@@ -47,7 +47,7 @@
 <body>
 <header>
   <div class="top">
-    <h1>📄 pictBLand PDF → TXT <small style="font-size:11px;color:#727d88;font-weight:600">v0.3.2</small></h1>
+    <h1>📄 pictBLand PDF → TXT <small style="font-size:11px;color:#727d88;font-weight:600">v0.3.3</small></h1>
     <label class="file-label primary">PDFを選択<input id="pdfFile" type="file" accept=".pdf,application/pdf"></label>
     <button id="reextract" disabled>再抽出</button>
     <button id="restore" disabled>↩ 抽出時に戻す</button>
@@ -210,7 +210,7 @@ async function extractSafariPrintNovel(file){
       });
     }
 
-    physical.push({page:p,width:viewport.width,height:viewport.height,lines});
+    physical.push({page:p,width:viewport.width,height:viewport.height,lines,raw});
   }
 
   // pictBLand上のページ番号を先に拾う。
@@ -247,13 +247,26 @@ async function extractSafariPrintNovel(file){
     .sort((a,b)=>b.size-a.size || a.y-b.y);
 
   let title=titleCandidates[0]?.text.trim()||"";
+  if(!title){
+    const rawTitle=(physical[0]?.raw||[])
+      .filter(item=>{
+        const t=item.text.trim();
+        if(t.length<2 || t.length>120) return false;
+        if(isGenericTitleText(t)) return false;
+        if(/^https?:\/\//i.test(t)) return false;
+        if(/^\d+\s*\/\s*\d+/.test(t)) return false;
+        return true;
+      })
+      .sort((a,b)=>b.size-a.size || Array.from(b.text).length-Array.from(a.text).length)[0];
+    title=rawTitle?.text.trim()||"";
+  }
   if(!title && pdfMetaTitle && !isGenericTitleText(pdfMetaTitle)) title=pdfMetaTitle;
   if(!title) title=file.name.replace(/\.pdf$/i,"").trim()||"pictBLand小説";
 
   // 本文は「ページ中央の細いカラム」。
   // 実PDFでは x≈209〜402 / page width 612 で、比率にすると左端34%前後。
   // フォントサイズには依存せず、位置だけで拾う。
-  const bodyFlow=[];
+  let bodyFlow=[];
   let stopped=false;
   let previousLine=null;
 
@@ -314,7 +327,74 @@ async function extractSafariPrintNovel(file){
   }
 
   if(bodyFlow.filter(x=>x.trim()).length<20){
-    throw new Error("本文カラムを十分に抽出できませんでした。");
+    const clusters=new Map();
+    for(const page of physical){
+      for(const item of page.raw){
+        const t=item.text.trim();
+        if(t.length<2) continue;
+        if(/^https?:\/\//i.test(t)) continue;
+        if(/^\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2}/.test(t)) continue;
+        if(/^\d+\s*\/\s*\d+\s*ページ$/.test(t)) continue;
+        if(item.x<page.width*0.15 || item.x>page.width*0.65) continue;
+
+        const key=Math.round(item.x/4)*4;
+        const cur=clusters.get(key)||{x:key,score:0,count:0,sizes:[]};
+        cur.score+=Math.min(Array.from(t).length,80);
+        cur.count++;
+        cur.sizes.push(item.size);
+        clusters.set(key,cur);
+      }
+    }
+
+    const best=[...clusters.values()].sort((a,b)=>b.score-a.score || b.count-a.count)[0];
+    if(best && best.score>=200){
+      const bx=best.x;
+      const bs=median(best.sizes)||8;
+      const flow=[];
+      let stop=false;
+      let prevY=null;
+
+      for(const page of physical){
+        if(stop) break;
+
+        const endItems=page.raw.filter(item=>/^(?:投稿ユーザー|コメント)(?:\s|$)/.test(item.text.trim()));
+        const endY=endItems.length ? Math.max(...endItems.map(x=>x.y)) : null;
+
+        const rows=page.raw
+          .filter(item=>{
+            const t=item.text.trim();
+            if(!t) return false;
+            if(Math.abs(item.x-bx)>8) return false;
+            if(item.size<bs*0.72) return false;
+            if(endY!==null && item.y<=endY) return false;
+            if(/^https?:\/\//i.test(t)) return false;
+            if(/^\d+\s*\/\s*\d+(?:\s*ページ)?/.test(t)) return false;
+            return true;
+          })
+          .sort((a,b)=>b.y-a.y);
+
+        const gaps=[];
+        for(let i=1;i<rows.length;i++){
+          const g=Math.abs(rows[i-1].y-rows[i].y);
+          if(g>0 && g<50) gaps.push(g);
+        }
+        const step=median(gaps)||14;
+
+        for(const row of rows){
+          if(prevY!==null && Math.abs(prevY-row.y)>step*1.65) flow.push("");
+          flow.push(row.text);
+          prevY=row.y;
+        }
+
+        if(endY!==null) stop=true;
+      }
+
+      bodyFlow=flow;
+    }
+  }
+
+  if(bodyFlow.filter(x=>x.trim()).length<20){
+    throw new Error("本文を十分に抽出できませんでした。");
   }
 
   const text=els.mode.value==="novel"
