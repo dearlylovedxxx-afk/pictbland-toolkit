@@ -47,7 +47,7 @@
 <body>
 <header>
   <div class="top">
-    <h1>📄 pictBLand PDF → TXT <small style="font-size:11px;color:#727d88;font-weight:600">v1.1.0 MuPDF</small></h1>
+    <h1>📄 pictBLand PDF → TXT <small style="font-size:11px;color:#727d88;font-weight:600">v1.1.1 MuPDF</small></h1>
     <label class="file-label primary">PDFを選択<input id="pdfFile" type="file" accept=".pdf,application/pdf"></label>
     <button id="reextract" disabled>再抽出</button>
     <button id="restore" disabled>↩ 抽出時に戻す</button>
@@ -126,6 +126,8 @@ function isUiLine(line) {
   const t = String(line || "").trim();
   if (!t) return false;
   if (/^(?:表紙を表示|小|中|大|次頁|前頁|次へ|前へ|編集)$/.test(t)) return true;
+  if (/ステキ！.*非公開|非公開.*ステキ！/.test(t)) return true;
+  if (/スタンプ(?:数)?は?非公開|スタンプ数は非公開/.test(t)) return true;
   if (/^[\uF000-\uF8FF]+$/.test(t)) return true;
   if (t.length <= 8 && /^[♡♥☆★⭐︎⭐\s・#"'〉]+$/.test(t)) return true;
   return false;
@@ -139,7 +141,9 @@ function isInternalPageMarker(line) {
 function stopDocumentAt(line) {
   const t = String(line || "").trim();
   return (
-    /^(?:投稿ユーザー|コメント)$/.test(t) ||
+    t.includes("投稿ユーザー") ||
+    /^コメント(?:\s|$)/.test(t) ||
+    /ステキ！.*非公開|非公開.*ステキ！/.test(t) ||
     t.includes("この作品はコメントを受け付けていません") ||
     t.startsWith("このユーザーの他の作品") ||
     t.startsWith("運営からの最新のお知らせ")
