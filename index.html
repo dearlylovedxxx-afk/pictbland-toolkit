@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <title>pictBLand PDF → TXT</title>
+  <style>
+    :root{font-family:-apple-system,BlinkMacSystemFont,"Noto Sans JP","Hiragino Sans",sans-serif;color:#202124;background:#f4f6f8}
+    *{box-sizing:border-box}
+    body{margin:0;background:#f4f6f8;color:#202124}
+    header{position:sticky;top:0;z-index:20;background:#fff;border-bottom:1px solid #dfe3e8;padding:12px max(12px,env(safe-area-inset-right)) 10px max(12px,env(safe-area-inset-left));box-shadow:0 2px 8px #0000000d}
+    .top{max-width:980px;margin:auto;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    h1{font-size:18px;margin:0 auto 0 0}
+    button,.file-label,select,input[type=text]{font:inherit;border:1px solid #ccd2d9;background:#fff;color:#202124;border-radius:9px;padding:9px 11px}
+    button,.file-label{cursor:pointer;font-weight:700}
+    button.primary,.file-label.primary{background:#7356a8;color:#fff;border-color:#7356a8}
+    button:disabled{opacity:.45;cursor:default}
+    input[type=file]{display:none}
+    .controls{max-width:980px;margin:9px auto 0;display:flex;gap:8px 12px;align-items:center;flex-wrap:wrap;font-size:12px;color:#59636e}
+    .controls label{display:flex;gap:5px;align-items:center;flex-wrap:wrap}
+    .controls input[type=text]{min-width:220px;max-width:100%;padding:6px 8px}
+    .controls select{padding:6px 8px}
+    #status{max-width:980px;margin:8px auto 0;font-size:12px;color:#59636e;white-space:pre-wrap}
+    .privacy{max-width:980px;margin:6px auto 0;font-size:11px;color:#727d88}
+    main{max-width:980px;margin:auto;padding:12px 10px 90px}
+    .empty{background:#fff;border:1px dashed #ccd2d9;border-radius:12px;padding:28px 16px;text-align:center;color:#727d88}
+    .page{background:#fff;border:1px solid #dfe3e8;border-radius:10px;margin:0 0 12px;padding:10px;transition:opacity .15s}
+    .page.excluded{opacity:.45}
+    .page-head{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:7px;font-size:13px;font-weight:700}
+    .page-head span{font-size:11px;color:#727d88;font-weight:400}
+    textarea{display:block;width:100%;min-height:46vh;resize:vertical;border:1px solid #ccd2d9;border-radius:8px;padding:12px;background:#fff;color:#202124;font:15px/1.8 ui-monospace,SFMono-Regular,Menlo,"Noto Sans JP",monospace;white-space:pre-wrap}
+    .warn{background:#fff8e6;border:1px solid #efd597;color:#765600;border-radius:8px;padding:10px;margin-bottom:12px;font-size:12px;line-height:1.6}
+    @media(max-width:600px){
+      header{padding-top:max(8px,env(safe-area-inset-top))}
+      h1{width:100%;font-size:16px}
+      button,.file-label{font-size:12px;padding:8px}
+      .controls{font-size:11px}
+      main{padding:10px 7px 80px}
+      .page{padding:8px}
+      textarea{min-height:52vh;font-size:14px;line-height:1.75}
+    }
+  </style>
+</head>
+<body>
+<header>
+  <div class="top">
+    <h1>📄 pictBLand PDF → TXT</h1>
+    <label class="file-label primary">PDFを選択<input id="pdfFile" type="file" accept=".pdf,application/pdf"></label>
+    <button id="reextract" disabled>再抽出</button>
+    <button id="restore" disabled>↩ 抽出時に戻す</button>
+    <button id="copy" disabled>コピー</button>
+    <button id="download" class="primary" disabled>⬇️ TXT</button>
+    <button id="share" disabled>📤 共有</button>
+  </div>
+  <div class="controls">
+    <label>ファイル名：<input id="title" type="text" placeholder="作品タイトル"></label>
+    <label>抽出：<select id="mode"><option value="novel">小説向け（折り返しをつなぐ）</option><option value="visual">見た目どおり</option></select></label>
+    <label><input id="removeUi" type="checkbox" checked> pictBLand UIを除去</label>
+    <label><input id="removeSmall" type="checkbox" checked> 小さい文字（ルビ候補）を除去</label>
+    <label><input id="metadata" type="checkbox"> タイトルをTXT先頭に入れる</label>
+  </div>
+  <div id="status">PDFを選択してください。</div>
+  <div class="privacy">PDFはこの端末のブラウザ内で解析します。このページからPDFファイルを外部へ送信する処理はありません。</div>
+</header>
+
+<main id="pages">
+  <div class="empty">ブラウザの「プリント → PDF」で保存したpictBLand小説を選んでください。<br>文字を選択できるPDF向けです（画像だけのPDFはOCRが必要です）。</div>
+</main>
+
+<script type="module">
+import * as pdfjsLib from "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs";
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs";
+
+const $ = id => document.getElementById(id);
+const els = {
+  file:$("pdfFile"), reextract:$("reextract"), restore:$("restore"), copy:$("copy"),
+  download:$("download"), share:$("share"), title:$("title"), mode:$("mode"),
+  removeUi:$("removeUi"), removeSmall:$("removeSmall"), metadata:$("metadata"),
+  status:$("status"), pages:$("pages")
+};
+
+let sourceFile = null;
+let originalPages = [];
+let logicalPages = [];
+let pdfMetaTitle = "";
+
+const NAV_ONLY = /^(?:前のページ|次のページ|前頁|次頁|前へ|次へ|作品に戻る|表紙を表示|縦狭|縦普|縦広|横極|横狭|横普|無|ゴ|明|トップ|ホーム)$/;
+const SITE_NOISE = /^(?:pictBLand|pictbland\.net|pictBLandへようこそ|この作品を運営事務局に報告する)$/i;
+const PAGE_MARKER = /^\s*(\d+)\s*\/\s*(\d+)\s*$/;
+
+function normalizeNewlines(s){return String(s??"").replace(/\r\n?/g,"\n").replace(/[\u0085\u2028\u2029]/g,"\n")}
+function cleanText(s){
+  return normalizeNewlines(s)
+    .replace(/[ \t]+\n/g,"\n")
+    .replace(/\n[ \t]+/g,"\n")
+    .replace(/\n{4,}/g,"\n\n\n")
+    .replace(/^\n+|\n+$/g,"");
+}
+function safeFileName(name){
+  const c=String(name||"pictBLand小説").replace(/[\\/:*?"<>|\u0000-\u001f]/g,"＿").replace(/[. ]+$/g,"").trim();
+  return (c||"pictBLand小説").slice(0,140)+".txt";
+}
+function charNeedsSpace(a,b){
+  return /[A-Za-z0-9]$/.test(a||"") && /^[A-Za-z0-9]/.test(b||"");
+}
+function joinTokens(tokens){
+  let out="";
+  for(const t of tokens){
+    const s=t.text;
+    if(!s) continue;
+    if(out && t.gap > Math.max(2,t.size*0.25) && charNeedsSpace(out,s)) out+=" ";
+    out+=s;
+  }
+  return out;
+}
+function median(nums){
+  const a=nums.filter(Number.isFinite).sort((x,y)=>x-y);
+  if(!a.length) return 0;
+  const m=Math.floor(a.length/2);
+  return a.length%2?a[m]:(a[m-1]+a[m])/2;
+}
+
+async function extractPhysicalPages(file){
+  const data=await file.arrayBuffer();
+  const pdf=await pdfjsLib.getDocument({data}).promise;
+  try{
+    const md=await pdf.getMetadata();
+    pdfMetaTitle=String(md?.info?.Title||"").trim();
+  }catch{pdfMetaTitle=""}
+
+  const result=[];
+  for(let p=1;p<=pdf.numPages;p++){
+    els.status.textContent=\`PDFを解析中… \${p} / \${pdf.numPages}ページ\`;
+    const page=await pdf.getPage(p);
+    const tc=await page.getTextContent({disableNormalization:false});
+    const raw=tc.items.filter(x=>typeof x.str==="string" && x.str.length).map(x=>{
+      const tr=x.transform||[1,0,0,1,0,0];
+      const size=Math.max(Math.abs(tr[0])||0,Math.abs(tr[3])||0,Number(x.height)||0,1);
+      return {text:x.str,x:Number(tr[4])||0,y:Number(tr[5])||0,width:Number(x.width)||0,size};
+    });
+    const medSize=median(raw.map(x=>x.size))||10;
+    const kept=els.removeSmall.checked ? raw.filter(x=>x.size>=medSize*0.72) : raw;
+
+    kept.sort((a,b)=>Math.abs(b.y-a.y)>2?b.y-a.y:a.x-b.x);
+    const groups=[];
+    for(const item of kept){
+      let line=groups.find(g=>Math.abs(g.y-item.y)<=Math.max(2,medSize*0.22));
+      if(!line){line={y:item.y,items:[],size:item.size};groups.push(line)}
+      line.items.push(item);
+      line.size=Math.max(line.size,item.size);
+    }
+    groups.sort((a,b)=>b.y-a.y);
+    const lines=[];
+    let prev=null;
+    for(const g of groups){
+      g.items.sort((a,b)=>a.x-b.x);
+      let lastEnd=null;
+      const toks=g.items.map(i=>{
+        const gap=lastEnd==null?0:i.x-lastEnd;
+        lastEnd=i.x+i.width;
+        return {text:i.text,gap,size:i.size};
+      });
+      const text=joinTokens(toks).replace(/\u00a0/g," ").trimEnd();
+      if(!text) continue;
+      if(prev){
+        const gapY=prev.y-g.y;
+        const base=Math.max(prev.size,g.size,medSize);
+        if(gapY>base*1.75) lines.push("");
+      }
+      lines.push(text);
+      prev=g;
+    }
+    result.push(lines);
+  }
+  return result;
+}
+
+function repeatedNoiseSets(physical){
+  const counts=new Map();
+  for(const lines of physical){
+    const uniq=new Set(lines.map(x=>x.trim()).filter(x=>x && x.length<=140));
+    for(const x of uniq) counts.set(x,(counts.get(x)||0)+1);
+  }
+  const threshold=Math.max(2,Math.ceil(physical.length*0.6));
+  const repeated=new Set();
+  for(const [x,n] of counts) if(n>=threshold) repeated.add(x);
+  return repeated;
+}
+
+function removeUiLines(physical){
+  if(!els.removeUi.checked) return physical.map(p=>[...p]);
+  const repeated=repeatedNoiseSets(physical);
+  return physical.map(lines=>lines.filter(line=>{
+    const t=line.trim();
+    if(!t) return true;
+    if(NAV_ONLY.test(t)||SITE_NOISE.test(t)) return false;
+    if(/^https?:\/\/(?:www\.)?pictbland\.net/i.test(t)) return false;
+    if(/^(?:投稿日|文字数|ステキ数|ブクマ数|プロフィールタグ)[:：]/.test(t)) return false;
+    if(repeated.has(t) && !PAGE_MARKER.test(t) && t.length<120) return false;
+    return true;
+  }));
+}
+
+function splitLogicalPages(physical){
+  const stream=[];
+  physical.forEach((lines,pi)=>{
+    if(pi && stream.at(-1)!=="") stream.push("");
+    stream.push(...lines);
+  });
+  const markers=[];
+  stream.forEach((line,i)=>{const m=line.match(PAGE_MARKER);if(m) markers.push({i,page:+m[1],total:+m[2]})});
+  const totals=new Map();
+  for(const m of markers){
+    if(!totals.has(m.total)) totals.set(m.total,[]);
+    totals.get(m.total).push(m);
+  }
+  const group=[...totals.values()].filter(g=>g.some(x=>x.page===1)).sort((a,b)=>{
+    const ad=new Set(a.map(x=>x.page)).size,bd=new Set(b.map(x=>x.page)).size;
+    return bd-ad||b.length-a.length;
+  })[0];
+
+  if(!group){
+    return physical.map((lines,i)=>({label:\`PDF \${i+1}\`,lines:[...lines]}));
+  }
+
+  const firstByPage=new Map();
+  for(const m of group) if(!firstByPage.has(m.page)) firstByPage.set(m.page,m);
+  const sorted=[...firstByPage.values()].sort((a,b)=>a.i-b.i);
+  const pages=[];
+  for(let j=0;j<sorted.length;j++){
+    const cur=sorted[j];
+    const next=sorted[j+1];
+    const segment=stream.slice(cur.i+1,next?next.i:stream.length);
+    pages.push({label:\`ページ \${cur.page}\`,lines:segment});
+  }
+  return pages;
+}
+
+function looksParagraphStart(s){
+  return /^[　「『（【〔［〈《“‘〝〟―—…‥・※＊*#◇◆○●◎△▲▽▼□■☆★♪]/.test(s||"");
+}
+function isHeading(s){
+  const t=String(s||"").trim();
+  return t.length>0&&t.length<=40&&/^(?:第.{1,18}[章話節幕部編]|序章|終章|前書き|後書き|まえがき|あとがき|プロローグ|エピローグ|Prologue|Epilogue|Chapter\s*\d+)/i.test(t);
+}
+function joinWrappedLines(lines){
+  const out=[];
+  let buf="";
+  const flush=()=>{if(buf.trim()){out.push(buf.trimEnd());buf=""}};
+  for(let i=0;i<lines.length;i++){
+    const raw=lines[i];
+    if(!raw.trim()){flush();if(out.length&&out.at(-1)!=="")out.push("");continue}
+    const s=raw;
+    if(isHeading(s)){flush();out.push(s.trim());out.push("");continue}
+    if(looksParagraphStart(s)){flush();buf=s;continue}
+    if(!buf){buf=s;continue}
+    const addSpace=charNeedsSpace(buf,s.trimStart())?" ":"";
+    buf+=addSpace+s.trimStart();
+  }
+  flush();
+  return cleanText(out.join("\n"));
+}
+
+function logicalToText(page){
+  const lines=page.lines.filter(line=>{
+    const t=line.trim();
+    if(!els.removeUi.checked) return true;
+    return !(NAV_ONLY.test(t)||SITE_NOISE.test(t)||PAGE_MARKER.test(t));
+  });
+  return els.mode.value==="novel"?joinWrappedLines(lines):cleanText(lines.join("\n"));
+}
+
+function deriveTitle(file,pages){
+  const generic=/(?:pictbland|同人|小説投稿SNS)/i;
+  if(pdfMetaTitle && !generic.test(pdfMetaTitle) && pdfMetaTitle.length<160) return pdfMetaTitle;
+  const first=pages[0]?.lines||[];
+  const markerIndex=first.findIndex(x=>PAGE_MARKER.test(x.trim()));
+  const pool=(markerIndex>=0?first.slice(Math.max(0,markerIndex-25),markerIndex):first.slice(0,30)).map(x=>x.trim()).filter(Boolean);
+  const cand=pool.filter(x=>x.length>=2&&x.length<=100&&!generic.test(x)&&!NAV_ONLY.test(x)&&!SITE_NOISE.test(x)&&!/^(?:R18|R-18|鍵付|編集|表紙を表示|小|中|大)$/.test(x)).at(-1);
+  if(cand) return cand;
+  return file.name.replace(/\.pdf$/i,"").trim()||"pictBLand小説";
+}
+
+function drawPages(textPages){
+  els.pages.replaceChildren();
+  textPages.forEach((p,i)=>{
+    const sec=document.createElement("section");sec.className="page";
+    const head=document.createElement("div");head.className="page-head";
+    const label=document.createElement("label");
+    const cb=document.createElement("input");cb.type="checkbox";cb.checked=true;cb.className="include";
+    label.append(cb,document.createTextNode(\` \${p.label} を保存\`));
+    const chars=document.createElement("span");chars.textContent=\`\${Array.from(p.text).length.toLocaleString("ja-JP")}字\`;
+    const ta=document.createElement("textarea");ta.value=p.text;ta.spellcheck=false;
+    ta.addEventListener("input",()=>chars.textContent=\`\${Array.from(ta.value).length.toLocaleString("ja-JP")}字\`);
+    cb.addEventListener("change",()=>sec.classList.toggle("excluded",!cb.checked));
+    head.append(label,chars);sec.append(head,ta);els.pages.append(sec);
+  });
+}
+
+async function extract(){
+  if(!sourceFile) return;
+  try{
+    setButtons(false);
+    els.status.textContent="PDFを読み込み中…";
+    const physical=await extractPhysicalPages(sourceFile);
+    const cleaned=removeUiLines(physical);
+    const logical=splitLogicalPages(cleaned);
+    const textPages=logical.map(p=>({label:p.label,text:logicalToText(p)})).filter(p=>p.text.trim());
+    if(!textPages.length) throw new Error("本文を抽出できませんでした。画像だけのPDFの場合はOCRが必要です。");
+    logicalPages=textPages;
+    originalPages=textPages.map(p=>({...p}));
+    els.title.value=deriveTitle(sourceFile,logical);
+    drawPages(textPages);
+    const total=textPages.reduce((n,p)=>n+Array.from(p.text).length,0);
+    els.status.textContent=\`抽出成功：\${textPages.length}区切り／\${total.toLocaleString("ja-JP")}字。内容を確認して不要部分を編集してください。\`;
+    setButtons(true);
+  }catch(err){
+    els.pages.innerHTML=\`<div class="warn">抽出できませんでした：\${escapeHtml(err?.message||err)}<br>文字を選択できないPDFは、このツールではOCRできません。</div>\`;
+    els.status.textContent="抽出失敗";
+    setButtons(false,true);
+  }
+}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m]))}
+function setButtons(ok,allowRe=true){
+  els.reextract.disabled=!sourceFile||!allowRe;
+  els.restore.disabled=!ok;els.copy.disabled=!ok;els.download.disabled=!ok;els.share.disabled=!ok;
+}
+function buildOutput(){
+  const pages=[...els.pages.querySelectorAll(".page")].filter(p=>p.querySelector(".include")?.checked).map(p=>cleanText(p.querySelector("textarea")?.value||"")).filter(Boolean);
+  const parts=[];
+  if(els.metadata.checked&&els.title.value.trim()) parts.push(els.title.value.trim(),"");
+  parts.push(pages.join("\n\n\n\n\n\n"));
+  return normalizeNewlines(parts.join("\n")).replace(/^\n+|\n+$/g,"")+"\n";
+}
+function restore(){
+  drawPages(originalPages);
+  els.status.textContent="抽出直後の本文に戻しました。";
+}
+async function copyText(){
+  const text=buildOutput();if(!text.trim()) return;
+  try{await navigator.clipboard.writeText(text);els.status.textContent="TXT本文をコピーしました。"}
+  catch{els.status.textContent="コピーできませんでした。"}
+}
+function downloadText(){
+  const text=buildOutput();if(!text.trim()) return;
+  const file=new File([text],safeFileName(els.title.value),{type:"text/plain;charset=utf-8"});
+  const url=URL.createObjectURL(file);const a=document.createElement("a");a.href=url;a.download=file.name;a.click();
+  setTimeout(()=>URL.revokeObjectURL(url),30000);els.status.textContent="TXTをダウンロードしました。";
+}
+async function shareText(){
+  const text=buildOutput();if(!text.trim()) return;
+  const file=new File([text],safeFileName(els.title.value),{type:"text/plain;charset=utf-8"});
+  if(!navigator.share||!navigator.canShare?.({files:[file]})){els.status.textContent="このブラウザではファイル共有に対応していません。";return}
+  try{await navigator.share({files:[file],title:els.title.value.trim()||"pictBLand小説"});els.status.textContent="共有シートへ渡しました。"}
+  catch(err){els.status.textContent=err?.name==="AbortError"?"共有をキャンセルしました。":\`共有できませんでした：\${err?.message||err}\`}
+}
+
+els.file.addEventListener("change",()=>{sourceFile=els.file.files?.[0]||null;if(sourceFile)extract()});
+els.reextract.addEventListener("click",extract);
+els.restore.addEventListener("click",restore);
+els.copy.addEventListener("click",copyText);
+els.download.addEventListener("click",downloadText);
+els.share.addEventListener("click",shareText);
+els.mode.addEventListener("change",()=>{if(sourceFile)extract()});
+els.removeUi.addEventListener("change",()=>{if(sourceFile)extract()});
+els.removeSmall.addEventListener("change",()=>{if(sourceFile)extract()});
+</script>
+</body>
+</html>
