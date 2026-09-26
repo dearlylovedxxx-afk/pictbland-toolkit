@@ -47,7 +47,7 @@
 <body>
 <header>
   <div class="top">
-    <h1>📄 pictBLand PDF → TXT <small style="font-size:11px;color:#727d88;font-weight:600">v1.1.1 MuPDF</small></h1>
+    <h1>📄 pictBLand PDF → TXT <small style="font-size:11px;color:#727d88;font-weight:600">v1.1.2 MuPDF</small></h1>
     <label class="file-label primary">PDFを選択<input id="pdfFile" type="file" accept=".pdf,application/pdf"></label>
     <button id="reextract" disabled>再抽出</button>
     <button id="restore" disabled>↩ 抽出時に戻す</button>
@@ -140,14 +140,44 @@ function isInternalPageMarker(line) {
 
 function stopDocumentAt(line) {
   const t = String(line || "").trim();
+  const compact = t.replace(/\s+/g, "");
   return (
-    t.includes("投稿ユーザー") ||
+    compact.includes("投稿ユーザー") ||
     /^コメント(?:\s|$)/.test(t) ||
-    /ステキ！.*非公開|非公開.*ステキ！/.test(t) ||
-    t.includes("この作品はコメントを受け付けていません") ||
-    t.startsWith("このユーザーの他の作品") ||
-    t.startsWith("運営からの最新のお知らせ")
+    (/ステキ!?/.test(compact) && /非公開/.test(compact)) ||
+    compact.includes("スタンプ数は非公開") ||
+    compact.includes("この作品はコメントを受け付けていません") ||
+    compact.startsWith("このユーザーの他の作品") ||
+    compact.startsWith("運営からの最新のお知らせ")
   );
+}
+
+function trimTrailingPictblandUi(lines) {
+  const start = Math.max(0, lines.length - 80);
+
+  for (let i = start; i < lines.length; i++) {
+    const windowText = lines
+      .slice(i, Math.min(lines.length, i + 4))
+      .join(" ")
+      .replace(/\s+/g, "");
+
+    const current = String(lines[i] || "").trim().replace(/\s+/g, "");
+
+    const reactionUi =
+      (/ステキ!?/.test(windowText) && /非公開/.test(windowText)) ||
+      /[（(]?[♡♥★☆⭐].*ステキ!?/.test(windowText);
+
+    const commentUi =
+      windowText.includes("投稿ユーザー") ||
+      windowText.includes("スタンプ数は非公開") ||
+      windowText.includes("この作品はコメントを受け付けていません");
+
+    if (reactionUi || commentUi || current === "コメント") {
+      return lines.slice(0, i);
+    }
+  }
+
+  return lines;
 }
 
 function plausibleTitle(line) {
@@ -626,6 +656,9 @@ function extractNovelFromPageLayouts(pageLayouts, metaTitle, filename) {
       bodyLines.splice(0, bodyLines.length, ...fallbackLines);
     }
   }
+
+  const cleanedBodyLines = trimTrailingPictblandUi(bodyLines);
+  bodyLines.splice(0, bodyLines.length, ...cleanedBodyLines);
 
   const compact = bodyLines.filter(line => line.trim());
 
