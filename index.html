@@ -47,7 +47,7 @@
 <body>
 <header>
   <div class="top">
-    <h1>📄 pictBLand PDF → TXT <small style="font-size:11px;color:#727d88;font-weight:600">v0.2.1</small></h1>
+    <h1>📄 pictBLand PDF → TXT <small style="font-size:11px;color:#727d88;font-weight:600">v0.2.2</small></h1>
     <label class="file-label primary">PDFを選択<input id="pdfFile" type="file" accept=".pdf,application/pdf"></label>
     <button id="reextract" disabled>再抽出</button>
     <button id="restore" disabled>↩ 抽出時に戻す</button>
@@ -59,7 +59,7 @@
     <label>ファイル名：<input id="title" type="text" placeholder="作品タイトル"></label>
     <label>抽出：<select id="mode"><option value="novel">小説向け（折り返しをつなぐ）</option><option value="visual">見た目どおり</option></select></label>
     <label><input id="removeUi" type="checkbox" checked> pictBLand UIを除去</label>
-    <label><input id="removeSmall" type="checkbox" checked> 小さい文字（ルビ候補）を除去</label>
+    <label><input id="removeSmall" type="checkbox"> 小さい文字（ルビ候補）を除去</label>
     <label><input id="metadata" type="checkbox"> タイトルをTXT先頭に入れる</label>
   </div>
   <div id="status">ページ読み込み中…</div>
@@ -184,6 +184,27 @@ async function extractPhysicalPages(file){
   return result;
 }
 
+function stripBrowserPrintChrome(physical){
+  const total=physical.length;
+  return physical.map((lines,pi)=>{
+    const pageNo=pi+1;
+    return lines.filter(line=>{
+      const t=String(line||"").trim();
+      if(!t) return true;
+
+      // Safari/ブラウザ印刷が自動で付ける「1 / 29ページ」等。
+      const m=t.match(/^(\d+)\s*\/\s*(\d+)(?:\s*ページ)?$/);
+      if(m && Number(m[1])===pageNo && Number(m[2])===total) return false;
+
+      // 印刷フッターのURL・日時。
+      if(/^https?:\/\/(?:www\.)?pictbland\.net\/items\/detail\//i.test(t)) return false;
+      if(/^\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2}\s+\d{1,2}:\d{2}/.test(t)) return false;
+
+      return true;
+    });
+  });
+}
+
 function repeatedNoiseSets(physical){
   const counts=new Map();
   for(const lines of physical){
@@ -205,6 +226,7 @@ function removeUiLines(physical){
     if(NAV_ONLY.test(t)||SITE_NOISE.test(t)) return false;
     if(/^https?:\/\/(?:www\.)?pictbland\.net/i.test(t)) return false;
     if(/^(?:投稿日|文字数|ステキ数|ブクマ数|プロフィールタグ)[:：]/.test(t)) return false;
+    if(t.length<=8 && /^[♡♥☆★⭐︎⭐\s・]+$/.test(t)) return false;
     if(repeated.has(t) && !PAGE_MARKER.test(t) && t.length<120) return false;
     return true;
   }));
@@ -313,7 +335,8 @@ async function extract(){
     els.status.classList.add("busy");
     els.status.textContent=`「${sourceFile.name}」を受け取りました。PDFを読み込み中…`;
     const physical=await extractPhysicalPages(sourceFile);
-    const cleaned=removeUiLines(physical);
+    const withoutPrintChrome=stripBrowserPrintChrome(physical);
+    const cleaned=removeUiLines(withoutPrintChrome);
     const logical=splitLogicalPages(cleaned);
     const textPages=logical.map(p=>({label:p.label,text:logicalToText(p)})).filter(p=>p.text.trim());
     if(!textPages.length) throw new Error("本文を抽出できませんでした。画像だけのPDFの場合はOCRが必要です。");
@@ -322,7 +345,7 @@ async function extract(){
     els.title.value=deriveTitle(sourceFile,logical);
     drawPages(textPages);
     const total=textPages.reduce((n,p)=>n+Array.from(p.text).length,0);
-    els.status.textContent=`抽出成功：${textPages.length}区切り／${total.toLocaleString("ja-JP")}字。内容を確認して不要部分を編集してください。`;
+    els.status.textContent=`抽出成功：PDF ${physical.length}枚 → 作品 ${textPages.length}区切り／${total.toLocaleString("ja-JP")}字。内容を確認して不要部分を編集してください。`;
     setButtons(true);
   }catch(err){
     els.pages.innerHTML=`<div class="warn">抽出できませんでした：${escapeHtml(err?.message||err)}<br>文字を選択できないPDFは、このツールではOCRできません。</div>`;
