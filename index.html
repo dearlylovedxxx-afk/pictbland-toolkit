@@ -155,7 +155,7 @@ async function extractSafariPrintNovel(file){
 
   const physical=[];
   for(let p=1;p<=pdf.numPages;p++){
-    els.status.textContent=\`PDFを解析中… \${p} / \${pdf.numPages}ページ\`;
+    els.status.textContent=`PDFを解析中… ${p} / ${pdf.numPages}ページ`;
     await new Promise(r=>requestAnimationFrame(r));
 
     const page=await pdf.getPage(p);
@@ -217,7 +217,7 @@ async function extractSafariPrintNovel(file){
   for(const page of physical){
     for(const line of page.lines){
       if(!isBodyStyleCandidate(line)) continue;
-      const key=\`\${Math.round(line.x/2)*2}|\${Math.round(line.size*2)/2}\`;
+      const key=`${Math.round(line.x/2)*2}|${Math.round(line.size*2)/2}`;
       const cur=styles.get(key)||{score:0,count:0,x:Math.round(line.x/2)*2,size:Math.round(line.size*2)/2};
       cur.score+=Math.min(Array.from(line.text).length,80);
       cur.count++;
@@ -523,7 +523,7 @@ async function extract(){
   try{
     setButtons(false);
     els.status.classList.add("busy");
-    els.status.textContent=\`「\${sourceFile.name}」を受け取りました。本文カラムを解析中…\`;
+    els.status.textContent=`「${sourceFile.name}」を受け取りました。本文カラムを解析中…`;
 
     const result=await extractSafariPrintNovel(sourceFile);
     if(!result.text.trim()) throw new Error("本文を抽出できませんでした。");
@@ -535,19 +535,19 @@ async function extract(){
 
     const total=Array.from(result.text).length;
     const siteInfo=result.siteMarker
-      ? \`／pictBLand \${result.siteMarker.current} / \${result.siteMarker.total}\`
+      ? `／pictBLand ${result.siteMarker.current} / ${result.siteMarker.total}`
       : "";
 
     els.status.classList.remove("busy");
     els.status.textContent=
-      \`抽出成功：PDF \${result.physicalCount}枚 → 本文1区切り／\${total.toLocaleString("ja-JP")}字\${siteInfo}。\` +
+      `抽出成功：PDF ${result.physicalCount}枚 → 本文1区切り／${total.toLocaleString("ja-JP")}字${siteInfo}。` +
       (result.siteMarker && result.siteMarker.current<result.siteMarker.total
-        ? \` このPDFにはpictBLandの\${result.siteMarker.current}/\${result.siteMarker.total}ページ目だけが含まれています。\`
+        ? ` このPDFにはpictBLandの${result.siteMarker.current}/${result.siteMarker.total}ページ目だけが含まれています。`
         : "");
 
     setButtons(true);
   }catch(err){
-    els.pages.innerHTML=\`<div class="warn">抽出できませんでした：\${escapeHtml(err?.message||err)}<br>文字を選択できないPDFは、このツールではOCRできません。</div>\`;
+    els.pages.innerHTML=`<div class="warn">抽出できませんでした：${escapeHtml(err?.message||err)}<br>文字を選択できないPDFは、このツールではOCRできません。</div>`;
     els.status.classList.remove("busy");
     els.status.textContent="抽出失敗";
     setButtons(false,true);
