@@ -23,6 +23,8 @@
     .controls select{padding:6px 8px}
     #status{max-width:980px;margin:8px auto 0;font-size:12px;color:#59636e;white-space:pre-wrap}
     .privacy{max-width:980px;margin:6px auto 0;font-size:11px;color:#727d88}
+    #status.busy{color:#7356a8;font-weight:700}
+    #status.busy::before{content:"⏳ ";}
     main{max-width:980px;margin:auto;padding:12px 10px 90px}
     .empty{background:#fff;border:1px dashed #ccd2d9;border-radius:12px;padding:28px 16px;text-align:center;color:#727d88}
     .page{background:#fff;border:1px solid #dfe3e8;border-radius:10px;margin:0 0 12px;padding:10px;transition:opacity .15s}
@@ -60,7 +62,7 @@
     <label><input id="removeSmall" type="checkbox" checked> 小さい文字（ルビ候補）を除去</label>
     <label><input id="metadata" type="checkbox"> タイトルをTXT先頭に入れる</label>
   </div>
-  <div id="status">PDFを選択してください。</div>
+  <div id="status">準備完了。PDFを選択してください。</div>
   <div class="privacy">PDFはこの端末のブラウザ内で解析します。このページからPDFファイルを外部へ送信する処理はありません。</div>
 </header>
 
@@ -68,9 +70,14 @@
   <div class="empty">ブラウザの「プリント → PDF」で保存したpictBLand小説を選んでください。<br>文字を選択できるPDF向けです（画像だけのPDFはOCRが必要です）。</div>
 </main>
 
-<script type="module">
-import * as pdfjsLib from "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs";
-pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs";
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+const pdfjsLib = window.pdfjsLib;
+if (!pdfjsLib) {
+  document.getElementById("status").textContent = "PDF解析ライブラリを読み込めませんでした。ページを再読み込みしてください。";
+  throw new Error("PDF.js failed to load");
+}
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
 const $ = id => document.getElementById(id);
 const els = {
@@ -302,7 +309,8 @@ async function extract(){
   if(!sourceFile) return;
   try{
     setButtons(false);
-    els.status.textContent="PDFを読み込み中…";
+    els.status.classList.add("busy");
+    els.status.textContent=`「${sourceFile.name}」を受け取りました。PDFを読み込み中…`;
     const physical=await extractPhysicalPages(sourceFile);
     const cleaned=removeUiLines(physical);
     const logical=splitLogicalPages(cleaned);
@@ -317,6 +325,7 @@ async function extract(){
     setButtons(true);
   }catch(err){
     els.pages.innerHTML=\`<div class="warn">抽出できませんでした：\${escapeHtml(err?.message||err)}<br>文字を選択できないPDFは、このツールではOCRできません。</div>\`;
+    els.status.classList.remove("busy");
     els.status.textContent="抽出失敗";
     setButtons(false,true);
   }
@@ -356,7 +365,13 @@ async function shareText(){
   catch(err){els.status.textContent=err?.name==="AbortError"?"共有をキャンセルしました。":\`共有できませんでした：\${err?.message||err}\`}
 }
 
-els.file.addEventListener("change",()=>{sourceFile=els.file.files?.[0]||null;if(sourceFile)extract()});
+els.file.addEventListener("change",()=>{
+  sourceFile=els.file.files?.[0]||null;
+  if(!sourceFile) return;
+  els.status.classList.add("busy");
+  els.status.textContent=`PDFを選択しました：「${sourceFile.name}」\n解析を開始します…`;
+  setTimeout(extract, 50);
+});
 els.reextract.addEventListener("click",extract);
 els.restore.addEventListener("click",restore);
 els.copy.addEventListener("click",copyText);
