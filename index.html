@@ -47,7 +47,7 @@
 <body>
 <header>
   <div class="top">
-    <h1>📄 pictBLand PDF → TXT <small style="font-size:11px;color:#727d88;font-weight:600">v0.5.0</small></h1>
+    <h1>📄 pictBLand PDF → TXT <small style="font-size:11px;color:#727d88;font-weight:600">v1.0.0 MuPDF</small></h1>
     <label class="file-label primary">PDFを選択<input id="pdfFile" type="file" accept=".pdf,application/pdf"></label>
     <button id="reextract" disabled>再抽出</button>
     <button id="restore" disabled>↩ 抽出時に戻す</button>
@@ -59,26 +59,18 @@
     <label>ファイル名：<input id="title" type="text" placeholder="作品タイトル"></label>
     <label>抽出：<select id="mode"><option value="novel">小説向け（折り返しをつなぐ）</option><option value="visual">見た目どおり</option></select></label>
     <label><input id="removeUi" type="checkbox" checked> pictBLand UIを除去</label>
-    <label title="本文カラム判定で自動除外します"><input id="removeSmall" type="checkbox" checked disabled> ルビ・小さいUIは自動除外</label>
+    <label><input id="removeSmall" type="checkbox" disabled> MuPDFで文字レイヤーを直接抽出</label>
     <label><input id="metadata" type="checkbox"> タイトルをTXT先頭に入れる</label>
   </div>
   <div id="status">ページ読み込み中…</div>
-  <div class="privacy">PDFはこの端末のブラウザ内で解析します。このページからPDFファイルを外部へ送信する処理はありません。</div>
+  <div class="privacy">PDFはこの端末のブラウザ内でMuPDF（WebAssembly）解析します。PDFファイル自体を外部へ送信する処理はありません。</div>
 </header>
 
 <main id="pages">
   <div class="empty">ブラウザの「プリント → PDF」で保存したpictBLand小説を選んでください。<br>文字を選択できるPDF向けです（画像だけのPDFはOCRが必要です）。</div>
 </main>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script>
-const pdfjsLib = window.pdfjsLib;
-if (!pdfjsLib) {
-  document.getElementById("status").textContent = "PDF解析ライブラリを読み込めませんでした。ページを再読み込みしてください。";
-  throw new Error("PDF.js failed to load");
-}
-pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
-
 const $ = id => document.getElementById(id);
 const els = {
   file:$("pdfFile"), reextract:$("reextract"), restore:$("restore"), copy:$("copy"),
@@ -86,612 +78,523 @@ const els = {
   removeUi:$("removeUi"), removeSmall:$("removeSmall"), metadata:$("metadata"),
   status:$("status"), pages:$("pages")
 };
-els.status.textContent = "✅ JS起動OK。PDFを選択してください。";
 
 let sourceFile = null;
 let originalPages = [];
-let logicalPages = [];
-let pdfMetaTitle = "";
+let mupdfPromise = null;
 
-const NAV_ONLY = /^(?:前のページ|次のページ|前頁|次頁|前へ|次へ|作品に戻る|表紙を表示|縦狭|縦普|縦広|横極|横狭|横普|無|ゴ|明|トップ|ホーム)$/;
-const SITE_NOISE = /^(?:pictBLand|pictbland\.net|pictBLandへようこそ|この作品を運営事務局に報告する)$/i;
-const PAGE_MARKER = /^\s*(\d+)\s*\/\s*(\d+)\s*$/;
-
-function normalizeNewlines(s){return String(s??"").replace(/\r\n?/g,"\n").replace(/[\u0085\u2028\u2029]/g,"\n")}
-function cleanText(s){
-  return normalizeNewlines(s)
-    .replace(/[ \t]+\n/g,"\n")
-    .replace(/\n[ \t]+/g,"\n")
-    .replace(/\n{4,}/g,"\n\n\n")
-    .replace(/^\n+|\n+$/g,"");
-}
-function safeFileName(name){
-  const c=String(name||"pictBLand小説").replace(/[\\/:*?"<>|\u0000-\u001f]/g,"＿").replace(/[. ]+$/g,"").trim();
-  return (c||"pictBLand小説").slice(0,140)+".txt";
-}
-function charNeedsSpace(a,b){
-  return /[A-Za-z0-9]$/.test(a||"") && /^[A-Za-z0-9]/.test(b||"");
-}
-function joinTokens(tokens){
-  let out="";
-  for(const t of tokens){
-    const s=t.text;
-    if(!s) continue;
-    if(out && t.gap > Math.max(2,t.size*0.25) && charNeedsSpace(out,s)) out+=" ";
-    out+=s;
-  }
-  return out;
-}
-function median(nums){
-  const a=nums.filter(Number.isFinite).sort((x,y)=>x-y);
-  if(!a.length) return 0;
-  const m=Math.floor(a.length/2);
-  return a.length%2?a[m]:(a[m-1]+a[m])/2;
+function normalizeNewlines(text) {
+  return String(text ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0085\u2028\u2029]/g, "\n");
 }
 
-
-function isGenericTitleText(text){
-  return /(?:pictbland\.net|pictBLand|同人\s*[・･]?\s*BL|小説投稿SNS|イラスト\s*[・･]?\s*小説投稿SNS)/i.test(text);
+function cleanText(text, maxBreaks = 3) {
+  return normalizeNewlines(text)
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(new RegExp("\\n{" + (maxBreaks + 1) + ",}", "g"), "\n".repeat(maxBreaks))
+    .replace(/^\n+|\n+$/g, "");
 }
 
-function isBodyStyleCandidate(line){
-  const t=(line.text||"").trim();
-  if(t.length<4) return false;
-  if(/^https?:\/\//i.test(t)) return false;
-  if(/^\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2}/.test(t)) return false;
-  if(/^\d+\s*\/\s*\d+\s*ページ$/.test(t)) return false;
-  if(/^(?:R18|R-18|鍵付|編集|表紙を表示|小|中|大|次頁|前頁|次へ|前へ)$/.test(t)) return false;
+function safeFileName(name) {
+  const cleaned = String(name || "pictBLand小説")
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, "＿")
+    .replace(/[. ]+$/g, "")
+    .trim();
+  return (cleaned || "pictBLand小説").slice(0, 140) + ".txt";
+}
+
+function isGenericTitle(text) {
+  return /(?:pictbland\.net|pictBLand|同人\s*[・･]?\s*BL|小説投稿SNS|イラスト\s*[・･]?\s*小説投稿SNS)/i.test(text || "");
+}
+
+function isPrintNoise(line) {
+  const t = String(line || "").trim();
+  if (!t) return false;
+  if (/https?:\/\/(?:www\.)?pictbland\.net\/items\/detail\//i.test(t)) return true;
+  if (/^\d{4}[\/.\-]\d{1,2}[\/.\-]\d{1,2}\s+\d{1,2}:\d{2}/.test(t)) return true;
+  if (/^\d+\s*\/\s*\d+\s*ページ$/.test(t)) return true;
+  return false;
+}
+
+function isUiLine(line) {
+  const t = String(line || "").trim();
+  if (!t) return false;
+  if (/^(?:表紙を表示|小|中|大|次頁|前頁|次へ|前へ|編集)$/.test(t)) return true;
+  if (/^[\uF000-\uF8FF]+$/.test(t)) return true;
+  if (t.length <= 8 && /^[♡♥☆★⭐︎⭐\s・#"'〉]+$/.test(t)) return true;
+  return false;
+}
+
+function isInternalPageMarker(line) {
+  const t = String(line || "").trim();
+  return /^\d+\s*\/\s*\d+$/.test(t);
+}
+
+function stopDocumentAt(line) {
+  const t = String(line || "").trim();
+  return (
+    /^(?:投稿ユーザー|コメント)$/.test(t) ||
+    t.includes("この作品はコメントを受け付けていません") ||
+    t.startsWith("このユーザーの他の作品") ||
+    t.startsWith("運営からの最新のお知らせ")
+  );
+}
+
+function plausibleTitle(line) {
+  const t = String(line || "").trim();
+  if (t.length < 2 || t.length > 120) return false;
+  if (isGenericTitle(t) || isPrintNoise(t) || isUiLine(t)) return false;
+  if (/^(?:R18|R-18|鍵付|#.*|\d+ステキ！?)$/i.test(t)) return false;
+  if (/^[★☆⭐♡♥\s]+$/.test(t)) return false;
+  if (/^["'“”]\s*[^"'“”]{1,40}\s*["'“”]?\s*(?:R18)?$/i.test(t)) return false;
   return true;
 }
 
-async function extractSafariPrintNovel(file){
-  const data=await file.arrayBuffer();
-  const pdf=await pdfjsLib.getDocument({data}).promise;
+function detectTitle(firstPageText, metaTitle, filename) {
+  const lines = normalizeNewlines(firstPageText).split("\n").map(s => s.trim());
 
-  try{
-    const md=await pdf.getMetadata();
-    pdfMetaTitle=String(md?.info?.Title||"").trim();
-  }catch{
-    pdfMetaTitle="";
+  // pictBLandでは「○ステキ！」の直後に作品タイトルが来ることが多い。
+  const stekiIndex = lines.findIndex((line, i) => i < 20 && /ステキ！?/.test(line));
+  if (stekiIndex >= 0) {
+    for (let i = stekiIndex + 1; i < Math.min(lines.length, stekiIndex + 8); i++) {
+      if (plausibleTitle(lines[i])) return lines[i];
+    }
   }
 
-  const pages=[];
+  if (metaTitle && plausibleTitle(metaTitle)) return metaTitle.trim();
 
-  for(let p=1;p<=pdf.numPages;p++){
-    els.status.textContent="PDFを解析中… "+p+" / "+pdf.numPages+"ページ";
-    await new Promise(resolve=>requestAnimationFrame(resolve));
+  // 先頭20行からUIを除いた最初の短い見出し。
+  for (const line of lines.slice(0, 20)) {
+    if (plausibleTitle(line)) return line;
+  }
 
-    const page=await pdf.getPage(p);
-    const tc=await page.getTextContent({disableNormalization:false});
+  return String(filename || "pictBLand小説").replace(/\.pdf$/i, "").trim() || "pictBLand小説";
+}
 
-    const raw=tc.items
-      .filter(item=>typeof item.str==="string" && item.str.length)
-      .map(item=>{
-        const tr=item.transform||[1,0,0,1,0,0];
-        return {
-          text:item.str.replace(/\u00a0/g," "),
-          x:Number(tr[4])||0,
-          y:Number(tr[5])||0,
-          width:Number(item.width)||0,
-          size:Math.max(Math.abs(tr[0])||0,Math.abs(tr[3])||0,Number(item.height)||0,1),
-          hasEOL:!!item.hasEOL
+function findFirstPageBodyStart(lines, title) {
+  let titleIndex = lines.findIndex(line => line.trim() === title.trim());
+  if (titleIndex < 0) titleIndex = 0;
+
+  // 「編集」直後の空行は作品情報→本文の境目として非常に安定。
+  const editIndex = lines.findIndex((line, i) => i >= titleIndex && i < 35 && /(?:^|\s)#?\s*編集\s*$/.test(line.trim()));
+  if (editIndex >= 0) {
+    let i = editIndex + 1;
+    while (i < lines.length && !lines[i].trim()) i++;
+    if (i < lines.length) return i;
+  }
+
+  // タイトル以降で最初に現れる空白ブロックの次。
+  let sawContentAfterTitle = false;
+  for (let i = titleIndex + 1; i < Math.min(lines.length, titleIndex + 30); i++) {
+    if (lines[i].trim()) {
+      sawContentAfterTitle = true;
+      continue;
+    }
+    if (sawContentAfterTitle) {
+      let j = i + 1;
+      while (j < lines.length && !lines[j].trim()) j++;
+      if (j < lines.length) return j;
+    }
+  }
+
+  // 最後の保険：作品情報らしい上部を少しだけ捨てる。
+  return Math.min(lines.length, titleIndex + 1);
+}
+
+function joinVisualWraps(lines) {
+  const out = [];
+  let buffer = "";
+
+  const terminal = /[。！？!?…‥」』）】〉》”’]$/;
+  const dialogueStart = /^[「『]/;
+
+  const flush = () => {
+    const t = buffer.trim();
+    if (t) out.push(t);
+    buffer = "";
+  };
+
+  for (const raw of lines) {
+    const line = String(raw || "").trim();
+
+    if (!line) {
+      flush();
+      if (out.length && out[out.length - 1] !== "") out.push("");
+      continue;
+    }
+
+    // 会話は1発言ごとに独立させる。
+    if (dialogueStart.test(line)) {
+      flush();
+      out.push(line);
+      continue;
+    }
+
+    if (!buffer) {
+      buffer = line;
+    } else {
+      const addSpace = /[A-Za-z0-9]$/.test(buffer) && /^[A-Za-z0-9]/.test(line) ? " " : "";
+      buffer += addSpace + line;
+    }
+
+    // PDF上の折り返しは結合し、句点等まで来たら一段落として確定。
+    if (terminal.test(line)) flush();
+  }
+
+  flush();
+
+  return cleanText(out.join("\n"), 3);
+}
+
+async function loadMuPDF() {
+  if (mupdfPromise) return mupdfPromise;
+
+  mupdfPromise = (async () => {
+    els.status.classList.add("busy");
+    els.status.textContent = "MuPDFエンジンを読み込み中…";
+
+    const sources = [
+      {
+        module: "https://cdn.jsdelivr.net/npm/mupdf@1.28.1/dist/mupdf.js",
+        base: "https://cdn.jsdelivr.net/npm/mupdf@1.28.1/dist/"
+      },
+      {
+        module: "https://unpkg.com/mupdf@1.28.1/dist/mupdf.js",
+        base: "https://unpkg.com/mupdf@1.28.1/dist/"
+      }
+    ];
+
+    let lastError = null;
+
+    for (const source of sources) {
+      try {
+        globalThis.$libmupdf_wasm_Module = {
+          locateFile(path) {
+            return source.base + path;
+          }
         };
-      });
 
-    pages.push({page:p,raw});
-  }
-
-  const japaneseCount=text=>{
-    let n=0;
-    for(const ch of String(text||"")){
-      const cp=ch.codePointAt(0);
-      if(
-        (cp>=0x3040 && cp<=0x30ff) ||
-        (cp>=0x3400 && cp<=0x9fff)
-      ){
-        n++;
+        const mod = await import(source.module);
+        if (!mod?.Document?.openDocument) throw new Error("MuPDF APIが見つかりません");
+        return mod;
+      } catch (err) {
+        lastError = err;
       }
     }
-    return n;
-  };
 
-  const isPrintNoise=text=>{
-    const t=String(text||"").trim();
-    if(!t) return true;
-    if(/^https?:\/\/(?:www\.)?pictbland\.net/i.test(t)) return true;
-    if(/^\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2}(?:\s+|$)/.test(t)) return true;
-    if(/^\d+\s*\/\s*\d+\s*ページ$/.test(t)) return true;
-    return false;
-  };
+    throw lastError || new Error("MuPDFを読み込めませんでした");
+  })();
 
-  const isUiOnly=text=>{
-    const t=String(text||"").trim();
-    if(!t) return true;
-    if(/^(?:表紙を表示|小|中|大|次頁|前頁|次へ|前へ|編集|R18|R-18|鍵付)$/.test(t)) return true;
-    if(t.length<=8 && /^[♡♥☆★⭐︎⭐\s・#"'〉]+$/.test(t)) return true;
-    return false;
-  };
+  return mupdfPromise;
+}
 
-  // 日本語文字数をフォントサイズごとに集計。
-  // 小説本文は同じサイズが圧倒的多数になるため、それを本文サイズとして採用。
-  const sizeBuckets=new Map();
+async function extractWithMuPDF(file) {
+  const mupdf = await loadMuPDF();
+  const buffer = await file.arrayBuffer();
 
-  for(const page of pages){
-    for(const item of page.raw){
-      const t=item.text.trim();
-      if(!t || isPrintNoise(t) || isUiOnly(t)) continue;
+  let doc = null;
+  const pageTexts = [];
+  let metaTitle = "";
 
-      const jp=japaneseCount(t);
-      if(jp===0) continue;
+  try {
+    doc = mupdf.Document.openDocument(buffer, "application/pdf");
 
-      const key=Math.round(item.size*4)/4;
-      const current=sizeBuckets.get(key)||{size:key,jp:0,count:0};
-      current.jp+=jp;
-      current.count+=1;
-      sizeBuckets.set(key,current);
-    }
-  }
+    try {
+      metaTitle = String(doc.getMetaData?.("info:Title") || "").trim();
+    } catch {}
 
-  const rankedSizes=[...sizeBuckets.values()]
-    .sort((a,b)=>b.jp-a.jp || b.count-a.count);
+    const total = doc.countPages();
 
-  const bodyBucket=rankedSizes[0];
+    for (let i = 0; i < total; i++) {
+      els.status.classList.add("busy");
+      els.status.textContent = "MuPDFで本文を解析中… " + (i + 1) + " / " + total + "ページ";
+      await new Promise(resolve => setTimeout(resolve, 0));
 
-  if(!bodyBucket){
-    throw new Error("本文フォント候補を作れませんでした。");
-  }
+      let page = null;
+      let stext = null;
 
-  const bodySize=bodyBucket.size;
-  const sizeTolerance=Math.max(0.45,bodySize*0.07);
-
-  // タイトルは1枚目の本文より大きい日本語文字列を優先。
-  const firstRaw=pages[0]?.raw||[];
-  const titleCandidates=firstRaw
-    .filter(item=>{
-      const t=item.text.trim();
-      if(t.length<2 || t.length>120) return false;
-      if(japaneseCount(t)<3) return false;
-      if(isGenericTitleText(t) || isPrintNoise(t) || isUiOnly(t)) return false;
-      if(/^\d+\s*\/\s*\d+/.test(t)) return false;
-      if(/^\d+ステキ！?$/.test(t)) return false;
-      return item.size>bodySize*1.08;
-    })
-    .sort((a,b)=>b.size-a.size || japaneseCount(b.text)-japaneseCount(a.text));
-
-  let title=titleCandidates[0]?.text.trim()||"";
-
-  if(!title && pdfMetaTitle && !isGenericTitleText(pdfMetaTitle)){
-    title=pdfMetaTitle;
-  }
-
-  if(!title){
-    title=file.name.replace(/\.pdf$/i,"").trim()||"pictBLand小説";
-  }
-
-  // pictBLand側のページ番号を、全テキストから緩く検出。
-  const siteMarkers=[];
-
-  for(const page of pages){
-    const all=page.raw.map(item=>item.text).join(" ");
-    const re=/(\d+)\s*\/\s*(\d+)(?!\s*ページ)/g;
-    let match;
-
-    while((match=re.exec(all))){
-      const current=Number(match[1]);
-      const total=Number(match[2]);
-
-      if(current>=1 && total>=1 && current<=total && total<=100){
-        siteMarkers.push({current,total});
+      try {
+        page = doc.loadPage(i);
+        stext = page.toStructuredText("preserve-whitespace");
+        pageTexts.push(normalizeNewlines(stext.asText()));
+      } finally {
+        try { stext?.destroy?.(); } catch {}
+        try { page?.destroy?.(); } catch {}
       }
     }
+
+    return { pageTexts, metaTitle };
+  } finally {
+    try { doc?.destroy?.(); } catch {}
   }
+}
 
-  const siteMarker=siteMarkers.sort((a,b)=>b.total-a.total)[0]||null;
+function extractNovelFromPageTexts(pageTexts, metaTitle, filename) {
+  if (!pageTexts.length) throw new Error("PDFにページがありません。");
 
-  // 本文サイズの文字だけを、PDF.jsが返す順序のまま連結。
-  // 行替わりは hasEOL またはY座標変化で判断する。
-  const bodyLines=[];
-  let stopped=false;
+  const title = detectTitle(pageTexts[0], metaTitle, filename);
+  const firstLines = normalizeNewlines(pageTexts[0]).split("\n");
+  const firstStart = findFirstPageBodyStart(firstLines, title);
 
-  for(const page of pages){
-    if(stopped) break;
+  const bodyLines = [];
+  let stopped = false;
+  let siteMarker = null;
 
-    const items=page.raw;
-    const bodyItems=items.filter(item=>
-      Math.abs(item.size-bodySize)<=sizeTolerance &&
-      !isPrintNoise(item.text) &&
-      !isUiOnly(item.text)
-    );
+  for (let pageIndex = 0; pageIndex < pageTexts.length && !stopped; pageIndex++) {
+    const lines = normalizeNewlines(pageTexts[pageIndex]).split("\n");
+    const start = pageIndex === 0 ? firstStart : 0;
 
-    const yDiffs=[];
-    let lastY=null;
+    for (let i = start; i < lines.length; i++) {
+      const raw = lines[i];
+      const t = raw.trim();
 
-    for(const item of bodyItems){
-      if(lastY!==null){
-        const d=Math.abs(item.y-lastY);
-        if(d>1 && d<80) yDiffs.push(d);
-      }
-      lastY=item.y;
-    }
-
-    const normalStep=median(yDiffs)||Math.max(10,bodySize*1.6);
-
-    let currentLine="";
-    let currentY=null;
-    let previousLineY=null;
-
-    const flushLine=()=>{
-      const cleaned=currentLine.trimEnd();
-
-      if(cleaned){
-        if(
-          previousLineY!==null &&
-          currentY!==null &&
-          Math.abs(previousLineY-currentY)>normalStep*1.6
-        ){
-          bodyLines.push("");
-        }
-
-        if(
-          !isPrintNoise(cleaned) &&
-          !isUiOnly(cleaned) &&
-          !/^\d+\s*\/\s*\d+(?:\s+(?:次頁|前頁).*)?$/.test(cleaned)
-        ){
-          bodyLines.push(cleaned);
-          previousLineY=currentY;
-        }
-      }
-
-      currentLine="";
-      currentY=null;
-    };
-
-    let stopWindow="";
-
-    for(const item of items){
-      const rawText=item.text||"";
-      stopWindow=(stopWindow+rawText).slice(-40);
-
-      if(
-        stopWindow.includes("投稿ユーザー") ||
-        stopWindow.includes("この作品はコメントを受け付けていません")
-      ){
-        flushLine();
-        stopped=true;
+      if (stopDocumentAt(t)) {
+        stopped = true;
         break;
       }
 
-      if(Math.abs(item.size-bodySize)>sizeTolerance) continue;
-      if(isPrintNoise(rawText) || isUiOnly(rawText)) continue;
+      if (isPrintNoise(t)) continue;
 
-      if(currentY===null){
-        currentY=item.y;
-      }else if(Math.abs(item.y-currentY)>Math.max(1.5,bodySize*0.25)){
-        flushLine();
-        currentY=item.y;
+      if (isInternalPageMarker(t)) {
+        const m = t.match(/^(\d+)\s*\/\s*(\d+)$/);
+        if (m && !siteMarker) {
+          siteMarker = { current:Number(m[1]), total:Number(m[2]) };
+        }
+        // pictBLandの「1 / 8」は本文末尾にあるため、この物理ページはここで終了。
+        break;
       }
 
-      currentLine+=rawText;
+      if (/^(?:次頁|前頁)(?:\s|$)/.test(t)) break;
+      if (isUiLine(t)) continue;
 
-      if(item.hasEOL){
-        flushLine();
-      }
-    }
+      // タグ・ヘッダー由来のPrivate Use Areaアイコンだけの行。
+      if (/^[\uF000-\uF8FF\s]+$/.test(t || " ")) continue;
 
-    if(!stopped){
-      flushLine();
+      bodyLines.push(raw.replace(/[ \t]+$/g, ""));
     }
   }
 
-  const nonEmpty=bodyLines.filter(line=>line.trim());
+  const compact = bodyLines.filter(line => line.trim());
 
-  if(nonEmpty.length<10){
-    const diag=rankedSizes.slice(0,6)
-      .map(entry=>entry.size+"pt:"+entry.jp+"字")
-      .join(" / ");
-
-    throw new Error(
-      "本文として拾えたのが "+nonEmpty.length+"行だけでした。フォント候補："+diag
-    );
+  if (compact.length < 20) {
+    throw new Error("MuPDFでは文字を取得できましたが、本文範囲を十分に切り出せませんでした（" + compact.length + "行）。");
   }
 
-  const text=els.mode.value==="novel"
-    ? joinWrappedLines(bodyLines)
-    : cleanText(bodyLines.join("\n"));
+  const text = els.mode.value === "novel"
+    ? joinVisualWraps(bodyLines)
+    : cleanText(bodyLines.join("\n"), 3);
 
   return {
     title,
     text,
-    physicalCount:pdf.numPages,
-    bodySize,
-    bodyRows:nonEmpty.length,
+    physicalCount:pageTexts.length,
+    rawLines:compact.length,
     siteMarker
   };
 }
-async function extractPhysicalPages(file){
-  const data=await file.arrayBuffer();
-  const pdf=await pdfjsLib.getDocument({data}).promise;
-  try{
-    const md=await pdf.getMetadata();
-    pdfMetaTitle=String(md?.info?.Title||"").trim();
-  }catch{pdfMetaTitle=""}
 
-  const result=[];
-  for(let p=1;p<=pdf.numPages;p++){
-    els.status.textContent=`PDFを解析中… ${p} / ${pdf.numPages}ページ`;
-    const page=await pdf.getPage(p);
-    const tc=await page.getTextContent({disableNormalization:false});
-    const raw=tc.items.filter(x=>typeof x.str==="string" && x.str.length).map(x=>{
-      const tr=x.transform||[1,0,0,1,0,0];
-      const size=Math.max(Math.abs(tr[0])||0,Math.abs(tr[3])||0,Number(x.height)||0,1);
-      return {text:x.str,x:Number(tr[4])||0,y:Number(tr[5])||0,width:Number(x.width)||0,size};
-    });
-    const medSize=median(raw.map(x=>x.size))||10;
-    const kept=els.removeSmall.checked ? raw.filter(x=>x.size>=medSize*0.72) : raw;
-
-    kept.sort((a,b)=>Math.abs(b.y-a.y)>2?b.y-a.y:a.x-b.x);
-    const groups=[];
-    for(const item of kept){
-      let line=groups.find(g=>Math.abs(g.y-item.y)<=Math.max(2,medSize*0.22));
-      if(!line){line={y:item.y,items:[],size:item.size};groups.push(line)}
-      line.items.push(item);
-      line.size=Math.max(line.size,item.size);
-    }
-    groups.sort((a,b)=>b.y-a.y);
-    const lines=[];
-    let prev=null;
-    for(const g of groups){
-      g.items.sort((a,b)=>a.x-b.x);
-      let lastEnd=null;
-      const toks=g.items.map(i=>{
-        const gap=lastEnd==null?0:i.x-lastEnd;
-        lastEnd=i.x+i.width;
-        return {text:i.text,gap,size:i.size};
-      });
-      const text=joinTokens(toks).replace(/\u00a0/g," ").trimEnd();
-      if(!text) continue;
-      if(prev){
-        const gapY=prev.y-g.y;
-        const base=Math.max(prev.size,g.size,medSize);
-        if(gapY>base*1.75) lines.push("");
-      }
-      lines.push(text);
-      prev=g;
-    }
-    result.push(lines);
-  }
-  return result;
-}
-
-function stripBrowserPrintChrome(physical){
-  const total=physical.length;
-  return physical.map((lines,pi)=>{
-    const pageNo=pi+1;
-    return lines.filter(line=>{
-      const t=String(line||"").trim();
-      if(!t) return true;
-
-      // Safari/ブラウザ印刷が自動で付ける「1 / 29ページ」等。
-      const m=t.match(/^(\d+)\s*\/\s*(\d+)(?:\s*ページ)?$/);
-      if(m && Number(m[1])===pageNo && Number(m[2])===total) return false;
-
-      // 印刷フッターのURL・日時。
-      if(/^https?:\/\/(?:www\.)?pictbland\.net\/items\/detail\//i.test(t)) return false;
-      if(/^\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2}\s+\d{1,2}:\d{2}/.test(t)) return false;
-
-      return true;
-    });
-  });
-}
-
-function repeatedNoiseSets(physical){
-  const counts=new Map();
-  for(const lines of physical){
-    const uniq=new Set(lines.map(x=>x.trim()).filter(x=>x && x.length<=140));
-    for(const x of uniq) counts.set(x,(counts.get(x)||0)+1);
-  }
-  const threshold=Math.max(2,Math.ceil(physical.length*0.6));
-  const repeated=new Set();
-  for(const [x,n] of counts) if(n>=threshold) repeated.add(x);
-  return repeated;
-}
-
-function removeUiLines(physical){
-  if(!els.removeUi.checked) return physical.map(p=>[...p]);
-  const repeated=repeatedNoiseSets(physical);
-  return physical.map(lines=>lines.filter(line=>{
-    const t=line.trim();
-    if(!t) return true;
-    if(NAV_ONLY.test(t)||SITE_NOISE.test(t)) return false;
-    if(/^https?:\/\/(?:www\.)?pictbland\.net/i.test(t)) return false;
-    if(/^(?:投稿日|文字数|ステキ数|ブクマ数|プロフィールタグ)[:：]/.test(t)) return false;
-    if(t.length<=8 && /^[♡♥☆★⭐︎⭐\s・]+$/.test(t)) return false;
-    if(repeated.has(t) && !PAGE_MARKER.test(t) && t.length<120) return false;
-    return true;
-  }));
-}
-
-function splitLogicalPages(physical){
-  const stream=[];
-  physical.forEach((lines,pi)=>{
-    if(pi && stream.at(-1)!=="") stream.push("");
-    stream.push(...lines);
-  });
-  const markers=[];
-  stream.forEach((line,i)=>{const m=line.match(PAGE_MARKER);if(m) markers.push({i,page:+m[1],total:+m[2]})});
-  const totals=new Map();
-  for(const m of markers){
-    if(!totals.has(m.total)) totals.set(m.total,[]);
-    totals.get(m.total).push(m);
-  }
-  const group=[...totals.values()].filter(g=>g.some(x=>x.page===1)).sort((a,b)=>{
-    const ad=new Set(a.map(x=>x.page)).size,bd=new Set(b.map(x=>x.page)).size;
-    return bd-ad||b.length-a.length;
-  })[0];
-
-  if(!group){
-    return physical.map((lines,i)=>({label:`PDF ${i+1}`,lines:[...lines]}));
-  }
-
-  const firstByPage=new Map();
-  for(const m of group) if(!firstByPage.has(m.page)) firstByPage.set(m.page,m);
-  const sorted=[...firstByPage.values()].sort((a,b)=>a.i-b.i);
-  const pages=[];
-  for(let j=0;j<sorted.length;j++){
-    const cur=sorted[j];
-    const next=sorted[j+1];
-    const segment=stream.slice(cur.i+1,next?next.i:stream.length);
-    pages.push({label:`ページ ${cur.page}`,lines:segment});
-  }
-  return pages;
-}
-
-function looksParagraphStart(s){
-  return /^[　「『（【〔［〈《“‘〝〟―—…‥・※＊*#◇◆○●◎△▲▽▼□■☆★♪]/.test(s||"");
-}
-function isHeading(s){
-  const t=String(s||"").trim();
-  return t.length>0&&t.length<=40&&/^(?:第.{1,18}[章話節幕部編]|序章|終章|前書き|後書き|まえがき|あとがき|プロローグ|エピローグ|Prologue|Epilogue|Chapter\s*\d+)/i.test(t);
-}
-function joinWrappedLines(lines){
-  const out=[];
-  let buf="";
-  const flush=()=>{if(buf.trim()){out.push(buf.trimEnd());buf=""}};
-  for(let i=0;i<lines.length;i++){
-    const raw=lines[i];
-    if(!raw.trim()){flush();if(out.length&&out.at(-1)!=="")out.push("");continue}
-    const s=raw;
-    if(isHeading(s)){flush();out.push(s.trim());out.push("");continue}
-    if(looksParagraphStart(s)){flush();buf=s;continue}
-    if(!buf){buf=s;continue}
-    const addSpace=charNeedsSpace(buf,s.trimStart())?" ":"";
-    buf+=addSpace+s.trimStart();
-  }
-  flush();
-  return cleanText(out.join("\n"));
-}
-
-function logicalToText(page){
-  const lines=page.lines.filter(line=>{
-    const t=line.trim();
-    if(!els.removeUi.checked) return true;
-    return !(NAV_ONLY.test(t)||SITE_NOISE.test(t)||PAGE_MARKER.test(t));
-  });
-  return els.mode.value==="novel"?joinWrappedLines(lines):cleanText(lines.join("\n"));
-}
-
-function deriveTitle(file,pages){
-  const generic=/(?:pictbland|同人|小説投稿SNS)/i;
-  if(pdfMetaTitle && !generic.test(pdfMetaTitle) && pdfMetaTitle.length<160) return pdfMetaTitle;
-  const first=pages[0]?.lines||[];
-  const markerIndex=first.findIndex(x=>PAGE_MARKER.test(x.trim()));
-  const pool=(markerIndex>=0?first.slice(Math.max(0,markerIndex-25),markerIndex):first.slice(0,30)).map(x=>x.trim()).filter(Boolean);
-  const cand=pool.filter(x=>x.length>=2&&x.length<=100&&!generic.test(x)&&!NAV_ONLY.test(x)&&!SITE_NOISE.test(x)&&!/^(?:R18|R-18|鍵付|編集|表紙を表示|小|中|大)$/.test(x)).at(-1);
-  if(cand) return cand;
-  return file.name.replace(/\.pdf$/i,"").trim()||"pictBLand小説";
-}
-
-function drawPages(textPages){
+function drawPages(textPages) {
   els.pages.replaceChildren();
-  textPages.forEach((p,i)=>{
-    const sec=document.createElement("section");sec.className="page";
-    const head=document.createElement("div");head.className="page-head";
-    const label=document.createElement("label");
-    const cb=document.createElement("input");cb.type="checkbox";cb.checked=true;cb.className="include";
-    label.append(cb,document.createTextNode(` ${p.label} を保存`));
-    const chars=document.createElement("span");chars.textContent=`${Array.from(p.text).length.toLocaleString("ja-JP")}字`;
-    const ta=document.createElement("textarea");ta.value=p.text;ta.spellcheck=false;
-    ta.addEventListener("input",()=>chars.textContent=`${Array.from(ta.value).length.toLocaleString("ja-JP")}字`);
-    cb.addEventListener("change",()=>sec.classList.toggle("excluded",!cb.checked));
-    head.append(label,chars);sec.append(head,ta);els.pages.append(sec);
+
+  textPages.forEach((page, index) => {
+    const section = document.createElement("section");
+    section.className = "page";
+
+    const head = document.createElement("div");
+    head.className = "page-head";
+
+    const label = document.createElement("label");
+    const include = document.createElement("input");
+    include.type = "checkbox";
+    include.checked = true;
+    include.className = "include";
+    label.append(include, document.createTextNode(" " + page.label + " を保存"));
+
+    const chars = document.createElement("span");
+    chars.textContent = Array.from(page.text).length.toLocaleString("ja-JP") + "字";
+
+    const textarea = document.createElement("textarea");
+    textarea.value = page.text;
+    textarea.spellcheck = false;
+    textarea.addEventListener("input", () => {
+      chars.textContent = Array.from(textarea.value).length.toLocaleString("ja-JP") + "字";
+    });
+
+    include.addEventListener("change", () => {
+      section.classList.toggle("excluded", !include.checked);
+    });
+
+    head.append(label, chars);
+    section.append(head, textarea);
+    els.pages.append(section);
   });
 }
 
-async function extract(){
-  if(!sourceFile) return;
-  try{
+function setButtons(ok) {
+  els.reextract.disabled = !sourceFile;
+  els.restore.disabled = !ok;
+  els.copy.disabled = !ok;
+  els.download.disabled = !ok;
+  els.share.disabled = !ok;
+}
+
+async function extract() {
+  if (!sourceFile) return;
+
+  try {
     setButtons(false);
     els.status.classList.add("busy");
-    els.status.textContent=`「${sourceFile.name}」を受け取りました。本文カラムを解析中…`;
+    els.status.textContent = "「" + sourceFile.name + "」をMuPDFで解析します…";
 
-    const result=await extractSafariPrintNovel(sourceFile);
-    if(!result.text.trim()) throw new Error("本文を抽出できませんでした。");
+    const { pageTexts, metaTitle } = await extractWithMuPDF(sourceFile);
+    const result = extractNovelFromPageTexts(pageTexts, metaTitle, sourceFile.name);
 
-    els.title.value=result.title;
-    logicalPages=[{label:"本文",text:result.text}];
-    originalPages=logicalPages.map(p=>({...p}));
-    drawPages(logicalPages);
+    els.title.value = result.title;
+    originalPages = [{ label:"本文", text:result.text }];
+    drawPages(originalPages);
 
-    const total=Array.from(result.text).length;
-    const siteInfo=result.siteMarker
-      ? `／pictBLand ${result.siteMarker.current} / ${result.siteMarker.total}`
+    const siteInfo = result.siteMarker
+      ? "／pictBLand " + result.siteMarker.current + " / " + result.siteMarker.total
       : "";
 
     els.status.classList.remove("busy");
-    els.status.textContent=
-      `抽出成功：PDF ${result.physicalCount}枚 → 本文1区切り／${total.toLocaleString("ja-JP")}字${siteInfo}。` +
-      (result.siteMarker && result.siteMarker.current<result.siteMarker.total
-        ? ` このPDFにはpictBLandの${result.siteMarker.current}/${result.siteMarker.total}ページ目だけが含まれています。`
-        : "");
+    els.status.textContent =
+      "抽出成功：MuPDF／PDF " + result.physicalCount + "枚 → 本文 " +
+      Array.from(result.text).length.toLocaleString("ja-JP") + "字" + siteInfo + "。";
 
     setButtons(true);
-  }catch(err){
-    els.pages.innerHTML=`<div class="warn">抽出できませんでした：${escapeHtml(err?.message||err)}<br>PDFに文字が入っていても、文字レイヤーの構造によって抽出に失敗する場合があります。</div>`;
+  } catch (err) {
     els.status.classList.remove("busy");
-    els.status.textContent="抽出失敗";
-    setButtons(false,true);
+    els.status.textContent = "抽出失敗";
+
+    els.pages.innerHTML =
+      '<div class="warn">抽出できませんでした：' +
+      escapeHtml(err?.message || err) +
+      "<br>MuPDFエンジンでの取得に失敗しました。</div>";
+
+    setButtons(false);
   }
 }
-function escapeHtml(s){return String(s).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m]))}
-function setButtons(ok,allowRe=true){
-  els.reextract.disabled=!sourceFile||!allowRe;
-  els.restore.disabled=!ok;els.copy.disabled=!ok;els.download.disabled=!ok;els.share.disabled=!ok;
-}
-function buildOutput(){
-  const pages=[...els.pages.querySelectorAll(".page")].filter(p=>p.querySelector(".include")?.checked).map(p=>cleanText(p.querySelector("textarea")?.value||"")).filter(Boolean);
-  const parts=[];
-  if(els.metadata.checked&&els.title.value.trim()) parts.push(els.title.value.trim(),"");
-  parts.push(pages.join("\n\n\n\n\n\n"));
-  return normalizeNewlines(parts.join("\n")).replace(/^\n+|\n+$/g,"")+"\n";
-}
-function restore(){
-  drawPages(originalPages);
-  els.status.textContent="抽出直後の本文に戻しました。";
-}
-async function copyText(){
-  const text=buildOutput();if(!text.trim()) return;
-  try{await navigator.clipboard.writeText(text);els.status.textContent="TXT本文をコピーしました。"}
-  catch{els.status.textContent="コピーできませんでした。"}
-}
-function downloadText(){
-  const text=buildOutput();if(!text.trim()) return;
-  const file=new File([text],safeFileName(els.title.value),{type:"text/plain;charset=utf-8"});
-  const url=URL.createObjectURL(file);const a=document.createElement("a");a.href=url;a.download=file.name;a.click();
-  setTimeout(()=>URL.revokeObjectURL(url),30000);els.status.textContent="TXTをダウンロードしました。";
-}
-async function shareText(){
-  const text=buildOutput();if(!text.trim()) return;
-  const file=new File([text],safeFileName(els.title.value),{type:"text/plain;charset=utf-8"});
-  if(!navigator.share||!navigator.canShare?.({files:[file]})){els.status.textContent="このブラウザではファイル共有に対応していません。";return}
-  try{await navigator.share({files:[file],title:els.title.value.trim()||"pictBLand小説"});els.status.textContent="共有シートへ渡しました。"}
-  catch(err){els.status.textContent=err?.name==="AbortError"?"共有をキャンセルしました。":`共有できませんでした：${err?.message||err}`}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, ch => ({
+    "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"
+  }[ch]));
 }
 
-els.file.addEventListener("change",()=>{
-  sourceFile=els.file.files?.[0]||null;
-  if(!sourceFile) return;
+function buildOutput() {
+  const pages = [...els.pages.querySelectorAll(".page")]
+    .filter(page => page.querySelector(".include")?.checked)
+    .map(page => cleanText(page.querySelector("textarea")?.value || "", 3))
+    .filter(Boolean);
+
+  const parts = [];
+
+  if (els.metadata.checked && els.title.value.trim()) {
+    parts.push(els.title.value.trim(), "");
+  }
+
+  parts.push(pages.join("\n\n\n\n\n\n"));
+  return normalizeNewlines(parts.join("\n")).replace(/^\n+|\n+$/g, "") + "\n";
+}
+
+function restore() {
+  drawPages(originalPages);
+  els.status.textContent = "抽出直後の本文に戻しました。";
+}
+
+async function copyText() {
+  const text = buildOutput();
+  if (!text.trim()) return;
+
+  try {
+    await navigator.clipboard.writeText(text);
+    els.status.textContent = "TXT本文をコピーしました。";
+  } catch {
+    els.status.textContent = "コピーできませんでした。";
+  }
+}
+
+function downloadText() {
+  const text = buildOutput();
+  if (!text.trim()) return;
+
+  const file = new File([text], safeFileName(els.title.value), {
+    type:"text/plain;charset=utf-8"
+  });
+
+  const url = URL.createObjectURL(file);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = file.name;
+  a.style.display = "none";
+  document.body.append(a);
+  a.click();
+  a.remove();
+
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+  els.status.textContent = "TXTをダウンロードしました。";
+}
+
+async function shareText() {
+  const text = buildOutput();
+  if (!text.trim()) return;
+
+  const file = new File([text], safeFileName(els.title.value), {
+    type:"text/plain;charset=utf-8"
+  });
+
+  if (!navigator.share || !navigator.canShare?.({files:[file]})) {
+    els.status.textContent = "このブラウザではファイル共有に対応していません。";
+    return;
+  }
+
+  try {
+    await navigator.share({
+      files:[file],
+      title:els.title.value.trim() || "pictBLand小説"
+    });
+    els.status.textContent = "共有シートへ渡しました。";
+  } catch (err) {
+    els.status.textContent = err?.name === "AbortError"
+      ? "共有をキャンセルしました。"
+      : "共有できませんでした：" + (err?.message || err);
+  }
+}
+
+els.file.addEventListener("change", () => {
+  sourceFile = els.file.files?.[0] || null;
+  if (!sourceFile) return;
+
   els.status.classList.add("busy");
-  els.status.textContent=`PDFを選択しました：「${sourceFile.name}」\n解析を開始します…`;
+  els.status.textContent = "PDFを選択しました：「" + sourceFile.name + "」";
   setTimeout(extract, 50);
 });
-els.reextract.addEventListener("click",extract);
-els.restore.addEventListener("click",restore);
-els.copy.addEventListener("click",copyText);
-els.download.addEventListener("click",downloadText);
-els.share.addEventListener("click",shareText);
-els.mode.addEventListener("change",()=>{if(sourceFile)extract()});
-els.removeUi.addEventListener("change",()=>{if(sourceFile)extract()});
-els.removeSmall.addEventListener("change",()=>{if(sourceFile)extract()});
+
+els.reextract.addEventListener("click", extract);
+els.restore.addEventListener("click", restore);
+els.copy.addEventListener("click", copyText);
+els.download.addEventListener("click", downloadText);
+els.share.addEventListener("click", shareText);
+els.mode.addEventListener("change", () => { if (sourceFile) extract(); });
+els.removeUi.addEventListener("change", () => { if (sourceFile) extract(); });
+
+els.removeSmall.disabled = true;
+els.removeSmall.checked = false;
+els.removeSmall.closest("label").title = "MuPDF版では文字レイヤーを直接読みます。";
+
+els.status.textContent = "MuPDFエンジン準備中…";
+loadMuPDF()
+  .then(() => {
+    els.status.classList.remove("busy");
+    els.status.textContent = "✅ MuPDF起動OK。PDFを選択してください。";
+  })
+  .catch(err => {
+    els.status.classList.remove("busy");
+    els.status.textContent = "⚠️ MuPDFエンジンを読み込めません：" + (err?.message || err);
+  });
 </script>
 </body>
 </html>
