@@ -47,7 +47,7 @@
 <body>
 <header>
   <div class="top">
-    <h1>📄 pictBLand PDF → TXT <small style="font-size:11px;color:#727d88;font-weight:600">v0.3.1</small></h1>
+    <h1>📄 pictBLand PDF → TXT <small style="font-size:11px;color:#727d88;font-weight:600">v0.3.2</small></h1>
     <label class="file-label primary">PDFを選択<input id="pdfFile" type="file" accept=".pdf,application/pdf"></label>
     <button id="reextract" disabled>再抽出</button>
     <button id="restore" disabled>↩ 抽出時に戻す</button>
@@ -234,11 +234,6 @@ async function extractSafariPrintNovel(file){
   // タイトル：1枚目の大きめの短文を優先。
   // このPDFでは「ずっと前からひとめぼれ！」が本文より大きいサイズで左上にある。
   const first=physical[0]?.lines||[];
-  const bodyMedian=median(
-    physical.flatMap(p=>p.lines)
-      .filter(line=>line.x>=pWidth(p=undefined))
-  );
-
   const titleCandidates=first
     .filter(line=>{
       const t=line.text.trim();
