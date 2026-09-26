@@ -47,7 +47,7 @@
 <body>
 <header>
   <div class="top">
-    <h1>📄 pictBLand PDF → TXT <small style="font-size:11px;color:#727d88;font-weight:600">v0.4.0</small></h1>
+    <h1>📄 pictBLand PDF → TXT <small style="font-size:11px;color:#727d88;font-weight:600">v0.4.1</small></h1>
     <label class="file-label primary">PDFを選択<input id="pdfFile" type="file" accept=".pdf,application/pdf"></label>
     <button id="reextract" disabled>再抽出</button>
     <button id="restore" disabled>↩ 抽出時に戻す</button>
@@ -177,49 +177,11 @@ async function extractSafariPrintNovel(file){
         };
       });
 
-    const medSize=median(raw.map(x=>x.size))||8;
-    const yTol=Math.max(1.5,medSize*0.22);
-
-    const groups=[];
-    for(const item of raw){
-      let group=groups.find(g=>Math.abs(g.y-item.y)<=yTol);
-      if(!group){
-        group={y:item.y,items:[]};
-        groups.push(group);
-      }
-      group.items.push(item);
-    }
-
-    groups.sort((a,b)=>b.y-a.y);
-
-    const lines=groups.map(group=>{
-      const items=[...group.items].sort((a,b)=>a.x-b.x);
-      let text="";
-      let lastEnd=null;
-
-      for(const item of items){
-        const gap=lastEnd===null?0:item.x-lastEnd;
-        if(text && gap>Math.max(2,item.size*0.28) && charNeedsSpace(text,item.text)) text+=" ";
-        text+=item.text;
-        lastEnd=item.x+item.width;
-      }
-
-      const sizes=items.map(i=>i.size).sort((a,b)=>a-b);
-
-      return {
-        text:text.trimEnd(),
-        x:Math.min(...items.map(i=>i.x)),
-        x1:Math.max(...items.map(i=>i.x+i.width)),
-        y:group.y,
-        size:sizes[Math.floor(sizes.length/2)]||medSize
-      };
-    }).filter(line=>line.text.trim());
-
     pages.push({
       page:p,
       width:viewport.width,
       height:viewport.height,
-      lines
+      raw
     });
   }
 
@@ -240,48 +202,56 @@ async function extractSafariPrintNovel(file){
     return false;
   };
 
-  // まず「行の左端X」だけを使って本文カラムを自動検出。
-  // フォントサイズや固定座標には依存しない。
+  // 生テキストの左端Xをページ幅比率でクラスタ化。
+  // 最も長文量が多い帯を本文として必ず採用する。
   const xClusters=new Map();
 
   for(const page of pages){
-    for(const line of page.lines){
-      const t=line.text.trim();
-      if(t.length<2 || isPrintNoise(t) || isUiOnly(t)) continue;
+    for(const item of page.raw){
+      const t=item.text.trim();
+      if(t.length<4 || isPrintNoise(t) || isUiOnly(t)) continue;
 
-      // 端のヘッダー/フッターは候補外。
-      if(line.x<page.width*0.10 || line.x>page.width*0.75) continue;
+      const ratio=item.x/page.width;
+      if(ratio<0.12 || ratio>0.75) continue;
+      if(item.size<2.5) continue;
 
-      const key=Math.round(line.x/6)*6;
-      const current=xClusters.get(key)||{x:key,score:0,count:0};
+      const key=Math.round(ratio/0.01)*0.01;
+      const current=xClusters.get(key)||{ratio:key,score:0,count:0,sizes:[]};
 
-      // 小説本文のような長文行ほど強く評価。
       const len=Array.from(t).length;
-      current.score+=Math.min(len,80);
+      const japanese=[...t].filter(ch=>
+        (ch>="ぁ"&&ch<="ヿ") || (ch>="一"&&ch<="龯")
+      ).length;
+      const proseBonus=japanese>=4 ? 1.5 : 1;
+
+      current.score+=Math.min(len,100)*proseBonus;
       current.count+=1;
+      current.sizes.push(item.size);
       xClusters.set(key,current);
     }
   }
 
-  const bodyCluster=[...xClusters.values()]
-    .filter(c=>c.count>=5)
-    .sort((a,b)=>b.score-a.score || b.count-a.count)[0];
+  const ranked=[...xClusters.values()]
+    .sort((a,b)=>b.score-a.score || b.count-a.count);
+
+  const bodyCluster=ranked[0];
 
   if(!bodyCluster){
-    throw new Error("本文位置を自動判定できませんでした。");
+    throw new Error("PDF内の文字位置候補を作れませんでした。");
   }
 
-  const bodyX=bodyCluster.x;
-  const bodyTolerance=14;
+  const bodyRatio=bodyCluster.ratio;
+  const bodySize=median(bodyCluster.sizes)||8;
+  const ratioTolerance=0.025;
 
-  // pictBLand上のページ番号（例：1 / 8）を取得。
+  // pictBLand側のページ番号（例：1 / 8）。
   const siteMarkers=[];
   for(const page of pages){
-    for(const line of page.lines){
-      const t=line.text.trim();
+    for(const item of page.raw){
+      const t=item.text.trim();
       if(/ページ/.test(t)) continue;
 
-      const m=t.match(/^(\d+)\s*\/\s*(\d+)(?:\s+(?:次頁|前頁).*)?$/);
+      const m=t.match(/^(\d+)\s*\/\s*(\d+)$/);
       if(!m) continue;
 
       const current=Number(m[1]);
@@ -295,23 +265,19 @@ async function extractSafariPrintNovel(file){
 
   const siteMarker=siteMarkers.sort((a,b)=>b.total-a.total)[0]||null;
 
-  // タイトル：1枚目の大きめの見出しから取得。
-  const firstLines=pages[0]?.lines||[];
-  const firstBodySizes=firstLines
-    .filter(line=>Math.abs(line.x-bodyX)<=bodyTolerance)
-    .map(line=>line.size);
-  const bodySize=median(firstBodySizes)||median(firstLines.map(line=>line.size))||8;
-
-  const titleCandidates=firstLines
-    .filter(line=>{
-      const t=line.text.trim();
+  // タイトル候補。
+  const firstRaw=pages[0]?.raw||[];
+  const titleCandidates=firstRaw
+    .filter(item=>{
+      const t=item.text.trim();
       if(t.length<2 || t.length>120) return false;
       if(isGenericTitleText(t) || isPrintNoise(t) || isUiOnly(t)) return false;
       if(/^\d+\s*\/\s*\d+/.test(t)) return false;
       if(/^\d+ステキ！?$/.test(t)) return false;
-      return line.size>=bodySize*1.08;
+      if(item.size<bodySize*1.08) return false;
+      return true;
     })
-    .sort((a,b)=>b.size-a.size || a.y-b.y);
+    .sort((a,b)=>b.size-a.size || Array.from(b.text).length-Array.from(a.text).length);
 
   let title=titleCandidates[0]?.text.trim()||"";
 
@@ -323,57 +289,108 @@ async function extractSafariPrintNovel(file){
     title=file.name.replace(/\.pdf$/i,"").trim()||"pictBLand小説";
   }
 
-  // 本文カラムだけを順番に拾い、コメント欄に入ったら終了。
+  // 本文をページ順・行順に再構成。
   const bodyLines=[];
   let stopped=false;
 
   for(const page of pages){
     if(stopped) break;
 
-    const commentIndex=page.lines.findIndex(line=>{
-      const t=line.text.trim();
+    const endItems=page.raw.filter(item=>{
+      const t=item.text.trim();
       return /^(?:投稿ユーザー|コメント)(?:\s|$)/.test(t);
     });
+    const endY=endItems.length ? Math.max(...endItems.map(item=>item.y)) : null;
 
-    const usable=commentIndex>=0
-      ? page.lines.slice(0,commentIndex)
-      : page.lines;
+    const seedItems=page.raw
+      .filter(item=>{
+        const t=item.text.trim();
+        if(!t || isPrintNoise(t) || isUiOnly(t)) return false;
 
-    const selected=usable.filter(line=>{
-      const t=line.text.trim();
+        const ratio=item.x/page.width;
+        if(Math.abs(ratio-bodyRatio)>ratioTolerance) return false;
 
-      if(!t || isPrintNoise(t) || isUiOnly(t)) return false;
-      if(/^\d+\s*\/\s*\d+(?:\s+(?:次頁|前頁).*)?$/.test(t)) return false;
-      if(Math.abs(line.x-bodyX)>bodyTolerance) return false;
+        if(item.size<bodySize*0.68) return false;
+        if(endY!==null && item.y<=endY) return false;
 
-      return true;
-    });
+        return true;
+      })
+      .sort((a,b)=>b.y-a.y);
 
-    // 1ページ内の大きな縦間隔は空行として保持。
+    const rows=[];
+
+    for(const seed of seedItems){
+      if(rows.some(row=>Math.abs(row.y-seed.y)<=2)) continue;
+
+      const parts=page.raw
+        .filter(item=>{
+          if(Math.abs(item.y-seed.y)>2) return false;
+          if(item.x<seed.x-8) return false;
+          if(item.x>seed.x+page.width*0.45) return false;
+          if(item.size<bodySize*0.68) return false;
+          return true;
+        })
+        .sort((a,b)=>a.x-b.x);
+
+      let text="";
+      let lastEnd=null;
+
+      for(const item of parts){
+        if(!item.text) continue;
+
+        const gap=lastEnd===null ? 0 : item.x-lastEnd;
+
+        if(
+          text &&
+          gap>Math.max(2,item.size*0.28) &&
+          charNeedsSpace(text,item.text)
+        ){
+          text+=" ";
+        }
+
+        text+=item.text;
+        lastEnd=item.x+item.width;
+      }
+
+      text=text.trimEnd();
+      const trimmed=text.trim();
+
+      if(!trimmed || isPrintNoise(trimmed) || isUiOnly(trimmed)) continue;
+      if(/^\d+\s*\/\s*\d+(?:\s+(?:次頁|前頁).*)?$/.test(trimmed)) continue;
+
+      rows.push({y:seed.y,text});
+    }
+
+    rows.sort((a,b)=>b.y-a.y);
+
     const gaps=[];
-    for(let i=1;i<selected.length;i++){
-      const gap=Math.abs(selected[i-1].y-selected[i].y);
+    for(let i=1;i<rows.length;i++){
+      const gap=Math.abs(rows[i-1].y-rows[i].y);
       if(gap>0 && gap<80) gaps.push(gap);
     }
 
     const normalStep=median(gaps.filter(g=>g<40))||12;
 
-    for(let i=0;i<selected.length;i++){
+    for(let i=0;i<rows.length;i++){
       if(i>0){
-        const gap=Math.abs(selected[i-1].y-selected[i].y);
+        const gap=Math.abs(rows[i-1].y-rows[i].y);
         if(gap>normalStep*1.65) bodyLines.push("");
       }
-      bodyLines.push(selected[i].text);
+      bodyLines.push(rows[i].text);
     }
 
-    if(commentIndex>=0) stopped=true;
+    if(endY!==null) stopped=true;
   }
 
   const nonEmpty=bodyLines.filter(line=>line.trim());
 
-  if(nonEmpty.length<20){
+  if(nonEmpty.length<10){
+    const debug=ranked.slice(0,5)
+      .map(c=>`${Math.round(c.ratio*100)}%:${c.count}行`)
+      .join(" / ");
+
     throw new Error(
-      `文字は検出できましたが、本文として拾えたのが ${nonEmpty.length} 行だけでした（本文候補 x≈${bodyX}）。`
+      `本文候補が少なすぎます（${nonEmpty.length}行）。位置候補：${debug}`
     );
   }
 
@@ -385,7 +402,8 @@ async function extractSafariPrintNovel(file){
     title,
     text,
     physicalCount:pdf.numPages,
-    bodyX,
+    bodyRatio,
+    bodyRows:nonEmpty.length,
     siteMarker
   };
 }
@@ -617,7 +635,7 @@ async function extract(){
 
     setButtons(true);
   }catch(err){
-    els.pages.innerHTML=`<div class="warn">抽出できませんでした：${escapeHtml(err?.message||err)}<br>文字を選択できないPDFは、このツールではOCRできません。</div>`;
+    els.pages.innerHTML=`<div class="warn">抽出できませんでした：${escapeHtml(err?.message||err)}<br>PDFに文字が入っていても、レイアウト判定に失敗する場合があります。</div>`;
     els.status.classList.remove("busy");
     els.status.textContent="抽出失敗";
     setButtons(false,true);
