@@ -47,7 +47,7 @@
 <body>
 <header>
   <div class="top">
-    <h1>📄 pictBLand PDF → TXT <small style="font-size:11px;color:#727d88;font-weight:600">v1.1.3 MuPDF</small></h1>
+    <h1>📄 pictBLand PDF → TXT <small style="font-size:11px;color:#727d88;font-weight:600">v1.1.2 MuPDF</small></h1>
     <label class="file-label primary">PDFを選択<input id="pdfFile" type="file" accept=".pdf,application/pdf"></label>
     <button id="reextract" disabled>再抽出</button>
     <button id="restore" disabled>↩ 抽出時に戻す</button>
@@ -91,12 +91,6 @@ function normalizeNewlines(text) {
   return String(text ?? "")
     .replace(/\r\n?/g, "\n")
     .replace(/[\u0085\u2028\u2029]/g, "\n");
-}
-
-function normalizeTxtPunctuation(text) {
-  return String(text ?? "")
-    .replace(/!/g, "！")
-    .replace(/\?/g, "？");
 }
 
 function cleanText(text, maxBreaks = 3) {
@@ -792,9 +786,7 @@ function buildOutput() {
   }
 
   parts.push(pages.join("\n\n\n\n\n\n"));
-  return normalizeTxtPunctuation(
-    normalizeNewlines(parts.join("\n")).replace(/^\n+|\n+$/g, "")
-  ) + "\n";
+  return normalizeNewlines(parts.join("\n")).replace(/^\n+|\n+$/g, "") + "\n";
 }
 
 function restore() {
