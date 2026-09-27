@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.1.6
+// @version      0.1.7
 // @description  pictBLandの閲覧可能な小説をページ分割して編集・整形し、TXTとしてダウンロード／共有保存します。
 // @match        https://pictbland.net/items/detail/*
 // @run-at       document-idle
@@ -36,6 +36,12 @@
 
   function normalizeTxtPunctuation(text) {
     return String(text ?? '')
+      .replace(/\u203C\uFE0F?/g, '！！')
+      .replace(/\u2049\uFE0F?/g, '！？')
+      .replace(/\u2047\uFE0F?/g, '？？')
+      .replace(/\u2048\uFE0F?/g, '？！')
+      .replace(/\u2757\uFE0F?/g, '！')
+      .replace(/\u2753\uFE0F?/g, '？')
       .replace(/!/g, '！')
       .replace(/\?/g, '？');
   }
