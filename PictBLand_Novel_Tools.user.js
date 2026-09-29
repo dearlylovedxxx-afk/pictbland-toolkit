@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.1.7
-// @description  pictBLandの閲覧可能な小説をページ分割して編集・整形し、TXTとしてダウンロード／共有保存します。
+// @version      0.1.8
+// @description  pictBLandの小説TXT化と、検索語の保存・呼び出しに対応します。
 // @match        https://pictbland.net/items/detail/*
+// @match        https://pictbland.net/tags/index/*
 // @run-at       document-idle
 // @grant        none
 // @updateURL    https://raw.githubusercontent.com/dearlylovedxxx-afk/pictbland-toolkit/main/PictBLand_Novel_Tools.meta.js
@@ -737,9 +738,215 @@
       return;
     }
 
-    // @match が作品詳細ページに限定されているため、判定せず必ずUIを出す。
-    buildUi();
+    // 検索ページでも同じuserscriptを動かすため、小説TXT UIは作品詳細ページだけに出す。
+    if (/^\/items\/detail\//.test(location.pathname)) buildUi();
   }
 
   init();
+})();
+
+
+
+// ---- Saved pictBLand search words (v0.1.8) ----
+(() => {
+  'use strict';
+  if (window.__pictblandSavedSearchWordsV018) return;
+  window.__pictblandSavedSearchWordsV018 = true;
+
+  const STORAGE_KEY = 'pictbland-saved-search-words-v1';
+  const BUTTON_ID = 'pbsw-button';
+  const ROOT_ID = 'pbsw-root';
+  const MAX_SAVED = 200;
+
+  function decodeWordFromPath(pathname = location.pathname) {
+    const m = pathname.match(/^\/tags\/index\/(.*)$/);
+    if (!m) return '';
+    let raw = m[1] || '';
+    try { raw = decodeURIComponent(raw); } catch {}
+    // pictBLandのタグ検索URLは +検索語+ の形になるため、表示時だけ外側の+を外す。
+    return raw.replace(/^\++|\++$/g, '').trim();
+  }
+
+  function searchHrefForWord(word) {
+    const clean = String(word || '').trim();
+    if (!clean) return '';
+    return '/tags/index/+' + encodeURIComponent(clean).replace(/%20/g, '+') + '+';
+  }
+
+  function currentWord() {
+    if (!/^\/tags\/index\//.test(location.pathname)) return '';
+    return decodeWordFromPath();
+  }
+
+  function readSaved() {
+    try {
+      const value = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+      if (!Array.isArray(value)) return [];
+      return value.filter(x => x && typeof x.word === 'string' && x.word.trim());
+    } catch {
+      return [];
+    }
+  }
+
+  function writeSaved(rows) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(rows.slice(0, MAX_SAVED)));
+    render();
+  }
+
+  function saveCurrent() {
+    const word = currentWord();
+    if (!word) {
+      const entered = prompt('保存するpictBLand検索語を入力してください。', '');
+      if (entered === null || !entered.trim()) return;
+      saveWord(entered.trim());
+      return;
+    }
+    saveWord(word);
+  }
+
+  function saveWord(word) {
+    const rows = readSaved();
+    const existing = rows.find(x => x.word === word);
+    const name = prompt(existing ? 'この検索語は保存済みです。表示名を変更しますか？' : '保存名を入力してください。', existing?.name || word);
+    if (name === null || !name.trim()) return;
+    const now = Date.now();
+    if (existing) {
+      existing.name = name.trim();
+      existing.updatedAt = now;
+    } else {
+      rows.unshift({id: crypto.randomUUID(), name: name.trim(), word, createdAt: now, updatedAt: now});
+    }
+    writeSaved(rows);
+  }
+
+  function rename(id) {
+    const rows = readSaved(), row = rows.find(x => x.id === id);
+    if (!row) return;
+    const name = prompt('保存名を変更', row.name || row.word);
+    if (name === null || !name.trim()) return;
+    row.name = name.trim();
+    row.updatedAt = Date.now();
+    writeSaved(rows);
+  }
+
+  function remove(id) {
+    const rows = readSaved(), row = rows.find(x => x.id === id);
+    if (!row || !confirm('「' + (row.name || row.word) + '」を削除しますか？')) return;
+    writeSaved(rows.filter(x => x.id !== id));
+  }
+
+  function move(id, delta) {
+    const rows = readSaved();
+    const i = rows.findIndex(x => x.id === id), j = i + delta;
+    if (i < 0 || j < 0 || j >= rows.length) return;
+    [rows[i], rows[j]] = [rows[j], rows[i]];
+    writeSaved(rows);
+  }
+
+  function openWord(word) {
+    const href = searchHrefForWord(word);
+    if (href) location.assign(href);
+  }
+
+  let root = null;
+  function render() {
+    if (!root) return;
+    const rows = readSaved();
+    const list = root.querySelector('.pbsw-list');
+    const now = currentWord();
+    root.querySelector('.pbsw-current').textContent = now ? '現在の検索語：' + now : '保存済み検索語からすぐ検索できます。';
+    list.replaceChildren();
+
+    if (!rows.length) {
+      const p = document.createElement('p');
+      p.className = 'pbsw-empty';
+      p.textContent = '保存した検索語はまだありません。検索ページで「現在の検索語を保存」を押してください。';
+      list.append(p);
+      return;
+    }
+
+    rows.forEach((row, index) => {
+      const card = document.createElement('article');
+      card.className = 'pbsw-card';
+
+      const open = document.createElement('button');
+      open.type = 'button';
+      open.className = 'pbsw-open';
+      open.addEventListener('click', () => openWord(row.word));
+      const name = document.createElement('strong');
+      name.textContent = row.name || row.word;
+      const word = document.createElement('span');
+      word.textContent = row.word;
+      open.append(name, word);
+
+      const actions = document.createElement('div');
+      actions.className = 'pbsw-actions';
+      const make = (label, fn, disabled=false) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = label;
+        b.disabled = disabled;
+        b.addEventListener('click', fn);
+        return b;
+      };
+      actions.append(
+        make('名前変更', () => rename(row.id)),
+        make('↑', () => move(row.id, -1), index === 0),
+        make('↓', () => move(row.id, 1), index === rows.length - 1),
+        make('削除', () => remove(row.id))
+      );
+
+      card.append(open, actions);
+      list.append(card);
+    });
+  }
+
+  function build() {
+    if (!document.body || root) return;
+
+    const style = document.createElement('style');
+    style.textContent = `
+      #${BUTTON_ID}{position:fixed;right:14px;bottom:max(128px,calc(env(safe-area-inset-bottom) + 128px));z-index:2147483000;border:0;border-radius:999px;padding:11px 15px;background:#5b4a8d;color:#fff;font:700 14px/1.2 -apple-system,BlinkMacSystemFont,'Noto Sans JP',sans-serif;box-shadow:0 4px 16px #0003}
+      #${ROOT_ID}{display:none;position:fixed;inset:0;z-index:2147483646;background:#f4f6f8;color:#202124;overflow:auto;-webkit-overflow-scrolling:touch;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Noto Sans JP',sans-serif}
+      #${ROOT_ID}.open{display:block}
+      #${ROOT_ID} *{box-sizing:border-box}
+      #${ROOT_ID} .pbsw-wrap{max-width:820px;margin:auto;padding:18px 14px 80px}
+      #${ROOT_ID} .pbsw-head{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;background:#fff;border:1px solid #ded9e8;border-radius:12px;padding:14px;margin-bottom:12px;position:sticky;top:0;z-index:2}
+      #${ROOT_ID} h2{font-size:18px;margin:0}
+      #${ROOT_ID} button{font:inherit;border:1px solid #cfc8dc;border-radius:8px;background:#fff;color:#2d2640;padding:9px 10px}
+      #${ROOT_ID} button:disabled{opacity:.45}
+      #${ROOT_ID} .pbsw-save{background:#7356a8;color:#fff;border-color:#7356a8;font-weight:700}
+      #${ROOT_ID} .pbsw-current{flex:1 1 100%;font-size:12px;color:#6b6478}
+      #${ROOT_ID} .pbsw-card{background:#fff;border:1px solid #ded9e8;border-radius:12px;padding:10px;margin-bottom:10px}
+      #${ROOT_ID} .pbsw-open{display:flex;width:100%;text-align:left;flex-direction:column;gap:4px;border:0;background:transparent;padding:5px}
+      #${ROOT_ID} .pbsw-open strong{font-size:15px}
+      #${ROOT_ID} .pbsw-open span{font-size:12px;color:#716b7b;overflow-wrap:anywhere}
+      #${ROOT_ID} .pbsw-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+      #${ROOT_ID} .pbsw-actions button{font-size:12px;padding:7px 9px}
+      #${ROOT_ID} .pbsw-empty{background:#fff;border:1px solid #ded9e8;border-radius:12px;padding:18px;color:#716b7b}
+      @media(max-width:600px){#${BUTTON_ID}{right:12px;padding:10px 13px}#${ROOT_ID} .pbsw-wrap{padding:10px 8px 70px}#${ROOT_ID} h2{font-size:16px}}
+    `;
+    document.head.append(style);
+
+    const button = document.createElement('button');
+    button.id = BUTTON_ID;
+    button.type = 'button';
+    button.textContent = '🔖 検索';
+    button.addEventListener('click', () => {
+      render();
+      root.classList.add('open');
+    });
+
+    root = document.createElement('section');
+    root.id = ROOT_ID;
+    root.innerHTML = '<div class="pbsw-wrap"><div class="pbsw-head"><h2>🔖 pictBLand 保存検索</h2><button type="button" class="pbsw-save">現在の検索語を保存</button><button type="button" class="pbsw-close">閉じる</button><div class="pbsw-current"></div></div><div class="pbsw-list"></div></div>';
+    root.querySelector('.pbsw-save').addEventListener('click', saveCurrent);
+    root.querySelector('.pbsw-close').addEventListener('click', () => root.classList.remove('open'));
+
+    document.body.append(button, root);
+    render();
+  }
+
+  if (document.body) build();
+  else addEventListener('DOMContentLoaded', build, {once:true});
 })();
