@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.1.9
-// @description  pictBLandの小説TXT化と、検索語の保存・呼び出しに対応します。
+// @version      0.2.0
+// @description  pictBLandツールを1つのボタンに統合。小説TXT化と保存検索・クイック検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
 // @grant        none
@@ -980,6 +980,198 @@
     render();
   }
 
+  function openPanel() {
+    build();
+    if (!root) return;
+    render();
+    root.classList.add('open');
+    setTimeout(() => quickInput?.focus(), 0);
+  }
+
+  function closePanel() {
+    root?.classList.remove('open');
+  }
+
+  function countSaved() {
+    return readSaved().length;
+  }
+
+  window.__pictblandSavedSearchUi = {open:openPanel, close:closePanel, render, count:countSaved, storageKey:STORAGE_KEY};
+
   if (document.body) build();
   else addEventListener('DOMContentLoaded', build, {once:true});
+})();
+
+
+// ---- Unified pictBLand tools shell (v0.2.0) ----
+(() => {
+  'use strict';
+  if (window.__pictblandUnifiedToolsV020) return;
+  window.__pictblandUnifiedToolsV020 = true;
+
+  const BAR_ID='pictbland-tools-unified-bar';
+  const LAUNCH_ID='pictbland-tools-unified-launch';
+  const PLACEHOLDER_ID='pictbland-tools-unified-placeholder';
+  const OFFSET=76;
+  let active='';
+
+  function isNovelPage() {
+    return /^\/items\/detail\//.test(location.pathname);
+  }
+
+  function novelUi() {
+    return {
+      button:document.getElementById('pbnt-button'),
+      overlay:document.getElementById('pbnt-root')
+    };
+  }
+
+  function searchUi() {
+    return window.__pictblandSavedSearchUi || null;
+  }
+
+  function hideNovel() {
+    novelUi().overlay?.classList.remove('pbnt-open');
+  }
+
+  function hideSearch() {
+    searchUi()?.close?.();
+  }
+
+  function hidePlaceholder() {
+    document.getElementById(PLACEHOLDER_ID)?.classList.remove('open');
+  }
+
+  function showPlaceholder(message) {
+    const p=document.getElementById(PLACEHOLDER_ID);
+    if(!p)return;
+    p.textContent=message;
+    p.classList.add('open');
+  }
+
+  function paintTabs() {
+    const bar=document.getElementById(BAR_ID);
+    if(!bar)return;
+    for(const b of bar.querySelectorAll('[data-tool-tab]')) b.classList.toggle('active',b.dataset.toolTab===active);
+  }
+
+  function openNovel() {
+    active='novel';
+    paintTabs();
+    hidePlaceholder();
+    hideSearch();
+    if(!isNovelPage()){
+      hideNovel();
+      showPlaceholder('📖 小説TXTはpictBLandの小説作品ページで利用できます。');
+      return;
+    }
+    const n=novelUi();
+    if(!n.button||!n.overlay){
+      showPlaceholder('小説TXT機能を準備中です。少し待ってからもう一度お試しください。');
+      return;
+    }
+    if(n.overlay.querySelector('.pbnt-page')) n.overlay.classList.add('pbnt-open');
+    else n.button.click();
+  }
+
+  function openSearch() {
+    active='search';
+    paintTabs();
+    hidePlaceholder();
+    hideNovel();
+    const s=searchUi();
+    if(!s?.open){
+      showPlaceholder('保存検索機能を準備中です。少し待ってからもう一度お試しください。');
+      return;
+    }
+    s.open();
+  }
+
+  function switchTo(tab) {
+    if(tab==='novel')openNovel();
+    else openSearch();
+  }
+
+  function closeAll() {
+    hidePlaceholder();
+    hideNovel();
+    hideSearch();
+    document.getElementById(BAR_ID)?.classList.remove('open');
+  }
+
+  function openShell() {
+    document.getElementById(BAR_ID)?.classList.add('open');
+    switchTo(isNovelPage()?'novel':'search');
+  }
+
+  function build() {
+    if(!document.body||document.getElementById(BAR_ID))return;
+
+    const style=document.createElement('style');
+    style.textContent=`
+      #pbnt-button,#pbsw-button{display:none!important}
+      #pbnt-root,#pbsw-root{top:${OFFSET}px!important;right:0!important;bottom:0!important;left:0!important;height:auto!important}
+      #${LAUNCH_ID}{position:fixed;right:14px;bottom:max(76px,env(safe-area-inset-bottom));z-index:2147483001;border:0;border-radius:999px;padding:12px 16px;background:#7356a8;color:#fff;font:700 14px/1.2 -apple-system,BlinkMacSystemFont,'Noto Sans JP',sans-serif;box-shadow:0 4px 18px #0004}
+      #${BAR_ID}{display:none;position:fixed;top:0;left:0;right:0;height:${OFFSET}px;z-index:2147483647;background:#fff;color:#202124;border-bottom:1px solid #dfe3e8;box-shadow:0 2px 9px #0002;padding:max(7px,env(safe-area-inset-top)) 8px 7px;font-family:-apple-system,BlinkMacSystemFont,'Noto Sans JP',sans-serif}
+      #${BAR_ID}.open{display:flex;align-items:flex-end;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+      #${BAR_ID} .pt-title{font-weight:800;font-size:14px;white-space:nowrap;margin:0 3px 5px 2px}
+      #${BAR_ID} [data-tool-tab],#${BAR_ID} .pt-close,#${BAR_ID} [data-ncb-slot] button{flex:0 0 auto;border:1px solid #cec7dc;background:#fff;color:#33294a;border-radius:9px;padding:9px 10px;font:700 12px/1 -apple-system,BlinkMacSystemFont,'Noto Sans JP',sans-serif}
+      #${BAR_ID} [data-tool-tab].active{background:#7356a8;color:#fff;border-color:#7356a8}
+      #${BAR_ID} [data-ncb-slot]{display:flex;flex:0 0 auto}
+      #${BAR_ID} .pt-close{margin-left:auto}
+      #${PLACEHOLDER_ID}{display:none;position:fixed;top:${OFFSET}px;right:0;bottom:0;left:0;z-index:2147483645;background:#f4f6f8;color:#5f586a;padding:36px 20px;text-align:center;font:14px/1.8 -apple-system,BlinkMacSystemFont,'Noto Sans JP',sans-serif}
+      #${PLACEHOLDER_ID}.open{display:block}
+      @media(max-width:600px){
+        #${BAR_ID}{gap:5px;padding-left:6px;padding-right:6px}
+        #${BAR_ID} .pt-title{display:none}
+        #${BAR_ID} [data-tool-tab],#${BAR_ID} .pt-close,#${BAR_ID} [data-ncb-slot] button{font-size:11px;padding:8px 7px}
+        #${LAUNCH_ID}{right:12px;padding:11px 14px}
+      }
+    `;
+    document.head.append(style);
+
+    const launch=document.createElement('button');
+    launch.id=LAUNCH_ID;
+    launch.type='button';
+    launch.textContent='🧰 pictBLandツール';
+    launch.addEventListener('click',openShell);
+
+    const bar=document.createElement('div');
+    bar.id=BAR_ID;
+
+    const title=document.createElement('div');
+    title.className='pt-title';
+    title.textContent='pictBLandツール';
+
+    const novel=document.createElement('button');
+    novel.type='button';
+    novel.dataset.toolTab='novel';
+    novel.textContent='📖 小説TXT';
+    novel.addEventListener('click',()=>switchTo('novel'));
+
+    const search=document.createElement('button');
+    search.type='button';
+    search.dataset.toolTab='search';
+    search.textContent='🔖 保存検索';
+    search.addEventListener('click',()=>switchTo('search'));
+
+    const cloudSlot=document.createElement('span');
+    cloudSlot.dataset.ncbSlot='pictbland';
+
+    const close=document.createElement('button');
+    close.type='button';
+    close.className='pt-close';
+    close.textContent='閉じる';
+    close.addEventListener('click',closeAll);
+
+    bar.append(title,novel,search,cloudSlot,close);
+
+    const placeholder=document.createElement('div');
+    placeholder.id=PLACEHOLDER_ID;
+
+    document.body.append(launch,bar,placeholder);
+  }
+
+  if(document.body)build();
+  else addEventListener('DOMContentLoaded',build,{once:true});
 })();
