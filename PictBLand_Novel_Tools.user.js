@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.7
+// @version      0.3.8
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
 // @grant        GM.download
 // @grant        GM.xmlhttpRequest
-// @require      https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
+// @require      https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js
 // @connect      *.pictbland.net
 // @updateURL    https://raw.githubusercontent.com/dearlylovedxxx-afk/pictbland-toolkit/main/PictBLand_Novel_Tools.meta.js
 // @downloadURL  https://raw.githubusercontent.com/dearlylovedxxx-afk/pictbland-toolkit/main/PictBLand_Novel_Tools.user.js
@@ -1010,11 +1010,11 @@
 
 
 
-// ---- pictBLand image saver (v0.3.7) ----
+// ---- pictBLand image saver (v0.3.8) ----
 (() => {
   'use strict';
-  if (window.__pictblandImageSaverV037) return;
-  window.__pictblandImageSaverV037 = true;
+  if (window.__pictblandImageSaverV038) return;
+  window.__pictblandImageSaverV038 = true;
 
   const ROOT_ID = 'pbi-root';
   const BUTTON_ID = 'pbi-button';
@@ -1460,26 +1460,32 @@
       statusNode.textContent = 'ZIPに入れる画像がありません。';
       return;
     }
-    if (typeof JSZip === 'undefined') {
+
+    if (!globalThis.fflate?.zipSync) {
       statusNode.textContent = 'ZIP機能を読み込めませんでした。スクリプトを再読み込みしてください。';
       return;
     }
 
-    const zip = new JSZip();
+    const files = {};
     let ok = 0;
     let failed = 0;
 
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
       statusNode.textContent =
-        'ZIP作成中… ' + (i + 1) + ' / ' + entries.length + '（PNG変換）';
+        'ZIP準備中… ' + (i + 1) + ' / ' + entries.length + '（PNG変換）';
+
       try {
         const png = await getPngBlob(entry.row.url);
-        zip.file(buildFileName(entry.index, found.length), png);
+        const bytes = new Uint8Array(await png.arrayBuffer());
+        files[buildFileName(entry.index, found.length)] = bytes;
         ok++;
       } catch {
         failed++;
       }
+
+      // iOSでUIが固まらないように一度イベントループへ返す。
+      await sleep(0);
     }
 
     if (!ok) {
@@ -1487,16 +1493,22 @@
       return;
     }
 
-    statusNode.textContent = 'ZIPを書き出し中…';
-    const blob = await zip.generateAsync({
-      type: 'blob',
-      compression: 'STORE'
-    });
-    await saveBlob(blob, zipName);
+    statusNode.textContent = 'ZIPを書き出し中… ' + ok + '枚';
 
-    statusNode.textContent = failed
-      ? 'ZIP保存完了：' + ok + '枚／失敗 ' + failed + '枚'
-      : 'ZIP保存完了：' + ok + '枚';
+    try {
+      // PNGは既に圧縮済みなのでZIP側はlevel 0。
+      // JSZipよりメモリ負荷と処理時間を抑えやすい。
+      const zipped = globalThis.fflate.zipSync(files, {level: 0});
+      const blob = new Blob([zipped], {type:'application/zip'});
+      await saveBlob(blob, zipName);
+
+      statusNode.textContent = failed
+        ? 'ZIP保存完了：' + ok + '枚／失敗 ' + failed + '枚'
+        : 'ZIP保存完了：' + ok + '枚';
+    } catch (err) {
+      statusNode.textContent =
+        'ZIP作成に失敗しました：' + (err?.message || err || '不明なエラー');
+    }
   }
 
   async function saveSelectedZip() {
