@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.2
+// @version      0.3.3
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1006,11 +1006,11 @@
 
 
 
-// ---- pictBLand image saver (v0.3.2) ----
+// ---- pictBLand image saver (v0.3.3) ----
 (() => {
   'use strict';
-  if (window.__pictblandImageSaverV032) return;
-  window.__pictblandImageSaverV032 = true;
+  if (window.__pictblandImageSaverV033) return;
+  window.__pictblandImageSaverV033 = true;
 
   const ROOT_ID = 'pbi-root';
   const BUTTON_ID = 'pbi-button';
@@ -1438,6 +1438,62 @@
     })).filter(x => x.checked && x.row);
   }
 
+  function readRange() {
+    const startInput = root?.querySelector('.pbi-range-start');
+    const endInput = root?.querySelector('.pbi-range-end');
+    const total = found.length;
+
+    let start = Number(startInput?.value || 1);
+    let end = Number(endInput?.value || total || 1);
+
+    if (!Number.isFinite(start)) start = 1;
+    if (!Number.isFinite(end)) end = total || 1;
+
+    start = Math.max(1, Math.min(total || 1, Math.floor(start)));
+    end = Math.max(1, Math.min(total || 1, Math.floor(end)));
+
+    if (start > end) [start, end] = [end, start];
+
+    if (startInput) startInput.value = String(start);
+    if (endInput) endInput.value = String(end);
+
+    return {start, end};
+  }
+
+  async function saveRange() {
+    if (!found.length) {
+      statusNode.textContent = '保存できる画像がありません。';
+      return;
+    }
+
+    const {start, end} = readRange();
+    const rows = found.slice(start - 1, end).map((row, offset) => ({
+      row,
+      index: start - 1 + offset
+    }));
+
+    const btn = root.querySelector('.pbi-save-range');
+    if (btn) btn.disabled = true;
+
+    let ok = 0;
+    let failed = 0;
+
+    for (let i = 0; i < rows.length; i++) {
+      const entry = rows[i];
+      statusNode.textContent =
+        start + '〜' + end + '枚目を保存中… ' + (i + 1) + ' / ' + rows.length;
+      const result = await saveOne(entry.row, entry.index, found.length);
+      if (result.ok) ok++;
+      else failed++;
+      await sleep(180);
+    }
+
+    if (btn) btn.disabled = false;
+    statusNode.textContent = failed
+      ? start + '〜' + end + '枚目：' + ok + '枚保存／失敗 ' + failed + '枚'
+      : start + '〜' + end + '枚目を保存しました（' + ok + '枚）。';
+  }
+
   async function saveSelected() {
     const selected = selectedRows();
     if (!selected.length) {
@@ -1544,9 +1600,17 @@
     let picked;
     let sourceNote = '';
 
-    if (expected && linkedUrls.length === expected) {
-      // pictBLandのアルバムでは、表示用<img>とは別に原寸表示用<a href>が
-      // 作品枚数ぶん並ぶことがある。枚数が一致する場合はこちらを優先する。
+    if (expected && rawUrls.length === expected * 2) {
+      // 実ページ上で「前半=表示用、後半=同内容の原寸側」と並ぶケース。
+      // 作品枚数のちょうど2倍なら後半だけを採用する。
+      picked = {
+        urls: rawUrls.slice(expected),
+        filtered: true,
+        rawCount: rawUrls.length,
+        forcedSecondHalf: true
+      };
+      sourceNote = '（後半の原寸候補を採用）';
+    } else if (expected && linkedUrls.length === expected) {
       picked = {
         urls: linkedUrls,
         filtered: true,
@@ -1564,9 +1628,20 @@
     found = picked.urls.map(url => ({url}));
     render();
 
+    const rangeStart = root?.querySelector('.pbi-range-start');
+    const rangeEnd = root?.querySelector('.pbi-range-end');
+    if (rangeStart) {
+      rangeStart.max = String(Math.max(1, found.length));
+      if (!rangeStart.value || Number(rangeStart.value) > found.length) rangeStart.value = '1';
+    }
+    if (rangeEnd) {
+      rangeEnd.max = String(Math.max(1, found.length));
+      rangeEnd.value = String(Math.max(1, found.length));
+    }
+
     if (!found.length) {
       statusNode.textContent = '作品画像を検出できませんでした。作品ページを一度表示し直してから「再検出」を押してください。';
-    } else if (picked.originalLinks) {
+    } else if (picked.forcedSecondHalf || picked.originalLinks) {
       statusNode.textContent =
         '検出：' + found.length + ' / ' + expected + '枚 ' + sourceNote;
     } else if (picked.filtered) {
@@ -1597,6 +1672,8 @@
       '#' + ROOT_ID + ' .pbi-primary{background:#7356a8;color:#fff;border-color:#7356a8}',
       '#' + ROOT_ID + ' .pbi-meta{max-width:980px;margin:8px auto 0;display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:12px;color:#59636e}',
       '#' + ROOT_ID + ' .pbi-meta input[type=text]{min-width:220px;max-width:100%;border:1px solid #ccd2d9;border-radius:7px;padding:6px}',
+      '#' + ROOT_ID + ' .pbi-range{max-width:980px;margin:8px auto 0;display:flex;gap:7px;align-items:center;flex-wrap:wrap;font-size:12px;color:#59636e}',
+      '#' + ROOT_ID + ' .pbi-range input[type=number]{width:72px;border:1px solid #ccd2d9;border-radius:7px;padding:6px;background:#fff;color:#202124}',
       '#' + ROOT_ID + ' .pbi-status{max-width:980px;margin:7px auto 0;font-size:12px;color:#59636e;overflow-wrap:anywhere}',
       '#' + ROOT_ID + ' .pbi-list{max-width:980px;margin:0 auto;padding:12px 10px 80px;display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px}',
       '#' + ROOT_ID + ' .pbi-card{background:#fff;border:1px solid #dfe3e8;border-radius:10px;padding:9px;min-width:0}',
@@ -1635,6 +1712,7 @@
           '<button type="button" class="pbi-close">閉じる</button>' +
         '</div>' +
         '<div class="pbi-meta"><label>ファイル名：<input type="text" class="pbi-title" placeholder="作品タイトル"></label><span>作品画像だけを検出し、01・02…の連番で保存します。</span></div>' +
+        '<div class="pbi-range"><strong>保存範囲：</strong><input type="number" class="pbi-range-start" min="1" value="1"><span>〜</span><input type="number" class="pbi-range-end" min="1" value="1"><span>枚目</span><button type="button" class="pbi-save-range pbi-primary">⬇️ この範囲を保存</button></div>' +
         '<div class="pbi-status">まだ検出していません。</div>' +
       '</div>' +
       '<main class="pbi-list"></main>';
@@ -1645,6 +1723,7 @@
 
     root.querySelector('.pbi-detect').addEventListener('click', detect);
     root.querySelector('.pbi-save-selected').addEventListener('click', saveSelected);
+    root.querySelector('.pbi-save-range').addEventListener('click', saveRange);
     root.querySelector('.pbi-select-all').addEventListener('click', () => {
       listNode.querySelectorAll('.pbi-check').forEach(x => x.checked = true);
     });
