@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.4
+// @version      0.3.5
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1006,11 +1006,11 @@
 
 
 
-// ---- pictBLand image saver (v0.3.4) ----
+// ---- pictBLand image saver (v0.3.5) ----
 (() => {
   'use strict';
-  if (window.__pictblandImageSaverV034) return;
-  window.__pictblandImageSaverV034 = true;
+  if (window.__pictblandImageSaverV035) return;
+  window.__pictblandImageSaverV035 = true;
 
   const ROOT_ID = 'pbi-root';
   const BUTTON_ID = 'pbi-button';
@@ -1054,7 +1054,7 @@
 
   function extractTitle() {
     const generic = /(?:pictbland\.net|pictBLand|同人\s*[・･]?\s*BL|イラスト\s*[・･]?\s*小説投稿SNS|小説投稿SNS)/i;
-    const reject = /^(?:R18|R-18|鍵付|編集|表紙を表示|アルバムを表示|クリックしてアルバムを表示|ステキ！?|ブクマ|非公開|コメント|プロフィールタグ|作品に戻る|投稿日|画像枚数|文字数)$/i;
+    const reject = /^(?:R18|R-18|鍵付|編集|編集する|表紙を表示|アルバムを表示|クリックしてアルバムを表示|ステキ！?|ブクマ|非公開|コメント|プロフィールタグ|キーワードタグを編集|タグを編集|作品に戻る|投稿日|画像枚数|文字数)$/i;
 
     const clean = value => String(value || '')
       .replace(/\s+/g, ' ')
@@ -1068,6 +1068,8 @@
         text.length <= 180 &&
         !generic.test(text) &&
         !reject.test(text) &&
+        !/(?:キーワード)?タグを編集/.test(text) &&
+        !/^編集(?:する)?$/.test(text) &&
         !/^画像枚数\s*[：:]?\s*\d+\s*枚/.test(text) &&
         !/^投稿日\s*[：:]?/.test(text);
     };
@@ -1075,12 +1077,15 @@
     // 明示的なメタ情報を最優先。
     const metaCandidates = [
       document.querySelector('meta[property="og:title"]')?.content,
-      document.querySelector('meta[name="twitter:title"]')?.content,
-      document.querySelector('meta[itemprop="name"]')?.content
+      document.querySelector('meta[name="twitter:title"]')?.content
     ];
     for (const value of metaCandidates) {
       if (usable(value)) return clean(value);
     }
+
+    // ブラウザのページタイトルは作品名を含むことが多いので、DOM探索より優先。
+    const pageTitle = clean(document.title);
+    if (usable(pageTitle)) return pageTitle;
 
     // title / subject / item-name 系の要素を探す。
     const explicit = [...document.querySelectorAll(
@@ -1160,9 +1165,6 @@
       .map(el => clean(el.textContent))
       .find(usable);
     if (heading) return heading;
-
-    const docTitle = clean(document.title);
-    if (usable(docTitle)) return docTitle;
 
     return 'pictBLand_' + itemId();
   }
