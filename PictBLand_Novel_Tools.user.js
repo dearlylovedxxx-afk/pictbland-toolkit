@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.0
+// @version      0.3.1
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1006,11 +1006,11 @@
 
 
 
-// ---- pictBLand image saver (v0.3.0) ----
+// ---- pictBLand image saver (v0.3.1) ----
 (() => {
   'use strict';
-  if (window.__pictblandImageSaverV030) return;
-  window.__pictblandImageSaverV030 = true;
+  if (window.__pictblandImageSaverV031) return;
+  window.__pictblandImageSaverV031 = true;
 
   const ROOT_ID = 'pbi-root';
   const BUTTON_ID = 'pbi-button';
@@ -1151,6 +1151,73 @@
     }
 
     return rows;
+  }
+
+  function imageDimensions(url) {
+    return new Promise(resolve => {
+      const img = new Image();
+      let done = false;
+      const finish = value => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        img.onload = null;
+        img.onerror = null;
+        resolve(value);
+      };
+      const timer = setTimeout(() => finish({width:0,height:0,area:0}), 8000);
+      img.onload = () => {
+        const width = img.naturalWidth || 0;
+        const height = img.naturalHeight || 0;
+        finish({width,height,area:width * height});
+      };
+      img.onerror = () => finish({width:0,height:0,area:0});
+      img.referrerPolicy = 'strict-origin-when-cross-origin';
+      img.src = url;
+    });
+  }
+
+  async function preferOriginalSet(urls, expected) {
+    if (!expected || urls.length <= expected || urls.length % expected !== 0) {
+      return {urls, filtered:false, rawCount:urls.length};
+    }
+
+    const setCount = urls.length / expected;
+    if (setCount < 2 || setCount > 6) {
+      return {urls, filtered:false, rawCount:urls.length};
+    }
+
+    const sets = [];
+    for (let s = 0; s < setCount; s++) {
+      const part = urls.slice(s * expected, (s + 1) * expected);
+      const dims = await Promise.all(part.map(imageDimensions));
+      const usable = dims.filter(d => d.area > 0);
+      const areas = usable.map(d => d.area).sort((a,b) => a-b);
+      const medianArea = areas.length ? areas[Math.floor(areas.length / 2)] : 0;
+      const totalArea = usable.reduce((sum,d) => sum + d.area, 0);
+      const known = usable.length;
+      sets.push({part, medianArea, totalArea, known, index:s});
+    }
+
+    sets.sort((a,b) =>
+      b.medianArea - a.medianArea ||
+      b.totalArea - a.totalArea ||
+      b.known - a.known ||
+      b.index - a.index
+    );
+
+    const best = sets[0];
+    if (!best || best.known < Math.max(1, Math.ceil(expected * 0.5))) {
+      return {urls, filtered:false, rawCount:urls.length};
+    }
+
+    return {
+      urls: best.part,
+      filtered: true,
+      rawCount: urls.length,
+      chosenSet: best.index + 1,
+      setCount
+    };
   }
 
   async function revealAlbum() {
@@ -1434,13 +1501,24 @@
   async function detect() {
     statusNode.textContent = 'アルバムを確認して画像を検出中…';
     await revealAlbum();
-    const urls = collectImageUrls();
-    found = urls.map(url => ({url}));
+
+    const rawUrls = collectImageUrls();
+    const expected = expectedCount();
+
+    if (expected && rawUrls.length > expected && rawUrls.length % expected === 0) {
+      statusNode.textContent = '表示用画像と原寸画像を判定中… ' + rawUrls.length + '件';
+    }
+
+    const picked = await preferOriginalSet(rawUrls, expected);
+    found = picked.urls.map(url => ({url}));
     render();
 
-    const expected = expectedCount();
     if (!found.length) {
       statusNode.textContent = '作品画像を検出できませんでした。作品ページを一度表示し直してから「再検出」を押してください。';
+    } else if (picked.filtered) {
+      statusNode.textContent =
+        '検出：' + found.length + ' / ' + expected + '枚' +
+        '（候補 ' + picked.rawCount + '件から高解像度側を採用）';
     } else if (expected && found.length < expected) {
       statusNode.textContent = '検出：' + found.length + ' / ' + expected + '枚。まだ読み込まれていない画像がある可能性があります。';
     } else {
