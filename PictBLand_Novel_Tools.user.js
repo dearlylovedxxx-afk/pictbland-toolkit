@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.6
+// @version      0.3.7
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
 // @grant        GM.download
 // @grant        GM.xmlhttpRequest
+// @require      https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
 // @connect      *.pictbland.net
 // @updateURL    https://raw.githubusercontent.com/dearlylovedxxx-afk/pictbland-toolkit/main/PictBLand_Novel_Tools.meta.js
 // @downloadURL  https://raw.githubusercontent.com/dearlylovedxxx-afk/pictbland-toolkit/main/PictBLand_Novel_Tools.user.js
@@ -1009,11 +1010,11 @@
 
 
 
-// ---- pictBLand image saver (v0.3.6) ----
+// ---- pictBLand image saver (v0.3.7) ----
 (() => {
   'use strict';
-  if (window.__pictblandImageSaverV036) return;
-  window.__pictblandImageSaverV036 = true;
+  if (window.__pictblandImageSaverV037) return;
+  window.__pictblandImageSaverV037 = true;
 
   const ROOT_ID = 'pbi-root';
   const BUTTON_ID = 'pbi-button';
@@ -1292,11 +1293,16 @@
     return 'jpg';
   }
 
-  function buildFileName(index, total, url) {
+  function buildFileName(index, total) {
     const base = safeBaseName(titleInput?.value || extractTitle());
     const width = Math.max(2, String(total).length);
     const no = String(index + 1).padStart(width, '0');
-    return base + '_' + no + '.' + extFromUrl(url);
+    return base + '_' + no + '.png';
+  }
+
+  function buildZipName(label='') {
+    const base = safeBaseName(titleInput?.value || extractTitle());
+    return base + (label ? '_' + label : '') + '.zip';
   }
 
   function gmXhrBlob(url) {
@@ -1370,6 +1376,52 @@
     return await res.blob();
   }
 
+  async function blobToPng(blob) {
+    if (!(blob instanceof Blob) || !blob.size) {
+      throw new Error('画像データが空です');
+    }
+    if (blob.type === 'image/png') return blob;
+
+    const objectUrl = URL.createObjectURL(blob);
+    try {
+      const img = await new Promise((resolve, reject) => {
+        const node = new Image();
+        node.onload = () => resolve(node);
+        node.onerror = () => reject(new Error('画像のデコードに失敗しました'));
+        node.src = objectUrl;
+      });
+
+      const width = img.naturalWidth || img.width;
+      const height = img.naturalHeight || img.height;
+      if (!width || !height) throw new Error('画像サイズを取得できませんでした');
+
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+
+      const ctx = canvas.getContext('2d', {alpha:true});
+      if (!ctx) throw new Error('PNG変換用Canvasを作成できませんでした');
+
+      ctx.drawImage(img, 0, 0, width, height);
+
+      const png = await new Promise((resolve, reject) => {
+        canvas.toBlob(
+          result => result ? resolve(result) : reject(new Error('PNG変換に失敗しました')),
+          'image/png'
+        );
+      });
+
+      return png;
+    } finally {
+      URL.revokeObjectURL(objectUrl);
+    }
+  }
+
+  async function getPngBlob(url) {
+    const original = await getBlob(url);
+    return await blobToPng(original);
+  }
+
   function saveBlob(blob, name) {
     return new Promise((resolve, reject) => {
       try {
@@ -1391,47 +1443,91 @@
   }
 
   async function saveOne(row, index, total) {
-    const name = buildFileName(index, total, row.url);
+    const name = buildFileName(index, total);
 
     try {
-      const blob = await getBlob(row.url);
-      await saveBlob(blob, name);
+      const png = await getPngBlob(row.url);
+      await saveBlob(png, name);
       return {ok:true};
-    } catch (firstErr) {
-      const dl = globalThis.GM?.download;
-      if (typeof dl !== 'function') return {ok:false, error:firstErr};
+    } catch (err) {
+      return {ok:false, error:err};
+    }
+  }
 
+
+  async function saveRowsAsZip(entries, zipName) {
+    if (!entries.length) {
+      statusNode.textContent = 'ZIPに入れる画像がありません。';
+      return;
+    }
+    if (typeof JSZip === 'undefined') {
+      statusNode.textContent = 'ZIP機能を読み込めませんでした。スクリプトを再読み込みしてください。';
+      return;
+    }
+
+    const zip = new JSZip();
+    let ok = 0;
+    let failed = 0;
+
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      statusNode.textContent =
+        'ZIP作成中… ' + (i + 1) + ' / ' + entries.length + '（PNG変換）';
       try {
-        await new Promise((resolve, reject) => {
-          let settled = false;
-          const done = (ok, value) => {
-            if (settled) return;
-            settled = true;
-            ok ? resolve(value) : reject(value instanceof Error ? value : new Error(String(value || '保存失敗')));
-          };
-          const timer = setTimeout(() => done(false, new Error('保存がタイムアウトしました')), 45000);
-          try {
-            const maybe = dl({
-              url: row.url,
-              name,
-              saveAs: false,
-              headers: { Referer: location.href },
-              onload: () => { clearTimeout(timer); done(true); },
-              onerror: err => { clearTimeout(timer); done(false, err?.error || err?.message || '保存失敗'); }
-            });
-            if (maybe && typeof maybe.then === 'function') {
-              maybe.then(() => { clearTimeout(timer); done(true); })
-                .catch(err => { clearTimeout(timer); done(false, err); });
-            }
-          } catch (err) {
-            clearTimeout(timer);
-            done(false, err);
-          }
-        });
-        return {ok:true};
-      } catch (secondErr) {
-        return {ok:false, error:secondErr || firstErr};
+        const png = await getPngBlob(entry.row.url);
+        zip.file(buildFileName(entry.index, found.length), png);
+        ok++;
+      } catch {
+        failed++;
       }
+    }
+
+    if (!ok) {
+      statusNode.textContent = 'ZIPに追加できる画像がありませんでした。';
+      return;
+    }
+
+    statusNode.textContent = 'ZIPを書き出し中…';
+    const blob = await zip.generateAsync({
+      type: 'blob',
+      compression: 'STORE'
+    });
+    await saveBlob(blob, zipName);
+
+    statusNode.textContent = failed
+      ? 'ZIP保存完了：' + ok + '枚／失敗 ' + failed + '枚'
+      : 'ZIP保存完了：' + ok + '枚';
+  }
+
+  async function saveSelectedZip() {
+    const entries = selectedRows().map(x => ({row:x.row,index:x.index}));
+    const btn = root?.querySelector('.pbi-zip-selected');
+    if (btn) btn.disabled = true;
+    try {
+      await saveRowsAsZip(entries, buildZipName('選択'));
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  async function saveRangeZip() {
+    if (!found.length) {
+      statusNode.textContent = '保存できる画像がありません。';
+      return;
+    }
+
+    const {start, end} = readRange();
+    const entries = found.slice(start - 1, end).map((row, offset) => ({
+      row,
+      index: start - 1 + offset
+    }));
+
+    const btn = root?.querySelector('.pbi-zip-range');
+    if (btn) btn.disabled = true;
+    try {
+      await saveRowsAsZip(entries, buildZipName(start + '-' + end));
+    } finally {
+      if (btn) btn.disabled = false;
     }
   }
 
@@ -1563,7 +1659,7 @@
 
       const file = document.createElement('div');
       file.className = 'pbi-file';
-      file.textContent = buildFileName(index, found.length, row.url);
+      file.textContent = buildFileName(index, found.length);
 
       const actions = document.createElement('div');
       actions.className = 'pbi-actions';
@@ -1718,11 +1814,12 @@
           '<button type="button" class="pbi-detect">🔄 再検出</button>' +
           '<button type="button" class="pbi-select-all">全部選択</button>' +
           '<button type="button" class="pbi-clear-all">全部解除</button>' +
-          '<button type="button" class="pbi-save-selected pbi-primary">⬇️ 選択を保存</button>' +
+          '<button type="button" class="pbi-save-selected">⬇️ 選択をPNG保存</button>' +
+          '<button type="button" class="pbi-zip-selected pbi-primary">📦 選択をZIP</button>' +
           '<button type="button" class="pbi-close">閉じる</button>' +
         '</div>' +
-        '<div class="pbi-meta"><label>ファイル名：<input type="text" class="pbi-title" placeholder="作品タイトル"></label><span>作品画像だけを検出し、01・02…の連番で保存します。</span></div>' +
-        '<div class="pbi-range"><strong>保存範囲：</strong><input type="number" class="pbi-range-start" min="1" value="1"><span>〜</span><input type="number" class="pbi-range-end" min="1" value="1"><span>枚目</span><button type="button" class="pbi-save-range pbi-primary">⬇️ この範囲を保存</button></div>' +
+        '<div class="pbi-meta"><label>ファイル名：<input type="text" class="pbi-title" placeholder="作品タイトル"></label><span>保存形式はPNG。01・02…の連番で保存します。</span></div>' +
+        '<div class="pbi-range"><strong>保存範囲：</strong><input type="number" class="pbi-range-start" min="1" value="1"><span>〜</span><input type="number" class="pbi-range-end" min="1" value="1"><span>枚目</span><button type="button" class="pbi-save-range">⬇️ PNG保存</button><button type="button" class="pbi-zip-range pbi-primary">📦 この範囲をZIP</button></div>' +
         '<div class="pbi-status">まだ検出していません。</div>' +
       '</div>' +
       '<main class="pbi-list"></main>';
@@ -1733,7 +1830,9 @@
 
     root.querySelector('.pbi-detect').addEventListener('click', detect);
     root.querySelector('.pbi-save-selected').addEventListener('click', saveSelected);
+    root.querySelector('.pbi-zip-selected').addEventListener('click', saveSelectedZip);
     root.querySelector('.pbi-save-range').addEventListener('click', saveRange);
+    root.querySelector('.pbi-zip-range').addEventListener('click', saveRangeZip);
     root.querySelector('.pbi-select-all').addEventListener('click', () => {
       listNode.querySelectorAll('.pbi-check').forEach(x => x.checked = true);
     });
