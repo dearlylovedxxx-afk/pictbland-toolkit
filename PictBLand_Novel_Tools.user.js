@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.5
+// @version      0.3.6
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -308,6 +308,9 @@
     });
     return (candidate?.textContent || '').trim();
   }
+
+  // 画像保存側でも、小説TXTとまったく同じ作品タイトル判定を使う。
+  window.__pictblandNovelExtractTitle = extractTitle;
 
   function normalizePictMarkup(text) {
     let out = normalizeNewlines(text);
@@ -1006,11 +1009,11 @@
 
 
 
-// ---- pictBLand image saver (v0.3.5) ----
+// ---- pictBLand image saver (v0.3.6) ----
 (() => {
   'use strict';
-  if (window.__pictblandImageSaverV035) return;
-  window.__pictblandImageSaverV035 = true;
+  if (window.__pictblandImageSaverV036) return;
+  window.__pictblandImageSaverV036 = true;
 
   const ROOT_ID = 'pbi-root';
   const BUTTON_ID = 'pbi-button';
@@ -1053,120 +1056,19 @@
   }
 
   function extractTitle() {
-    const generic = /(?:pictbland\.net|pictBLand|同人\s*[・･]?\s*BL|イラスト\s*[・･]?\s*小説投稿SNS|小説投稿SNS)/i;
-    const reject = /^(?:R18|R-18|鍵付|編集|編集する|表紙を表示|アルバムを表示|クリックしてアルバムを表示|ステキ！?|ブクマ|非公開|コメント|プロフィールタグ|キーワードタグを編集|タグを編集|作品に戻る|投稿日|画像枚数|文字数)$/i;
+    const shared = window.__pictblandNovelExtractTitle;
+    if (typeof shared === 'function') {
+      try {
+        const title = shared();
+        if (title && title.trim()) return title.trim();
+      } catch {}
+    }
 
-    const clean = value => String(value || '')
-      .replace(/\s+/g, ' ')
-      .replace(/\s*[|｜]\s*pictBLand.*$/i, '')
+    // 念のため共通関数がまだ準備できていない場合だけ最低限のフォールバック。
+    const docTitle = (document.title || '')
+      .replace(/\s*[|｜-]\s*pictBLand.*$/i, '')
       .trim();
-
-    const usable = value => {
-      const text = clean(value);
-      return text &&
-        text.length >= 1 &&
-        text.length <= 180 &&
-        !generic.test(text) &&
-        !reject.test(text) &&
-        !/(?:キーワード)?タグを編集/.test(text) &&
-        !/^編集(?:する)?$/.test(text) &&
-        !/^画像枚数\s*[：:]?\s*\d+\s*枚/.test(text) &&
-        !/^投稿日\s*[：:]?/.test(text);
-    };
-
-    // 明示的なメタ情報を最優先。
-    const metaCandidates = [
-      document.querySelector('meta[property="og:title"]')?.content,
-      document.querySelector('meta[name="twitter:title"]')?.content
-    ];
-    for (const value of metaCandidates) {
-      if (usable(value)) return clean(value);
-    }
-
-    // ブラウザのページタイトルは作品名を含むことが多いので、DOM探索より優先。
-    const pageTitle = clean(document.title);
-    if (usable(pageTitle)) return pageTitle;
-
-    // title / subject / item-name 系の要素を探す。
-    const explicit = [...document.querySelectorAll(
-      '[class*="title"],[class*="subject"],[class*="item-name"],[class*="item_name"],[id*="title"],[id*="subject"]'
-    )]
-      .map(el => ({
-        text: clean(el.textContent),
-        el
-      }))
-      .filter(x => usable(x.text));
-
-    if (explicit.length) {
-      explicit.sort((a,b) => {
-        const ar = a.el.getBoundingClientRect();
-        const br = b.el.getBoundingClientRect();
-        const as = parseFloat(getComputedStyle(a.el).fontSize) || 0;
-        const bs = parseFloat(getComputedStyle(b.el).fontSize) || 0;
-        return bs - as || ar.top - br.top;
-      });
-      if (explicit[0]?.text) return explicit[0].text;
-    }
-
-    // 「画像枚数」より上にある、見出しらしい要素を採点する。
-    const all = [...document.querySelectorAll('body *')];
-    const countEl = all.find(el => /画像枚数\s*[：:]?\s*\d+\s*枚/.test(clean(el.textContent)));
-    const countY = countEl ? countEl.getBoundingClientRect().top + window.scrollY : Infinity;
-
-    const candidates = [];
-    const seen = new Set();
-
-    for (const el of all) {
-      if (!(el instanceof HTMLElement)) continue;
-
-      const text = clean(el.textContent);
-      if (!usable(text) || seen.has(text)) continue;
-      if (el.children.length > 3) continue;
-
-      const rect = el.getBoundingClientRect();
-      if (rect.width < 20 || rect.height < 8) continue;
-
-      const y = rect.top + window.scrollY;
-      if (y >= countY || y < 60) continue;
-
-      const style = getComputedStyle(el);
-      const size = parseFloat(style.fontSize) || 0;
-      const weight = parseInt(style.fontWeight, 10) || (style.fontWeight === 'bold' ? 700 : 400);
-      const cls = String(el.className || '');
-      const tag = el.tagName;
-
-      let score = 0;
-      if (/^H[1-6]$/.test(tag)) score += 120;
-      if (/title|subject|headline|item[_-]?name/i.test(cls)) score += 110;
-      if (size >= 24) score += 90;
-      else if (size >= 20) score += 65;
-      else if (size >= 17) score += 30;
-      if (weight >= 700) score += 45;
-      else if (weight >= 600) score += 25;
-      if (el.children.length === 0) score += 20;
-      if (text.length <= 80) score += 15;
-
-      // 画像枚数に近い位置の見出しを少し優先。
-      if (Number.isFinite(countY)) {
-        const distance = countY - y;
-        if (distance >= 0 && distance < 900) score += 25;
-      }
-
-      if (score >= 55) {
-        candidates.push({text, score, y});
-        seen.add(text);
-      }
-    }
-
-    candidates.sort((a,b) => b.score - a.score || b.y - a.y);
-    if (candidates[0]?.text) return candidates[0].text;
-
-    const heading = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6')]
-      .map(el => clean(el.textContent))
-      .find(usable);
-    if (heading) return heading;
-
-    return 'pictBLand_' + itemId();
+    return docTitle || ('pictBLand_' + itemId());
   }
 
   function normalizeImageUrl(raw) {
@@ -1697,7 +1599,7 @@
     await revealAlbum();
 
     const detectedTitle = extractTitle();
-    if (titleInput && detectedTitle && (!titleInput.value || /^pictBLand_\d+$/.test(titleInput.value))) {
+    if (titleInput && detectedTitle) {
       titleInput.value = detectedTitle;
     }
 
@@ -1847,7 +1749,7 @@
     build();
     if (!root) return;
     root.classList.add('open');
-    if (titleInput && !titleInput.value) titleInput.value = extractTitle();
+    if (titleInput) titleInput.value = extractTitle();
     if (!found.length) await detect();
   }
 
