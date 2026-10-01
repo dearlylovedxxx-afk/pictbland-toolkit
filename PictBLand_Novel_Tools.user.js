@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.1
+// @version      0.3.2
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1006,11 +1006,11 @@
 
 
 
-// ---- pictBLand image saver (v0.3.1) ----
+// ---- pictBLand image saver (v0.3.2) ----
 (() => {
   'use strict';
-  if (window.__pictblandImageSaverV031) return;
-  window.__pictblandImageSaverV031 = true;
+  if (window.__pictblandImageSaverV032) return;
+  window.__pictblandImageSaverV032 = true;
 
   const ROOT_ID = 'pbi-root';
   const BUTTON_ID = 'pbi-button';
@@ -1088,6 +1088,41 @@
       const url = part.trim().split(/\s+/)[0];
       if (url) add(url);
     });
+  }
+
+  function collectLinkedImageUrls() {
+    const rows = [];
+    const seen = new Set();
+
+    const add = raw => {
+      const url = normalizeImageUrl(raw);
+      if (!url) return;
+      let key = url;
+      try {
+        const u = new URL(url);
+        key = u.origin + u.pathname;
+      } catch {}
+      if (seen.has(key)) return;
+      seen.add(key);
+      rows.push(url);
+    };
+
+    document.querySelectorAll('a[href]').forEach(a => add(a.href));
+
+    const id = itemId();
+    if (id) {
+      const strict = rows.filter(url => {
+        try {
+          const p = new URL(url).pathname;
+          return new RegExp('(?:/|_)' + id + '(?:[_.\\/-]|$)').test(p);
+        } catch {
+          return false;
+        }
+      });
+      if (strict.length) return strict;
+    }
+
+    return rows;
   }
 
   function collectImageUrls() {
@@ -1502,19 +1537,38 @@
     statusNode.textContent = 'アルバムを確認して画像を検出中…';
     await revealAlbum();
 
-    const rawUrls = collectImageUrls();
     const expected = expectedCount();
+    const linkedUrls = collectLinkedImageUrls();
+    const rawUrls = collectImageUrls();
 
-    if (expected && rawUrls.length > expected && rawUrls.length % expected === 0) {
-      statusNode.textContent = '表示用画像と原寸画像を判定中… ' + rawUrls.length + '件';
+    let picked;
+    let sourceNote = '';
+
+    if (expected && linkedUrls.length === expected) {
+      // pictBLandのアルバムでは、表示用<img>とは別に原寸表示用<a href>が
+      // 作品枚数ぶん並ぶことがある。枚数が一致する場合はこちらを優先する。
+      picked = {
+        urls: linkedUrls,
+        filtered: true,
+        rawCount: rawUrls.length,
+        originalLinks: true
+      };
+      sourceNote = '（原寸リンクを採用）';
+    } else {
+      if (expected && rawUrls.length > expected && rawUrls.length % expected === 0) {
+        statusNode.textContent = '表示用画像と原寸画像を判定中… ' + rawUrls.length + '件';
+      }
+      picked = await preferOriginalSet(rawUrls, expected);
     }
 
-    const picked = await preferOriginalSet(rawUrls, expected);
     found = picked.urls.map(url => ({url}));
     render();
 
     if (!found.length) {
       statusNode.textContent = '作品画像を検出できませんでした。作品ページを一度表示し直してから「再検出」を押してください。';
+    } else if (picked.originalLinks) {
+      statusNode.textContent =
+        '検出：' + found.length + ' / ' + expected + '枚 ' + sourceNote;
     } else if (picked.filtered) {
       statusNode.textContent =
         '検出：' + found.length + ' / ' + expected + '枚' +
