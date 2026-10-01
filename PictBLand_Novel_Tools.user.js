@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.2.0
-// @description  pictBLandツールを1つのボタンに統合。小説TXT化と保存検索・クイック検索に対応します。
+// @version      0.3.0
+// @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
-// @grant        none
+// @grant        GM.download
+// @grant        GM.xmlhttpRequest
+// @connect      *.pictbland.net
 // @updateURL    https://raw.githubusercontent.com/dearlylovedxxx-afk/pictbland-toolkit/main/PictBLand_Novel_Tools.meta.js
 // @downloadURL  https://raw.githubusercontent.com/dearlylovedxxx-afk/pictbland-toolkit/main/PictBLand_Novel_Tools.user.js
 // ==/UserScript==
@@ -1003,11 +1005,557 @@
 })();
 
 
-// ---- Unified pictBLand tools shell (v0.2.0) ----
+
+// ---- pictBLand image saver (v0.3.0) ----
 (() => {
   'use strict';
-  if (window.__pictblandUnifiedToolsV020) return;
-  window.__pictblandUnifiedToolsV020 = true;
+  if (window.__pictblandImageSaverV030) return;
+  window.__pictblandImageSaverV030 = true;
+
+  const ROOT_ID = 'pbi-root';
+  const BUTTON_ID = 'pbi-button';
+  const STYLE_ID = 'pbi-style';
+
+  let root = null;
+  let statusNode = null;
+  let listNode = null;
+  let titleInput = null;
+  let found = [];
+
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  function isItemPage() {
+    return /^\/items\/detail\/\d+/.test(location.pathname);
+  }
+
+  function itemId() {
+    return location.pathname.match(/^\/items\/detail\/(\d+)/)?.[1] || '';
+  }
+
+  function expectedCount() {
+    const text = document.body?.innerText || '';
+    const m = text.match(/画像枚数\s*[：:]\s*(\d+)\s*枚/);
+    return m ? Number(m[1]) : 0;
+  }
+
+  function isImageWork() {
+    if (!isItemPage()) return false;
+    const text = document.body?.innerText || '';
+    return /画像枚数\s*[：:]\s*\d+\s*枚/.test(text) || /アルバムを表示/.test(text);
+  }
+
+  function safeBaseName(name) {
+    const cleaned = String(name || ('pictBLand_' + itemId()))
+      .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '＿')
+      .replace(/[. ]+$/g, '')
+      .trim();
+    return (cleaned || ('pictBLand_' + itemId())).slice(0, 120);
+  }
+
+  function extractTitle() {
+    const reject = /^(?:pictBLand|コメント|プロフィールタグ|アルバムを表示|ステキ！?|ブクマ|非公開|作品に戻る)$/i;
+    const headings = [...document.querySelectorAll('h1,h2,h3,h4')]
+      .map(el => (el.textContent || '').replace(/\s+/g, ' ').trim())
+      .filter(t => t && t.length <= 160 && !reject.test(t) && !/pictbland\.net/i.test(t));
+    if (headings.length) return headings[0];
+
+    const og = document.querySelector('meta[property="og:title"]')?.content?.trim();
+    if (og && !/pictbland\.net/i.test(og)) return og;
+
+    const title = (document.title || '').replace(/\s*[|｜-]\s*pictBLand.*$/i, '').trim();
+    return title || ('pictBLand_' + itemId());
+  }
+
+  function normalizeImageUrl(raw) {
+    if (!raw) return '';
+    let value = String(raw).trim().replace(/&amp;/g, '&');
+    if (!value || value.startsWith('data:') || value.startsWith('blob:')) return '';
+    if (value.startsWith('//')) value = location.protocol + value;
+
+    try {
+      const u = new URL(value, location.href);
+      if (!/^https?:$/.test(u.protocol)) return '';
+      if (!/^img\d*\.pictbland\.net$/i.test(u.hostname)) return '';
+      if (!/^\/items\//i.test(u.pathname)) return '';
+      return u.href;
+    } catch {
+      return '';
+    }
+  }
+
+  function addSrcset(value, add) {
+    String(value || '').split(',').forEach(part => {
+      const url = part.trim().split(/\s+/)[0];
+      if (url) add(url);
+    });
+  }
+
+  function collectImageUrls() {
+    const rows = [];
+    const seen = new Set();
+
+    const add = raw => {
+      const url = normalizeImageUrl(raw);
+      if (!url) return;
+      let key = url;
+      try {
+        const u = new URL(url);
+        key = u.origin + u.pathname;
+      } catch {}
+      if (seen.has(key)) return;
+      seen.add(key);
+      rows.push(url);
+    };
+
+    document.querySelectorAll('img').forEach(img => {
+      add(img.currentSrc);
+      add(img.src);
+      ['data-src','data-original','data-lazy-src','data-url','data-image'].forEach(attr => add(img.getAttribute(attr)));
+      addSrcset(img.getAttribute('srcset'), add);
+    });
+
+    document.querySelectorAll('source').forEach(source => {
+      addSrcset(source.getAttribute('srcset'), add);
+      add(source.getAttribute('src'));
+    });
+
+    document.querySelectorAll('a[href]').forEach(a => add(a.href));
+
+    document.querySelectorAll('[style*="background"]').forEach(el => {
+      const style = el.getAttribute('style') || '';
+      const re = /url\((['"]?)(.*?)\1\)/g;
+      let m;
+      while ((m = re.exec(style))) add(m[2]);
+    });
+
+    try {
+      performance.getEntriesByType('resource').forEach(entry => add(entry.name));
+    } catch {}
+
+    const html = document.documentElement?.innerHTML || '';
+    const re = /(?:https?:)?\/\/img\d*\.pictbland\.net\/items\/[^"'()<>\s\\]+/gi;
+    let m;
+    while ((m = re.exec(html))) add(m[0]);
+
+    const id = itemId();
+    if (id) {
+      const strict = rows.filter(url => {
+        try {
+          const p = new URL(url).pathname;
+          return new RegExp('(?:/|_)' + id + '(?:[_.\\/-]|$)').test(p);
+        } catch {
+          return false;
+        }
+      });
+      if (strict.length) return strict;
+    }
+
+    return rows;
+  }
+
+  async function revealAlbum() {
+    const nodes = [...document.querySelectorAll('button,a,input,[role="button"]')];
+    const target = nodes.find(el => {
+      const text = ((el.textContent || '') + ' ' + (el.getAttribute?.('value') || '') + ' ' + (el.getAttribute?.('aria-label') || '')).trim();
+      return /クリックしてアルバムを表示|アルバムを表示/.test(text);
+    });
+
+    if (target) {
+      try { target.click(); } catch {}
+      await sleep(700);
+    }
+
+    const oldY = window.scrollY;
+    const maxY = Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0);
+    if (maxY > innerHeight * 2) {
+      for (const ratio of [0.25, 0.5, 0.75, 1]) {
+        window.scrollTo(0, Math.floor(maxY * ratio));
+        await sleep(120);
+      }
+      window.scrollTo(0, oldY);
+      await sleep(120);
+    }
+  }
+
+  function extFromUrl(url) {
+    try {
+      const ext = new URL(url).pathname.match(/\.([a-z0-9]{2,5})$/i)?.[1]?.toLowerCase();
+      if (ext && ['jpg','jpeg','png','gif','webp','avif'].includes(ext)) return ext === 'jpeg' ? 'jpg' : ext;
+    } catch {}
+    return 'jpg';
+  }
+
+  function buildFileName(index, total, url) {
+    const base = safeBaseName(titleInput?.value || extractTitle());
+    const width = Math.max(2, String(total).length);
+    const no = String(index + 1).padStart(width, '0');
+    return base + '_' + no + '.' + extFromUrl(url);
+  }
+
+  function gmXhrBlob(url) {
+    const fn = globalThis.GM?.xmlhttpRequest || globalThis.GM?.xmlHttpRequest;
+    if (typeof fn !== 'function') return Promise.reject(new Error('GM.xmlhttpRequest が利用できません'));
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const done = (ok, value) => {
+        if (settled) return;
+        settled = true;
+        ok ? resolve(value) : reject(value instanceof Error ? value : new Error(String(value || '取得失敗')));
+      };
+
+      const timer = setTimeout(() => done(false, new Error('画像取得がタイムアウトしました')), 45000);
+
+      try {
+        const maybe = fn({
+          method: 'GET',
+          url,
+          responseType: 'blob',
+          anonymous: false,
+          nocache: true,
+          headers: {
+            Referer: location.href
+          },
+          onload: res => {
+            clearTimeout(timer);
+            if (res.status >= 200 && res.status < 300 && res.response) done(true, res.response);
+            else done(false, new Error('HTTP ' + res.status));
+          },
+          onerror: err => {
+            clearTimeout(timer);
+            done(false, new Error(err?.error || err?.message || '画像取得に失敗しました'));
+          },
+          ontimeout: () => {
+            clearTimeout(timer);
+            done(false, new Error('画像取得がタイムアウトしました'));
+          }
+        });
+        if (maybe && typeof maybe.then === 'function') {
+          maybe.then(res => {
+            if (settled) return;
+            clearTimeout(timer);
+            if (res?.status >= 200 && res?.status < 300 && res.response) done(true, res.response);
+          }).catch(err => {
+            if (settled) return;
+            clearTimeout(timer);
+            done(false, err);
+          });
+        }
+      } catch (err) {
+        clearTimeout(timer);
+        done(false, err);
+      }
+    });
+  }
+
+  async function getBlob(url) {
+    try {
+      const blob = await gmXhrBlob(url);
+      if (blob instanceof Blob && blob.size) return blob;
+    } catch {}
+
+    const res = await fetch(url, {
+      credentials: 'include',
+      referrer: location.href,
+      cache: 'no-store'
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return await res.blob();
+  }
+
+  function saveBlob(blob, name) {
+    return new Promise((resolve, reject) => {
+      try {
+        const objectUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = objectUrl;
+        a.download = name;
+        a.rel = 'noopener';
+        a.style.display = 'none';
+        document.body.append(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 30000);
+        setTimeout(resolve, 120);
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  async function saveOne(row, index, total) {
+    const name = buildFileName(index, total, row.url);
+
+    try {
+      const blob = await getBlob(row.url);
+      await saveBlob(blob, name);
+      return {ok:true};
+    } catch (firstErr) {
+      const dl = globalThis.GM?.download;
+      if (typeof dl !== 'function') return {ok:false, error:firstErr};
+
+      try {
+        await new Promise((resolve, reject) => {
+          let settled = false;
+          const done = (ok, value) => {
+            if (settled) return;
+            settled = true;
+            ok ? resolve(value) : reject(value instanceof Error ? value : new Error(String(value || '保存失敗')));
+          };
+          const timer = setTimeout(() => done(false, new Error('保存がタイムアウトしました')), 45000);
+          try {
+            const maybe = dl({
+              url: row.url,
+              name,
+              saveAs: false,
+              headers: { Referer: location.href },
+              onload: () => { clearTimeout(timer); done(true); },
+              onerror: err => { clearTimeout(timer); done(false, err?.error || err?.message || '保存失敗'); }
+            });
+            if (maybe && typeof maybe.then === 'function') {
+              maybe.then(() => { clearTimeout(timer); done(true); })
+                .catch(err => { clearTimeout(timer); done(false, err); });
+            }
+          } catch (err) {
+            clearTimeout(timer);
+            done(false, err);
+          }
+        });
+        return {ok:true};
+      } catch (secondErr) {
+        return {ok:false, error:secondErr || firstErr};
+      }
+    }
+  }
+
+  function selectedRows() {
+    return [...listNode.querySelectorAll('.pbi-card')].map((card, index) => ({
+      index,
+      checked: !!card.querySelector('.pbi-check')?.checked,
+      row: found[index]
+    })).filter(x => x.checked && x.row);
+  }
+
+  async function saveSelected() {
+    const selected = selectedRows();
+    if (!selected.length) {
+      statusNode.textContent = '保存する画像を選択してください。';
+      return;
+    }
+
+    const saveBtn = root.querySelector('.pbi-save-selected');
+    if (saveBtn) saveBtn.disabled = true;
+
+    let ok = 0;
+    let failed = 0;
+
+    for (let i = 0; i < selected.length; i++) {
+      const entry = selected[i];
+      statusNode.textContent = '保存中… ' + (i + 1) + ' / ' + selected.length;
+      const result = await saveOne(entry.row, entry.index, found.length);
+      if (result.ok) ok++;
+      else failed++;
+      await sleep(180);
+    }
+
+    if (saveBtn) saveBtn.disabled = false;
+    statusNode.textContent = failed
+      ? '保存完了：' + ok + '枚／失敗 ' + failed + '枚。失敗した画像は各カードの「画像を開く」から確認できます。'
+      : '保存完了：' + ok + '枚';
+  }
+
+  function render() {
+    listNode.replaceChildren();
+
+    if (!found.length) {
+      const empty = document.createElement('div');
+      empty.className = 'pbi-empty';
+      empty.textContent = '作品画像をまだ検出できていません。';
+      listNode.append(empty);
+      return;
+    }
+
+    found.forEach((row, index) => {
+      const card = document.createElement('article');
+      card.className = 'pbi-card';
+
+      const preview = document.createElement('img');
+      preview.className = 'pbi-preview';
+      preview.src = row.url;
+      preview.alt = '画像 ' + (index + 1);
+      preview.loading = 'lazy';
+      preview.referrerPolicy = 'strict-origin-when-cross-origin';
+
+      const info = document.createElement('div');
+      info.className = 'pbi-info';
+
+      const label = document.createElement('label');
+      const check = document.createElement('input');
+      check.type = 'checkbox';
+      check.checked = true;
+      check.className = 'pbi-check';
+      const strong = document.createElement('strong');
+      strong.textContent = '画像 ' + (index + 1);
+      label.append(check, strong);
+
+      const file = document.createElement('div');
+      file.className = 'pbi-file';
+      file.textContent = buildFileName(index, found.length, row.url);
+
+      const actions = document.createElement('div');
+      actions.className = 'pbi-actions';
+
+      const save = document.createElement('button');
+      save.type = 'button';
+      save.textContent = '⬇️ この1枚を保存';
+      save.addEventListener('click', async () => {
+        save.disabled = true;
+        statusNode.textContent = '画像 ' + (index + 1) + ' を保存中…';
+        const result = await saveOne(row, index, found.length);
+        save.disabled = false;
+        statusNode.textContent = result.ok
+          ? '画像 ' + (index + 1) + ' を保存しました。'
+          : '保存失敗：' + (result.error?.message || result.error || '不明なエラー');
+      });
+
+      const open = document.createElement('a');
+      open.href = row.url;
+      open.target = '_blank';
+      open.rel = 'noopener noreferrer';
+      open.textContent = '画像を開く';
+
+      actions.append(save, open);
+      info.append(label, file, actions);
+      card.append(preview, info);
+      listNode.append(card);
+    });
+  }
+
+  async function detect() {
+    statusNode.textContent = 'アルバムを確認して画像を検出中…';
+    await revealAlbum();
+    const urls = collectImageUrls();
+    found = urls.map(url => ({url}));
+    render();
+
+    const expected = expectedCount();
+    if (!found.length) {
+      statusNode.textContent = '作品画像を検出できませんでした。作品ページを一度表示し直してから「再検出」を押してください。';
+    } else if (expected && found.length < expected) {
+      statusNode.textContent = '検出：' + found.length + ' / ' + expected + '枚。まだ読み込まれていない画像がある可能性があります。';
+    } else {
+      statusNode.textContent = '検出：' + found.length + (expected ? ' / ' + expected : '') + '枚';
+    }
+  }
+
+  function injectCss() {
+    if (document.getElementById(STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = STYLE_ID;
+    style.textContent = [
+      '#' + BUTTON_ID + '{position:fixed;right:14px;bottom:max(76px,env(safe-area-inset-bottom));z-index:2147483000;border:0;border-radius:999px;padding:11px 15px;background:#7356a8;color:#fff;font:700 14px/1.2 -apple-system,BlinkMacSystemFont,"Noto Sans JP",sans-serif;box-shadow:0 4px 16px #0003}',
+      '#' + ROOT_ID + '{display:none;position:fixed;inset:0;z-index:2147483646;background:#f4f6f8;color:#202124;overflow:auto;-webkit-overflow-scrolling:touch;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Noto Sans JP",sans-serif}',
+      '#' + ROOT_ID + '.open{display:block}',
+      '#' + ROOT_ID + ' *{box-sizing:border-box}',
+      '#' + ROOT_ID + ' .pbi-head{position:sticky;top:0;z-index:3;background:#fff;border-bottom:1px solid #dfe3e8;padding:10px 12px;box-shadow:0 2px 8px #0000000d}',
+      '#' + ROOT_ID + ' .pbi-bar{max-width:980px;margin:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}',
+      '#' + ROOT_ID + ' .pbi-bar strong{font-size:16px;margin-right:auto}',
+      '#' + ROOT_ID + ' button,#' + ROOT_ID + ' input{font:inherit}',
+      '#' + ROOT_ID + ' button{border:1px solid #ccd2d9;background:#fff;color:#202124;border-radius:8px;padding:8px 10px;font-weight:600}',
+      '#' + ROOT_ID + ' .pbi-primary{background:#7356a8;color:#fff;border-color:#7356a8}',
+      '#' + ROOT_ID + ' .pbi-meta{max-width:980px;margin:8px auto 0;display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:12px;color:#59636e}',
+      '#' + ROOT_ID + ' .pbi-meta input[type=text]{min-width:220px;max-width:100%;border:1px solid #ccd2d9;border-radius:7px;padding:6px}',
+      '#' + ROOT_ID + ' .pbi-status{max-width:980px;margin:7px auto 0;font-size:12px;color:#59636e;overflow-wrap:anywhere}',
+      '#' + ROOT_ID + ' .pbi-list{max-width:980px;margin:0 auto;padding:12px 10px 80px;display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px}',
+      '#' + ROOT_ID + ' .pbi-card{background:#fff;border:1px solid #dfe3e8;border-radius:10px;padding:9px;min-width:0}',
+      '#' + ROOT_ID + ' .pbi-preview{display:block;width:100%;height:260px;object-fit:contain;background:#eef0f3;border-radius:7px}',
+      '#' + ROOT_ID + ' .pbi-info{padding-top:8px}',
+      '#' + ROOT_ID + ' .pbi-info label{display:flex;gap:7px;align-items:center}',
+      '#' + ROOT_ID + ' .pbi-file{font-size:11px;color:#747d87;overflow-wrap:anywhere;margin:5px 0 7px}',
+      '#' + ROOT_ID + ' .pbi-actions{display:flex;gap:7px;align-items:center;flex-wrap:wrap}',
+      '#' + ROOT_ID + ' .pbi-actions a{font-size:12px;color:#5b4690;text-decoration:underline}',
+      '#' + ROOT_ID + ' .pbi-empty{grid-column:1/-1;background:#fff;border:1px solid #dfe3e8;border-radius:10px;padding:18px;color:#6a727b}',
+      '@media(max-width:600px){#' + ROOT_ID + ' .pbi-head{padding:8px}#' + ROOT_ID + ' .pbi-bar strong{width:100%;font-size:15px}#' + ROOT_ID + ' .pbi-bar button{font-size:12px;padding:7px 8px}#' + ROOT_ID + ' .pbi-list{grid-template-columns:1fr;padding:10px 7px 70px}#' + ROOT_ID + ' .pbi-preview{height:auto;max-height:70vh}}'
+    ].join('');
+    document.head.append(style);
+  }
+
+  function build() {
+    if (!document.body || root) return;
+    injectCss();
+
+    const button = document.createElement('button');
+    button.id = BUTTON_ID;
+    button.type = 'button';
+    button.textContent = '🖼️ 画像保存';
+    button.addEventListener('click', openPanel);
+
+    root = document.createElement('section');
+    root.id = ROOT_ID;
+    root.innerHTML =
+      '<div class="pbi-head">' +
+        '<div class="pbi-bar">' +
+          '<strong>🖼️ pictBLand 画像保存</strong>' +
+          '<button type="button" class="pbi-detect">🔄 再検出</button>' +
+          '<button type="button" class="pbi-select-all">全部選択</button>' +
+          '<button type="button" class="pbi-clear-all">全部解除</button>' +
+          '<button type="button" class="pbi-save-selected pbi-primary">⬇️ 選択を保存</button>' +
+          '<button type="button" class="pbi-close">閉じる</button>' +
+        '</div>' +
+        '<div class="pbi-meta"><label>ファイル名：<input type="text" class="pbi-title" placeholder="作品タイトル"></label><span>作品画像だけを検出し、01・02…の連番で保存します。</span></div>' +
+        '<div class="pbi-status">まだ検出していません。</div>' +
+      '</div>' +
+      '<main class="pbi-list"></main>';
+
+    statusNode = root.querySelector('.pbi-status');
+    listNode = root.querySelector('.pbi-list');
+    titleInput = root.querySelector('.pbi-title');
+
+    root.querySelector('.pbi-detect').addEventListener('click', detect);
+    root.querySelector('.pbi-save-selected').addEventListener('click', saveSelected);
+    root.querySelector('.pbi-select-all').addEventListener('click', () => {
+      listNode.querySelectorAll('.pbi-check').forEach(x => x.checked = true);
+    });
+    root.querySelector('.pbi-clear-all').addEventListener('click', () => {
+      listNode.querySelectorAll('.pbi-check').forEach(x => x.checked = false);
+    });
+    root.querySelector('.pbi-close').addEventListener('click', closePanel);
+
+    document.body.append(button, root);
+  }
+
+  async function openPanel() {
+    build();
+    if (!root) return;
+    root.classList.add('open');
+    if (titleInput && !titleInput.value) titleInput.value = extractTitle();
+    if (!found.length) await detect();
+  }
+
+  function closePanel() {
+    root?.classList.remove('open');
+  }
+
+  window.__pictblandImageSaveUi = {
+    open: openPanel,
+    close: closePanel,
+    detect,
+    isImageWork,
+    count: () => found.length
+  };
+
+  if (isItemPage()) {
+    if (document.body) build();
+    else addEventListener('DOMContentLoaded', build, {once:true});
+  }
+})();
+
+
+// ---- Unified pictBLand tools shell (v0.3.0) ----
+(() => {
+  'use strict';
+  if (window.__pictblandUnifiedToolsV030) return;
+  window.__pictblandUnifiedToolsV030 = true;
 
   const BAR_ID='pictbland-tools-unified-bar';
   const LAUNCH_ID='pictbland-tools-unified-launch';
@@ -1030,12 +1578,20 @@
     return window.__pictblandSavedSearchUi || null;
   }
 
+  function imageUi() {
+    return window.__pictblandImageSaveUi || null;
+  }
+
   function hideNovel() {
     novelUi().overlay?.classList.remove('pbnt-open');
   }
 
   function hideSearch() {
     searchUi()?.close?.();
+  }
+
+  function hideImage() {
+    imageUi()?.close?.();
   }
 
   function hidePlaceholder() {
@@ -1060,6 +1616,7 @@
     paintTabs();
     hidePlaceholder();
     hideSearch();
+    hideImage();
     if(!isNovelPage()){
       hideNovel();
       showPlaceholder('📖 小説TXTはpictBLandの小説作品ページで利用できます。');
@@ -1079,6 +1636,7 @@
     paintTabs();
     hidePlaceholder();
     hideNovel();
+    hideImage();
     const s=searchUi();
     if(!s?.open){
       showPlaceholder('保存検索機能を準備中です。少し待ってからもう一度お試しください。');
@@ -1087,8 +1645,28 @@
     s.open();
   }
 
+  function openImage() {
+    active='image';
+    paintTabs();
+    hidePlaceholder();
+    hideNovel();
+    hideSearch();
+    if(!isNovelPage()){
+      hideImage();
+      showPlaceholder('🖼️ 画像保存はpictBLandの作品詳細ページで利用できます。');
+      return;
+    }
+    const i=imageUi();
+    if(!i?.open){
+      showPlaceholder('画像保存機能を準備中です。少し待ってからもう一度お試しください。');
+      return;
+    }
+    i.open();
+  }
+
   function switchTo(tab) {
     if(tab==='novel')openNovel();
+    else if(tab==='image')openImage();
     else openSearch();
   }
 
@@ -1096,12 +1674,13 @@
     hidePlaceholder();
     hideNovel();
     hideSearch();
+    hideImage();
     document.getElementById(BAR_ID)?.classList.remove('open');
   }
 
   function openShell() {
     document.getElementById(BAR_ID)?.classList.add('open');
-    switchTo(isNovelPage()?'novel':'search');
+    switchTo(isNovelPage()?(imageUi()?.isImageWork?.()?'image':'novel'):'search');
   }
 
   function build() {
@@ -1109,8 +1688,8 @@
 
     const style=document.createElement('style');
     style.textContent=`
-      #pbnt-button,#pbsw-button{display:none!important}
-      #pbnt-root,#pbsw-root{top:${OFFSET}px!important;right:0!important;bottom:0!important;left:0!important;height:auto!important}
+      #pbnt-button,#pbsw-button,#pbi-button{display:none!important}
+      #pbnt-root,#pbsw-root,#pbi-root{top:${OFFSET}px!important;right:0!important;bottom:0!important;left:0!important;height:auto!important}
       #${LAUNCH_ID}{position:fixed;right:14px;bottom:max(76px,env(safe-area-inset-bottom));z-index:2147483001;border:0;border-radius:999px;padding:12px 16px;background:#7356a8;color:#fff;font:700 14px/1.2 -apple-system,BlinkMacSystemFont,'Noto Sans JP',sans-serif;box-shadow:0 4px 18px #0004}
       #${BAR_ID}{display:none;position:fixed;top:0;left:0;right:0;height:${OFFSET}px;z-index:2147483647;background:#fff;color:#202124;border-bottom:1px solid #dfe3e8;box-shadow:0 2px 9px #0002;padding:max(7px,env(safe-area-inset-top)) 8px 7px;font-family:-apple-system,BlinkMacSystemFont,'Noto Sans JP',sans-serif}
       #${BAR_ID}.open{display:flex;align-items:flex-end;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch}
@@ -1149,6 +1728,12 @@
     novel.textContent='📖 小説TXT';
     novel.addEventListener('click',()=>switchTo('novel'));
 
+    const image=document.createElement('button');
+    image.type='button';
+    image.dataset.toolTab='image';
+    image.textContent='🖼️ 画像保存';
+    image.addEventListener('click',()=>switchTo('image'));
+
     const search=document.createElement('button');
     search.type='button';
     search.dataset.toolTab='search';
@@ -1164,7 +1749,7 @@
     close.textContent='閉じる';
     close.addEventListener('click',closeAll);
 
-    bar.append(title,novel,search,cloudSlot,close);
+    bar.append(title,novel,image,search,cloudSlot,close);
 
     const placeholder=document.createElement('div');
     placeholder.id=PLACEHOLDER_ID;
