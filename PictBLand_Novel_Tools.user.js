@@ -1117,13 +1117,14 @@
       }
 
       meta = readSyncMeta();
-      localRevision = derivedRevision(localRows);
+      const currentRows = readSaved();
+      localRevision = derivedRevision(currentRows);
       if (remoteRevision > localRevision) {
         writeSaved(remote.rows, { fromCloud: true, revision: remoteRevision });
         setCloudStatus(`☁️ pCloudから更新：${remote.rows.length}件`);
       } else if (localRevision > remoteRevision) {
-        await cloudUpload(localRows, localRevision);
-        setCloudStatus(`☁️ pCloudへ更新：${localRows.length}件`);
+        await cloudUpload(currentRows, localRevision);
+        setCloudStatus(`☁️ pCloudへ更新：${currentRows.length}件`);
       } else {
         writeSyncMeta({ initialized: true, localRevision, lastCloudRevision: remoteRevision });
         setCloudStatus(`☁️ 同期済み：${localRows.length}件`);
