@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.10
+// @version      0.3.11
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -760,7 +760,7 @@
 // ---- Saved pictBLand search words + pCloud sync (v0.3.9) ----
 (() => {
   'use strict';
-  if (window.__pictblandSavedSearchWordsV039) return;
+  if (window.__pictblandSavedSearchWordsV0311) return;
   window.__pictblandSavedSearchWordsV039 = true;
 
   const STORAGE_KEY = 'pictbland-saved-search-words-v1';
@@ -978,7 +978,7 @@
   async function cloudUpload(rows, revision, token = cloudToken) {
     const payload = {
       app: 'Niji Research Helper',
-      version: 'pictbland-saved-search-sync-v1',
+      version: '0.3.11',
       dbVersion: 1,
       exportedAt: new Date().toISOString(),
       sourceOrigin: location.origin,
@@ -1006,7 +1006,7 @@
         'x-nrh-device': CLOUD_DEVICE,
         'x-nrh-origin': location.origin,
         'x-nrh-sha256': hash,
-        'x-nrh-version': 'pictbland-search-sync-v1',
+        'x-nrh-version': '0.3.11',
       },
       data: text,
       responseType: 'text',
