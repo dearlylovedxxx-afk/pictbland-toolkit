@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.12
+// @version      0.3.13
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -752,18 +752,35 @@
 
 
 
-// ---- Saved pictBLand search words (v0.1.9) ----
+// ---- Saved pictBLand searches + cross-search newest feed (v0.2.0) ----
 (() => {
   'use strict';
-  if (window.__pictblandSavedSearchWordsV019) return;
-  window.__pictblandSavedSearchWordsV019 = true;
+  if (window.__pictblandSavedSearchWordsV020) return;
+  window.__pictblandSavedSearchWordsV020 = true;
 
   const STORAGE_KEY = 'pictbland-saved-search-words-v1';
+  const FEED_EXCLUDE_TAGS_KEY = 'pictbland-saved-search-feed-exclude-tags-v1';
   const BUTTON_ID = 'pbsw-button';
   const ROOT_ID = 'pbsw-root';
   const MAX_SAVED = 200;
+  const FEED_STEP = 50;
+  const SEARCH_CONCURRENCY = 3;
+  const DETAIL_CONCURRENCY = 3;
+
   let root = null;
   let quickInput = null;
+
+  let feedOpen = false;
+  let feedLoading = false;
+  let feedGeneration = 0;
+  let feedAbort = null;
+  let feedStates = [];
+  let feedWorks = new Map();
+  let feedVisibleCount = FEED_STEP;
+  let feedObserver = null;
+  let detailQueue = [];
+  let detailActive = 0;
+  let feedExcludeTags = readExcludeTags();
 
   function currentSearch() {
     const m = location.pathname.match(/^\/tags\/index\/(.*)$/);
@@ -778,8 +795,6 @@
   function searchHrefForWord(word) {
     const clean = String(word || '').trim();
     if (!clean) return '';
-    // pictBLandの既知の検索URL形式：/tags/index/+検索語+
-    // 空白は + にし、検索演算子として入力された + / - はそのまま残す。
     const encoded = encodeURIComponent(clean)
       .replace(/%20/g, '+')
       .replace(/%2B/gi, '+')
@@ -800,6 +815,64 @@
   function writeSaved(rows) {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(rows.slice(0, MAX_SAVED)));
     render();
+  }
+
+  function normalizeExcludeTag(value) {
+    return String(value || '').trim().replace(/^#+/, '').normalize('NFKC').toLocaleLowerCase('ja-JP');
+  }
+
+  function parseExcludeTags(value) {
+    const parts = String(value || '').split(/[\n,、]+/).map(x => x.trim()).filter(Boolean);
+    const unique = new Map();
+    for (const raw of parts) {
+      const key = normalizeExcludeTag(raw);
+      if (!key || unique.has(key)) continue;
+      unique.set(key, raw.replace(/^#+/, '').trim());
+    }
+    return [...unique.values()];
+  }
+
+  function readExcludeTags() {
+    try {
+      const value = JSON.parse(localStorage.getItem(FEED_EXCLUDE_TAGS_KEY) || '[]');
+      return Array.isArray(value) ? parseExcludeTags(value.join('\n')) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveExcludeTags(tags) {
+    feedExcludeTags = parseExcludeTags((tags || []).join('\n'));
+    try { localStorage.setItem(FEED_EXCLUDE_TAGS_KEY, JSON.stringify(feedExcludeTags)); } catch {}
+  }
+
+  function excludedTagSet() {
+    return new Set(feedExcludeTags.map(normalizeExcludeTag).filter(Boolean));
+  }
+
+  function excludedByTag(work) {
+    if (!feedExcludeTags.length || !Array.isArray(work?.tags) || !work.tags.length) return false;
+    const blocked = excludedTagSet();
+    return work.tags.some(tag => blocked.has(normalizeExcludeTag(tag)));
+  }
+
+  function syncExcludeUi() {
+    if (!root) return;
+    const input = root.querySelector('.pbsw-feed-exclude-input');
+    const summary = root.querySelector('.pbsw-feed-exclude-summary');
+    if (input && document.activeElement !== input) input.value = feedExcludeTags.join(', ');
+    if (summary) summary.textContent = feedExcludeTags.length
+      ? '🚫 除外タグ ' + feedExcludeTags.length + '件'
+      : '🚫 除外タグなし';
+  }
+
+  function applyExcludeInput() {
+    const input = root?.querySelector('.pbsw-feed-exclude-input');
+    if (!input) return;
+    saveExcludeTags(parseExcludeTags(input.value));
+    feedVisibleCount = FEED_STEP;
+    syncExcludeUi();
+    renderFeed();
   }
 
   function saveWord(word, href='') {
@@ -870,16 +943,656 @@
     writeSaved(rows);
   }
 
-  function render() {
+  function firstSearchHref(row) {
+    const target = row?.href || searchHrefForWord(row?.word || '');
+    if (!target) return '';
+    const u = new URL(target, location.origin);
+    for (const key of ['ctop','page','p','offset']) u.searchParams.delete(key);
+    return u.pathname + (u.searchParams.toString() ? '?' + u.searchParams.toString() : '');
+  }
+
+  async function requestHtml(url, signal) {
+    const abs = new URL(url, location.origin).href;
+    const response = await fetch(abs, {
+      method:'GET',
+      credentials:'include',
+      redirect:'follow',
+      signal,
+      headers:{Accept:'text/html,application/xhtml+xml'}
+    });
+    if (response.status === 429) throw new Error('429：pictBLandのアクセス制限です');
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    return {html:await response.text(), url:response.url || abs};
+  }
+
+  function compactText(value) {
+    return String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+
+  function itemIdFromHref(href) {
+    try {
+      const u = new URL(href, location.origin);
+      return u.origin === location.origin ? (u.pathname.match(/^\/items\/detail\/(\d+)/)?.[1] || '') : '';
+    } catch {
+      return '';
+    }
+  }
+
+  function itemHref(id) {
+    return '/items/detail/' + encodeURIComponent(id);
+  }
+
+  function itemIdsInside(el) {
+    const ids = new Set();
+    for (const a of el?.querySelectorAll?.('a[href]') || []) {
+      const id = itemIdFromHref(a.getAttribute('href') || a.href || '');
+      if (id) ids.add(id);
+      if (ids.size > 2) break;
+    }
+    return ids;
+  }
+
+  function workCardFor(anchor, id) {
+    let node = anchor;
+    let best = anchor.parentElement || anchor;
+    for (let depth = 0; node?.parentElement && depth < 9; depth++) {
+      node = node.parentElement;
+      if (!node || node === document.body || node === document.documentElement) break;
+      const ids = itemIdsInside(node);
+      if (ids.size === 1 && ids.has(id)) {
+        best = node;
+        if (/^(ARTICLE|LI)$/i.test(node.tagName)) break;
+      } else if (ids.size > 1) {
+        break;
+      }
+    }
+    return best;
+  }
+
+  function imageUrlFrom(card) {
+    const img = card?.querySelector?.('img');
+    if (!img) return '';
+    const candidates = [
+      img.getAttribute('src'),
+      img.getAttribute('data-src'),
+      img.getAttribute('data-original'),
+      img.getAttribute('data-lazy-src'),
+      img.getAttribute('data-url')
+    ];
+    const srcset = String(img.getAttribute('srcset') || '').split(',').map(x => x.trim().split(/\s+/)[0]).filter(Boolean);
+    for (const raw of [...candidates, ...srcset]) {
+      if (!raw || /^data:|^blob:/i.test(raw)) continue;
+      try { return new URL(raw, location.origin).href; } catch {}
+    }
+    return '';
+  }
+
+  function tagsFrom(rootNode) {
+    const out = [];
+    const seen = new Set();
+    for (const a of rootNode?.querySelectorAll?.('a[href*="/tags/index/"]') || []) {
+      let tag = compactText(a.textContent).replace(/^#/, '');
+      if (!tag) {
+        try {
+          const u = new URL(a.getAttribute('href') || '', location.origin);
+          const raw = u.pathname.match(/^\/tags\/index\/(.*)$/)?.[1] || '';
+          tag = decodeURIComponent(raw).replace(/^\++|\++$/g, '').trim();
+        } catch {}
+      }
+      const key = normalizeExcludeTag(tag);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push(tag);
+    }
+    return out;
+  }
+
+  function parseDateFromText(text) {
+    const s = compactText(text);
+    let m = s.match(/(20\d{2})[\/.-](\d{1,2})[\/.-](\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?/);
+    if (!m) m = s.match(/(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日(?:\s*(\d{1,2}):(\d{2}))?/);
+    if (!m) return {text:'', time:0};
+    const y=Number(m[1]), mo=Number(m[2])-1, d=Number(m[3]), h=Number(m[4]||0), mi=Number(m[5]||0);
+    const time = +new Date(y,mo,d,h,mi,0,0);
+    return {text:m[0], time:Number.isFinite(time)?time:0};
+  }
+
+  function dateFrom(rootNode) {
+    const timeEl = rootNode?.querySelector?.('time[datetime]');
+    if (timeEl) {
+      const raw = timeEl.getAttribute('datetime') || '';
+      const time = Date.parse(raw);
+      if (Number.isFinite(time)) return {text:compactText(timeEl.textContent) || new Date(time).toLocaleString('ja-JP'), time};
+    }
+    return parseDateFromText(rootNode?.textContent || '');
+  }
+
+  function metricFromText(text, names) {
+    const source = compactText(text);
+    for (const name of names) {
+      let m = source.match(new RegExp(name + '[^0-9０-９]{0,10}([0-9０-９,，]+)', 'i'));
+      if (!m) m = source.match(new RegExp('([0-9０-９,，]+)[^0-9０-９]{0,6}' + name, 'i'));
+      if (!m) continue;
+      const n = Number(m[1].replace(/[０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0)-0xFEE0)).replace(/[，,]/g,''));
+      if (Number.isFinite(n)) return n;
+    }
+    return null;
+  }
+
+  function titleFrom(card, anchors, id) {
+    const reject = /^(?:詳細|続きを読む|作品を見る|画像|小説|漫画|イラスト|ステキ!?|ブクマ|ブックマーク)$/i;
+    const candidates = [];
+    for (const el of card?.querySelectorAll?.('h1,h2,h3,h4,strong,[class*="title"],[class*="subject"]') || []) {
+      const t = compactText(el.textContent);
+      if (t && t.length <= 180 && !reject.test(t)) candidates.push(t);
+    }
+    for (const a of anchors) {
+      const t = compactText(a.textContent);
+      if (t && t.length <= 180 && !reject.test(t)) candidates.push(t);
+      const alt = compactText(a.querySelector('img')?.getAttribute('alt'));
+      if (alt && alt.length <= 180 && !reject.test(alt)) candidates.push(alt);
+    }
+    return candidates.sort((a,b)=>b.length-a.length)[0] || ('作品 ' + id);
+  }
+
+  function authorFrom(rootNode) {
+    for (const a of rootNode?.querySelectorAll?.('a[href]') || []) {
+      try {
+        const u = new URL(a.getAttribute('href') || '', location.origin);
+        if (!/^\/users\/[^/]+\/?$/.test(u.pathname)) continue;
+        const name = compactText(a.textContent);
+        if (name) return {name, href:u.pathname};
+      } catch {}
+    }
+    return {name:'', href:''};
+  }
+
+  function captionFrom(rootNode, title, authorName, tags) {
+    const tagSet = new Set((tags || []).map(compactText));
+    const candidates = [];
+    for (const el of rootNode?.querySelectorAll?.('p,[class*="caption"],[class*="description"],[class*="comment"],[class*="summary"]') || []) {
+      const t = compactText(el.textContent);
+      if (!t || t === title || t === authorName || tagSet.has(t) || t.length < 8 || t.length > 800) continue;
+      if (/^(?:投稿日|更新日|ステキ|ブクマ|ブックマーク|タグ|閲覧)/.test(t)) continue;
+      candidates.push(t);
+    }
+    return candidates.sort((a,b)=>b.length-a.length)[0] || '';
+  }
+
+  function normalizeSearchWork(card, anchors, id, state, orderIndex) {
+    const tags = tagsFrom(card);
+    const title = titleFrom(card, anchors, id);
+    const author = authorFrom(card);
+    const date = dateFrom(card);
+    const text = compactText(card?.textContent || '');
+    return {
+      id,
+      href:itemHref(id),
+      title,
+      thumb:imageUrlFrom(card),
+      authorName:author.name,
+      authorHref:author.href,
+      dateText:date.text,
+      dateTime:date.time,
+      caption:captionFrom(card,title,author.name,tags),
+      tags,
+      sukiCount:metricFromText(text,['ステキ!?','ステキ','いいね']),
+      bookmarkCount:metricFromText(text,['ブクマ','ブックマーク']),
+      matches:new Set([state.row.name || state.row.word]),
+      detailLoaded:false,
+      detailQueued:false,
+      detailLoading:false,
+      searchOrder:orderIndex
+    };
+  }
+
+  function findNextHref(doc, currentUrl) {
+    const direct = doc.querySelector('link[rel="next"][href],a[rel="next"][href]');
+    if (direct?.getAttribute('href')) {
+      try {
+        const u = new URL(direct.getAttribute('href'), currentUrl);
+        if (u.origin === location.origin) return u.href;
+      } catch {}
+    }
+
+    const candidates = [];
+    for (const a of doc.querySelectorAll('a[href]')) {
+      const text = compactText(a.textContent);
+      if (!/(?:^|\s)(?:次|次へ|次のページ|NEXT|Next)(?:\s|$|[>＞»›])/i.test(text)) continue;
+      try {
+        const u = new URL(a.getAttribute('href'), currentUrl);
+        if (u.origin !== location.origin || !/^\/tags\/index\//.test(u.pathname)) continue;
+        candidates.push(u.href);
+      } catch {}
+    }
+    return candidates[0] || '';
+  }
+
+  function parseSearchPage(html, pageUrl, state) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const grouped = new Map();
+    for (const a of doc.querySelectorAll('a[href]')) {
+      const id = itemIdFromHref(a.getAttribute('href') || '');
+      if (!id) continue;
+      if (!grouped.has(id)) grouped.set(id, []);
+      grouped.get(id).push(a);
+    }
+
+    const works = [];
+    let orderIndex = 0;
+    for (const [id, anchors] of grouped) {
+      const card = workCardFor(anchors[0], id);
+      works.push(normalizeSearchWork(card, anchors, id, state, orderIndex++));
+    }
+
+    if (!works.length) {
+      const text = compactText(doc.body?.textContent || '');
+      if (/ログイン|login/i.test(text)) throw new Error('検索結果を取得できません。pictBLandへのログイン状態を確認してください');
+    }
+
+    return {works, nextHref:findNextHref(doc,pageUrl)};
+  }
+
+  async function fetchSearchState(state, url, generation) {
+    if (!url || generation !== feedGeneration || feedAbort?.signal.aborted) return;
+    try {
+      const response = await requestHtml(url, feedAbort.signal);
+      if (generation !== feedGeneration) return;
+      const parsed = parseSearchPage(response.html, response.url, state);
+      state.nextHref = parsed.nextHref;
+      state.done = !parsed.nextHref;
+      state.error = '';
+      mergeWorks(parsed.works);
+    } catch (e) {
+      if (e?.name === 'AbortError') return;
+      state.error = String(e?.message || e);
+    }
+  }
+
+  function mergeWorks(works) {
+    for (const work of works || []) {
+      const old = feedWorks.get(work.id);
+      if (!old) {
+        feedWorks.set(work.id, work);
+        continue;
+      }
+      for (const name of work.matches) old.matches.add(name);
+      if (!old.thumb && work.thumb) old.thumb = work.thumb;
+      if (!old.authorName && work.authorName) { old.authorName = work.authorName; old.authorHref = work.authorHref; }
+      if (!old.caption && work.caption) old.caption = work.caption;
+      if (!old.tags.length && work.tags.length) old.tags = work.tags;
+      if (!old.dateTime && work.dateTime) { old.dateTime = work.dateTime; old.dateText = work.dateText; }
+      if (old.sukiCount == null && work.sukiCount != null) old.sukiCount = work.sukiCount;
+      if (old.bookmarkCount == null && work.bookmarkCount != null) old.bookmarkCount = work.bookmarkCount;
+    }
+  }
+
+  function allSortedWorks() {
+    return [...feedWorks.values()].sort((a,b) => {
+      if ((b.dateTime||0) !== (a.dateTime||0)) return (b.dateTime||0) - (a.dateTime||0);
+      const bi = Number(b.id), ai = Number(a.id);
+      if (Number.isFinite(bi) && Number.isFinite(ai) && bi !== ai) return bi-ai;
+      return (a.searchOrder||0) - (b.searchOrder||0);
+    });
+  }
+
+  function sortedWorks() {
+    return allSortedWorks().filter(work => !excludedByTag(work));
+  }
+
+  async function mapLimit(items, limit, worker) {
+    let index = 0;
+    const runners = Array.from({length:Math.min(limit,items.length)}, async () => {
+      while (index < items.length) {
+        const item = items[index++];
+        await worker(item);
+      }
+    });
+    await Promise.allSettled(runners);
+  }
+
+  async function fetchDetail(work, signal) {
+    const response = await requestHtml(work.href, signal);
+    const doc = new DOMParser().parseFromString(response.html, 'text/html');
+    const bodyText = compactText(doc.body?.textContent || '');
+
+    const tags = tagsFrom(doc);
+    if (tags.length) work.tags = tags;
+
+    const author = authorFrom(doc);
+    if (author.name) { work.authorName = author.name; work.authorHref = author.href; }
+
+    const ogTitle = compactText(doc.querySelector('meta[property="og:title"]')?.getAttribute('content'));
+    const headingTitle = compactText(doc.querySelector('h1,h2,[class*="title"],[class*="subject"]')?.textContent);
+    const title = ogTitle || headingTitle;
+    if (title && !/pictBLand/i.test(title)) work.title = title.replace(/\s*[|｜-]\s*pictBLand.*$/i,'').trim() || work.title;
+
+    const ogImage = doc.querySelector('meta[property="og:image"]')?.getAttribute('content') || '';
+    if (!work.thumb && ogImage) {
+      try { work.thumb = new URL(ogImage,response.url).href; } catch {}
+    }
+
+    const date = dateFrom(doc);
+    if (date.time) { work.dateTime = date.time; work.dateText = date.text; }
+
+    const descriptionMeta = compactText(
+      doc.querySelector('meta[property="og:description"]')?.getAttribute('content') ||
+      doc.querySelector('meta[name="description"]')?.getAttribute('content')
+    );
+    const candidateCaption = captionFrom(doc,work.title,work.authorName,work.tags);
+    const caption = candidateCaption || descriptionMeta;
+    if (caption && !/pictBLandへようこそ/i.test(caption)) work.caption = caption;
+
+    const suki = metricFromText(bodyText,['ステキ!?','ステキ','いいね']);
+    const bookmark = metricFromText(bodyText,['ブクマ','ブックマーク']);
+    if (suki != null) work.sukiCount = suki;
+    if (bookmark != null) work.bookmarkCount = bookmark;
+  }
+
+  function resetDetailQueue() {
+    detailQueue = [];
+    detailActive = 0;
+  }
+
+  function enqueueDetail(work, generation) {
+    if (!work || work.detailLoaded || work.detailLoading || work.detailQueued) return;
+    work.detailQueued = true;
+    detailQueue.push({work,generation});
+    pumpDetailQueue();
+  }
+
+  function pumpDetailQueue() {
+    while (detailActive < DETAIL_CONCURRENCY && detailQueue.length) {
+      const job = detailQueue.shift();
+      const work = job.work;
+      work.detailQueued = false;
+      if (job.generation !== feedGeneration || feedAbort?.signal.aborted || work.detailLoaded || work.detailLoading) continue;
+      work.detailLoading = true;
+      detailActive++;
+      fetchDetail(work,feedAbort.signal).then(() => {
+        if (job.generation !== feedGeneration) return;
+        work.detailLoaded = true;
+        if (excludedByTag(work)) renderFeed();
+        else updateFeedCard(work);
+      }).catch(e => {
+        if (e?.name !== 'AbortError') {
+          work.detailLoaded = true;
+          updateFeedCard(work);
+        }
+      }).finally(() => {
+        work.detailLoading = false;
+        detailActive = Math.max(0,detailActive-1);
+        pumpDetailQueue();
+      });
+    }
+  }
+
+  function feedStatusText() {
+    const total = feedStates.length;
+    const ok = feedStates.filter(s => !s.error).length;
+    const bad = feedStates.filter(s => s.error).length;
+    const visible = sortedWorks().length;
+    const excluded = Math.max(0,feedWorks.size-visible);
+    return feedLoading
+      ? '保存検索 ' + total + '件を更新中… 現在 ' + visible.toLocaleString('ja-JP') + '作品' + (excluded ? '（除外 ' + excluded + '）' : '')
+      : '保存検索 ' + ok + '/' + total + '件取得 ／ 表示 ' + visible.toLocaleString('ja-JP') + '作品' + (excluded ? ' ／ 除外 ' + excluded + '作品' : '') + (bad ? ' ／ 失敗 ' + bad + '件' : '');
+  }
+
+  function metricLabel(work) {
+    const bits = [];
+    if (work.sukiCount != null) bits.push('♥ ' + Number(work.sukiCount).toLocaleString('ja-JP'));
+    if (work.bookmarkCount != null) bits.push('🔖 ' + Number(work.bookmarkCount).toLocaleString('ja-JP'));
+    return bits.length ? bits.join('  ') : '詳細取得中…';
+  }
+
+  function createFeedCard(work) {
+    const card = document.createElement('article');
+    card.className = 'pbsw-feed-card';
+    card.dataset.workId = work.id;
+
+    const thumb = document.createElement('a');
+    thumb.className = 'pbsw-feed-thumb';
+    thumb.href = work.href;
+    const img = document.createElement('img');
+    img.loading = 'lazy';
+    img.alt = work.title;
+    if (work.thumb) img.src = work.thumb;
+    else img.classList.add('empty');
+    thumb.append(img);
+
+    const info = document.createElement('div');
+    info.className = 'pbsw-feed-info';
+
+    const top = document.createElement('div');
+    top.className = 'pbsw-feed-top';
+    const title = document.createElement('a');
+    title.className = 'pbsw-feed-title';
+    title.href = work.href;
+    title.textContent = work.title;
+    const metric = document.createElement('span');
+    metric.className = 'pbsw-feed-metric';
+    metric.textContent = metricLabel(work);
+    top.append(title,metric);
+
+    const author = document.createElement(work.authorHref ? 'a' : 'span');
+    author.className = 'pbsw-feed-author';
+    if (work.authorHref) author.href = work.authorHref;
+    author.textContent = work.authorName || '作者取得中…';
+
+    const date = document.createElement('div');
+    date.className = 'pbsw-feed-date';
+    date.textContent = work.dateText || '';
+
+    const caption = document.createElement('p');
+    caption.className = 'pbsw-feed-caption';
+    caption.textContent = work.caption || '作品情報を取得中…';
+
+    const tags = document.createElement('div');
+    tags.className = 'pbsw-feed-tags';
+    for (const tag of work.tags.slice(0,10)) {
+      const a = document.createElement('a');
+      a.href = searchHrefForWord(tag);
+      a.textContent = '#' + tag;
+      tags.append(a);
+    }
+
+    const matches = document.createElement('div');
+    matches.className = 'pbsw-feed-matches';
+    const names = [...work.matches];
+    for (const name of names.slice(0,4)) {
+      const chip = document.createElement('span');
+      chip.textContent = name;
+      matches.append(chip);
+    }
+    if (names.length > 4) {
+      const more = document.createElement('span');
+      more.textContent = '+' + (names.length-4);
+      matches.append(more);
+    }
+
+    info.append(top,author,date,caption,tags,matches);
+    card.append(thumb,info);
+    return card;
+  }
+
+  function updateFeedCard(work) {
+    const card = root?.querySelector('.pbsw-feed-card[data-work-id="' + CSS.escape(work.id) + '"]');
+    if (!card) return;
+    const metric = card.querySelector('.pbsw-feed-metric');
+    if (metric) metric.textContent = metricLabel(work);
+    const title = card.querySelector('.pbsw-feed-title');
+    if (title) title.textContent = work.title;
+    const author = card.querySelector('.pbsw-feed-author');
+    if (author) author.textContent = work.authorName || '作者不明';
+    const date = card.querySelector('.pbsw-feed-date');
+    if (date) date.textContent = work.dateText || '';
+    const caption = card.querySelector('.pbsw-feed-caption');
+    if (caption) caption.textContent = work.caption || '説明なし';
+    const img = card.querySelector('.pbsw-feed-thumb img');
+    if (img && work.thumb && !img.getAttribute('src')) { img.src = work.thumb; img.classList.remove('empty'); }
+    const tags = card.querySelector('.pbsw-feed-tags');
+    if (tags) {
+      tags.replaceChildren();
+      for (const tag of work.tags.slice(0,10)) {
+        const a = document.createElement('a');
+        a.href = searchHrefForWord(tag);
+        a.textContent = '#' + tag;
+        tags.append(a);
+      }
+    }
+  }
+
+  function observeFeedCards(works,generation) {
+    feedObserver?.disconnect();
+    if (!('IntersectionObserver' in window)) {
+      for (const work of works.slice(0,10)) enqueueDetail(work,generation);
+      return;
+    }
+    feedObserver = new IntersectionObserver(entries => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const id = entry.target?.dataset?.workId;
+        const work = id ? feedWorks.get(id) : null;
+        if (work) enqueueDetail(work,generation);
+        feedObserver?.unobserve(entry.target);
+      }
+    }, {root,rootMargin:'500px 0px',threshold:0.01});
+    for (const card of root.querySelectorAll('.pbsw-feed-card')) feedObserver.observe(card);
+  }
+
+  function renderFeed() {
     if (!root) return;
+    syncExcludeUi();
+    const status = root.querySelector('.pbsw-feed-status');
+    if (status) status.textContent = feedStatusText();
+
+    const works = sortedWorks();
+    const visible = works.slice(0,feedVisibleCount);
+    const grid = root.querySelector('.pbsw-feed-grid');
+    grid.replaceChildren();
+
+    if (!works.length && !feedLoading) {
+      const p = document.createElement('p');
+      p.className = 'pbsw-empty';
+      p.textContent = feedWorks.size && feedExcludeTags.length
+        ? '取得した作品はすべて除外タグに一致しました。'
+        : '該当する新着作品がありません。';
+      grid.append(p);
+    } else {
+      for (const work of visible) grid.append(createFeedCard(work));
+    }
+
+    const showMore = root.querySelector('.pbsw-feed-show-more');
+    const older = root.querySelector('.pbsw-feed-load-older');
+    const refresh = root.querySelector('.pbsw-feed-refresh');
+    const hasHidden = works.length > feedVisibleCount;
+    const hasOlder = feedStates.some(s => !s.error && !s.done && s.nextHref);
+    showMore.hidden = !hasHidden;
+    older.hidden = hasHidden || !hasOlder || feedLoading;
+    refresh.disabled = feedLoading;
+    showMore.disabled = feedLoading;
+    older.disabled = feedLoading;
+
+    observeFeedCards(visible,feedGeneration);
+  }
+
+  async function refreshFeed() {
+    const rows = readSaved();
+    feedAbort?.abort();
+    feedAbort = new AbortController();
+    feedGeneration++;
+    const generation = feedGeneration;
+    feedLoading = true;
+    feedWorks = new Map();
+    feedVisibleCount = FEED_STEP;
+    feedStates = rows.map(row => ({
+      row,
+      nextHref:firstSearchHref(row),
+      done:false,
+      error:''
+    }));
+    feedObserver?.disconnect();
+    resetDetailQueue();
+    renderFeed();
+
+    await mapLimit(feedStates,SEARCH_CONCURRENCY,async state => {
+      await fetchSearchState(state,state.nextHref,generation);
+      if (generation === feedGeneration) renderFeed();
+    });
+
+    if (generation !== feedGeneration) return;
+    feedLoading = false;
+    renderFeed();
+  }
+
+  async function loadOlderFeed() {
+    if (feedLoading) return;
+    const generation = feedGeneration;
+    const targets = feedStates.filter(s => !s.error && !s.done && s.nextHref);
+    if (!targets.length) return;
+    feedLoading = true;
+    renderFeed();
+
+    await mapLimit(targets,SEARCH_CONCURRENCY,async state => {
+      const url = state.nextHref;
+      await fetchSearchState(state,url,generation);
+      if (generation === feedGeneration) renderFeed();
+    });
+
+    if (generation !== feedGeneration) return;
+    feedLoading = false;
+    renderFeed();
+  }
+
+  function showManagePage() {
+    if (!root) return;
+    const manage = root.querySelector('.pbsw-manage-page');
+    const feed = root.querySelector('.pbsw-feed-page');
+    if (feed) { feed.hidden = true; feed.style.setProperty('display','none','important'); }
+    if (manage) { manage.hidden = false; manage.style.setProperty('display','block','important'); }
+  }
+
+  function showFeedPage() {
+    if (!root) return;
+    const manage = root.querySelector('.pbsw-manage-page');
+    const feed = root.querySelector('.pbsw-feed-page');
+    if (manage) { manage.hidden = true; manage.style.setProperty('display','none','important'); }
+    if (feed) { feed.hidden = false; feed.style.setProperty('display','block','important'); }
+  }
+
+  function openFeed() {
+    build();
+    if (!root) return;
+    feedOpen = true;
+    root.classList.add('open');
+    showFeedPage();
+    root.scrollTop = 0;
+    void refreshFeed();
+  }
+
+  function closeFeed() {
+    feedAbort?.abort();
+    feedObserver?.disconnect();
+    resetDetailQueue();
+    feedOpen = false;
+    if (!root) return;
+    showManagePage();
+    root.scrollTop = 0;
+    render();
+  }
+
+  function render() {
+    if (!root || feedOpen) return;
     const rows = readSaved();
     const list = root.querySelector('.pbsw-list');
     const current = currentSearch();
     const saveCurrentBtn = root.querySelector('.pbsw-save-current');
+    const newestBtn = root.querySelector('.pbsw-newest-open');
     root.querySelector('.pbsw-current').textContent = current
       ? '現在の検索語：' + current.word
       : '検索語を入力するか、保存済みの検索語をタップしてください。';
     saveCurrentBtn.hidden = !current;
+    newestBtn.disabled = !rows.length;
     list.replaceChildren();
 
     if (!rows.length) {
@@ -890,7 +1603,7 @@
       return;
     }
 
-    rows.forEach((row, index) => {
+    rows.forEach((row,index) => {
       const card = document.createElement('article');
       card.className = 'pbsw-card';
 
@@ -898,32 +1611,27 @@
       open.type = 'button';
       open.className = 'pbsw-open';
       open.title = 'タップして検索';
-      open.addEventListener('click', () => runSearch(row.word, row.href));
+      open.addEventListener('click',()=>runSearch(row.word,row.href));
       const name = document.createElement('strong');
       name.textContent = row.name || row.word;
       const word = document.createElement('span');
       word.textContent = '🔎 ' + row.word;
-      open.append(name, word);
+      open.append(name,word);
 
       const actions = document.createElement('div');
       actions.className = 'pbsw-actions';
-      const make = (label, fn, disabled=false) => {
-        const b = document.createElement('button');
-        b.type = 'button';
-        b.textContent = label;
-        b.disabled = disabled;
-        b.addEventListener('click', fn);
-        return b;
+      const make=(label,fn,disabled=false)=>{
+        const b=document.createElement('button');
+        b.type='button';b.textContent=label;b.disabled=disabled;b.addEventListener('click',fn);return b;
       };
       actions.append(
-        make('🔎 検索する', () => runSearch(row.word, row.href)),
-        make('名前変更', () => rename(row.id)),
-        make('↑', () => move(row.id, -1), index === 0),
-        make('↓', () => move(row.id, 1), index === rows.length - 1),
-        make('削除', () => remove(row.id))
+        make('🔎 検索する',()=>runSearch(row.word,row.href)),
+        make('名前変更',()=>rename(row.id)),
+        make('↑',()=>move(row.id,-1),index===0),
+        make('↓',()=>move(row.id,1),index===rows.length-1),
+        make('削除',()=>remove(row.id))
       );
-
-      card.append(open, actions);
+      card.append(open,actions);
       list.append(card);
     });
   }
@@ -937,15 +1645,16 @@
       #${ROOT_ID}{display:none;position:fixed;inset:0;z-index:2147483646;background:#f4f6f8;color:#202124;overflow:auto;-webkit-overflow-scrolling:touch;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Noto Sans JP',sans-serif}
       #${ROOT_ID}.open{display:block}
       #${ROOT_ID} *{box-sizing:border-box}
-      #${ROOT_ID} .pbsw-wrap{max-width:820px;margin:auto;padding:18px 14px 80px}
-      #${ROOT_ID} .pbsw-head{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;background:#fff;border:1px solid #ded9e8;border-radius:12px;padding:14px;margin-bottom:12px;position:sticky;top:0;z-index:2}
+      #${ROOT_ID} a{color:inherit}
+      #${ROOT_ID} .pbsw-wrap{max-width:1080px;margin:auto;padding:18px 14px 80px}
+      #${ROOT_ID} .pbsw-head,#${ROOT_ID} .pbsw-feed-head{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;background:#fff;border:1px solid #ded9e8;border-radius:12px;padding:14px;margin-bottom:12px;position:sticky;top:0;z-index:2}
       #${ROOT_ID} h2{font-size:18px;margin:0}
       #${ROOT_ID} button,#${ROOT_ID} input{font:inherit;border:1px solid #cfc8dc;border-radius:8px;background:#fff;color:#2d2640;padding:9px 10px}
       #${ROOT_ID} button:disabled{opacity:.45}
       #${ROOT_ID} .pbsw-current{flex:1 1 100%;font-size:12px;color:#6b6478}
       #${ROOT_ID} .pbsw-quick{display:flex;gap:7px;flex:1 1 100%;flex-wrap:wrap}
       #${ROOT_ID} .pbsw-quick input{flex:1 1 260px;min-width:0}
-      #${ROOT_ID} .pbsw-search,#${ROOT_ID} .pbsw-save-current{background:#7356a8;color:#fff;border-color:#7356a8;font-weight:700}
+      #${ROOT_ID} .pbsw-search,#${ROOT_ID} .pbsw-save-current,#${ROOT_ID} .pbsw-newest-open,#${ROOT_ID} .pbsw-feed-refresh{background:#7356a8;color:#fff;border-color:#7356a8;font-weight:700}
       #${ROOT_ID} .pbsw-card{background:#fff;border:1px solid #ded9e8;border-radius:12px;padding:10px;margin-bottom:10px}
       #${ROOT_ID} .pbsw-open{display:flex;width:100%;text-align:left;flex-direction:column;gap:4px;border:0;background:transparent;padding:5px;cursor:pointer}
       #${ROOT_ID} .pbsw-open strong{font-size:15px}
@@ -953,59 +1662,154 @@
       #${ROOT_ID} .pbsw-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
       #${ROOT_ID} .pbsw-actions button{font-size:12px;padding:7px 9px}
       #${ROOT_ID} .pbsw-empty{background:#fff;border:1px solid #ded9e8;border-radius:12px;padding:18px;color:#716b7b}
-      @media(max-width:600px){#${BUTTON_ID}{right:12px;padding:10px 13px}#${ROOT_ID} .pbsw-wrap{padding:10px 8px 70px}#${ROOT_ID} h2{font-size:16px}}
+      #${ROOT_ID} .pbsw-feed-status{flex:1 1 100%;font-size:12px;color:#716b7b}
+      #${ROOT_ID} .pbsw-feed-filter{flex:1 1 100%;background:#faf9fc;border:1px solid #ded9e8;border-radius:9px;padding:8px 10px}
+      #${ROOT_ID} .pbsw-feed-filter summary{cursor:pointer;font-weight:700}
+      #${ROOT_ID} .pbsw-feed-filter-row{display:flex;gap:7px;margin-top:8px}
+      #${ROOT_ID} .pbsw-feed-exclude-input{flex:1;min-width:0}
+      #${ROOT_ID} .pbsw-feed-filter-note{margin:6px 0 0;color:#7b7388;font-size:11px}
+      #${ROOT_ID} .pbsw-feed-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
+      #${ROOT_ID} .pbsw-feed-card{display:grid;grid-template-columns:128px minmax(0,1fr);background:#fff;border:1px solid #ded9e8;border-radius:12px;overflow:hidden;min-width:0}
+      #${ROOT_ID} .pbsw-feed-thumb{display:block;background:#ece8f2;min-height:128px}
+      #${ROOT_ID} .pbsw-feed-thumb img{display:block;width:100%;height:100%;min-height:128px;object-fit:cover;background:#ece8f2}
+      #${ROOT_ID} .pbsw-feed-thumb img.empty{visibility:hidden}
+      #${ROOT_ID} .pbsw-feed-info{padding:10px;min-width:0}
+      #${ROOT_ID} .pbsw-feed-top{display:flex;gap:7px;align-items:flex-start}
+      #${ROOT_ID} .pbsw-feed-title{font-weight:800;text-decoration:none;line-height:1.35;overflow-wrap:anywhere;flex:1}
+      #${ROOT_ID} .pbsw-feed-metric{font-size:11px;color:#755096;white-space:nowrap;font-weight:700}
+      #${ROOT_ID} .pbsw-feed-author{display:block;margin-top:5px;color:#675f74;text-decoration:none;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      #${ROOT_ID} .pbsw-feed-date{font-size:11px;color:#8c8595;margin-top:2px}
+      #${ROOT_ID} .pbsw-feed-caption{font-size:12px;line-height:1.5;color:#494251;margin:7px 0;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+      #${ROOT_ID} .pbsw-feed-tags{display:flex;gap:5px;flex-wrap:wrap;max-height:44px;overflow:hidden}
+      #${ROOT_ID} .pbsw-feed-tags a{font-size:11px;color:#7356a8;text-decoration:none;overflow-wrap:anywhere}
+      #${ROOT_ID} .pbsw-feed-matches{display:flex;gap:4px;flex-wrap:wrap;margin-top:8px}
+      #${ROOT_ID} .pbsw-feed-matches span{font-size:10px;color:#645c70;background:#f0edf4;border-radius:999px;padding:3px 6px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      #${ROOT_ID} .pbsw-feed-more{display:flex;justify-content:center;gap:8px;flex-wrap:wrap;padding:18px 0}
+      #${ROOT_ID} .pbsw-feed-more button{font-weight:700}
+      @media(max-width:650px){
+        #${BUTTON_ID}{right:12px;padding:10px 13px}
+        #${ROOT_ID} .pbsw-wrap{padding:10px 8px 70px}
+        #${ROOT_ID} h2{font-size:16px}
+        #${ROOT_ID} .pbsw-feed-grid{grid-template-columns:1fr}
+        #${ROOT_ID} .pbsw-feed-card{grid-template-columns:112px minmax(0,1fr)}
+        #${ROOT_ID} .pbsw-feed-thumb,#${ROOT_ID} .pbsw-feed-thumb img{min-height:112px}
+      }
     `;
     document.head.append(style);
 
-    const button = document.createElement('button');
-    button.id = BUTTON_ID;
-    button.type = 'button';
-    button.textContent = '🔖 検索';
-    button.addEventListener('click', () => {
-      render();
-      root.classList.add('open');
-      setTimeout(() => quickInput?.focus(), 0);
+    const button=document.createElement('button');
+    button.id=BUTTON_ID;
+    button.type='button';
+    button.textContent='🔖 検索';
+    button.addEventListener('click',openPanel);
+
+    root=document.createElement('section');
+    root.id=ROOT_ID;
+    root.innerHTML=`
+      <div class="pbsw-wrap pbsw-manage-page">
+        <div class="pbsw-head">
+          <h2>🔖 pictBLand 保存検索</h2>
+          <button type="button" class="pbsw-newest-open">🆕 保存検索の新着</button>
+          <button type="button" class="pbsw-save-current">現在の検索語を保存</button>
+          <button type="button" class="pbsw-close">閉じる</button>
+          <div class="pbsw-current"></div>
+          <div class="pbsw-quick">
+            <input class="pbsw-input" type="search" placeholder="検索語を入力">
+            <button type="button" class="pbsw-search">🔎 検索</button>
+            <button type="button" class="pbsw-save-input">この語を保存</button>
+          </div>
+        </div>
+        <div class="pbsw-list"></div>
+      </div>
+      <div class="pbsw-wrap pbsw-feed-page" hidden>
+        <div class="pbsw-feed-head">
+          <button type="button" class="pbsw-feed-back">← 保存検索へ</button>
+          <h2>🆕 保存検索の新着</h2>
+          <button type="button" class="pbsw-feed-refresh">更新</button>
+          <div class="pbsw-feed-status"></div>
+          <details class="pbsw-feed-filter">
+            <summary class="pbsw-feed-exclude-summary">🚫 除外タグなし</summary>
+            <div class="pbsw-feed-filter-row">
+              <input type="text" class="pbsw-feed-exclude-input" placeholder="例：女体化, パロディ, R-18">
+              <button type="button" class="pbsw-feed-exclude-apply">適用</button>
+            </div>
+            <p class="pbsw-feed-filter-note">カンマまたは改行区切り。作品タグと完全一致した場合に除外します。</p>
+          </details>
+        </div>
+        <div class="pbsw-feed-grid"></div>
+        <div class="pbsw-feed-more">
+          <button type="button" class="pbsw-feed-show-more" hidden>次の50件を表示</button>
+          <button type="button" class="pbsw-feed-load-older" hidden>さらに過去の新着を取得</button>
+        </div>
+      </div>
+    `;
+
+    quickInput=root.querySelector('.pbsw-input');
+    root.querySelector('.pbsw-save-current').addEventListener('click',saveCurrent);
+    root.querySelector('.pbsw-search').addEventListener('click',runQuickSearch);
+    root.querySelector('.pbsw-save-input').addEventListener('click',saveQuickSearch);
+    root.querySelector('.pbsw-close').addEventListener('click',closePanel);
+    root.querySelector('.pbsw-newest-open').addEventListener('click',openFeed);
+    root.querySelector('.pbsw-feed-back').addEventListener('click',closeFeed);
+    root.querySelector('.pbsw-feed-refresh').addEventListener('click',()=>void refreshFeed());
+    root.querySelector('.pbsw-feed-exclude-apply').addEventListener('click',applyExcludeInput);
+    root.querySelector('.pbsw-feed-exclude-input').addEventListener('keydown',e=>{
+      if(e.key==='Enter'){e.preventDefault();applyExcludeInput();}
+    });
+    root.querySelector('.pbsw-feed-show-more').addEventListener('click',()=>{
+      feedVisibleCount+=FEED_STEP;
+      renderFeed();
+    });
+    root.querySelector('.pbsw-feed-load-older').addEventListener('click',()=>void loadOlderFeed());
+    quickInput.addEventListener('keydown',e=>{
+      if(e.key==='Enter'){e.preventDefault();runQuickSearch();}
     });
 
-    root = document.createElement('section');
-    root.id = ROOT_ID;
-    root.innerHTML = '<div class="pbsw-wrap"><div class="pbsw-head"><h2>🔖 pictBLand 保存検索</h2><button type="button" class="pbsw-save-current">現在の検索語を保存</button><button type="button" class="pbsw-close">閉じる</button><div class="pbsw-current"></div><div class="pbsw-quick"><input class="pbsw-input" type="search" placeholder="検索語を入力"><button type="button" class="pbsw-search">🔎 検索</button><button type="button" class="pbsw-save-input">この語を保存</button></div></div><div class="pbsw-list"></div></div>';
-    quickInput = root.querySelector('.pbsw-input');
-    root.querySelector('.pbsw-save-current').addEventListener('click', saveCurrent);
-    root.querySelector('.pbsw-search').addEventListener('click', runQuickSearch);
-    root.querySelector('.pbsw-save-input').addEventListener('click', saveQuickSearch);
-    root.querySelector('.pbsw-close').addEventListener('click', () => root.classList.remove('open'));
-    quickInput.addEventListener('keydown', e => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        runQuickSearch();
-      }
-    });
-
-    document.body.append(button, root);
+    document.body.append(button,root);
+    syncExcludeUi();
     render();
   }
 
   function openPanel() {
     build();
     if (!root) return;
-    render();
+    feedAbort?.abort();
+    feedObserver?.disconnect();
+    resetDetailQueue();
+    feedOpen=false;
     root.classList.add('open');
-    setTimeout(() => quickInput?.focus(), 0);
+    showManagePage();
+    root.scrollTop=0;
+    render();
+    setTimeout(()=>quickInput?.focus(),0);
   }
 
   function closePanel() {
-    root?.classList.remove('open');
+    feedAbort?.abort();
+    feedObserver?.disconnect();
+    resetDetailQueue();
+    feedOpen=false;
+    if(root){
+      showManagePage();
+      root.classList.remove('open');
+    }
   }
 
   function countSaved() {
     return readSaved().length;
   }
 
-  window.__pictblandSavedSearchUi = {open:openPanel, close:closePanel, render, count:countSaved, storageKey:STORAGE_KEY};
+  window.__pictblandSavedSearchUi={
+    open:openPanel,
+    close:closePanel,
+    render,
+    count:countSaved,
+    storageKey:STORAGE_KEY,
+    openNewest:openFeed
+  };
 
-  if (document.body) build();
-  else addEventListener('DOMContentLoaded', build, {once:true});
+  if(document.body)build();
+  else addEventListener('DOMContentLoaded',build,{once:true});
 })();
 
 
