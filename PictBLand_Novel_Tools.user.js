@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.17
+// @version      0.3.18
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1133,27 +1133,51 @@
 
   function itemIdsInside(el) {
     const ids = new Set();
-    for (const a of el?.querySelectorAll?.('a[href]') || []) {
-      const id = itemIdFromHref(a.getAttribute('href') || a.href || '');
-      if (id) ids.add(id);
+    if (!el) return ids;
+
+    const inspect = node => {
+      if (!node?.getAttribute) return;
+      for (const attr of [...(node.attributes || [])]) {
+        const id = itemIdFromAny(attr.value);
+        if (id) ids.add(id);
+        if (ids.size > 2) return;
+      }
+    };
+
+    inspect(el);
+    if (ids.size > 2) return ids;
+
+    let nodes = [];
+    try { nodes = [...(el.querySelectorAll?.('*') || [])]; } catch {}
+    for (const node of nodes) {
+      inspect(node);
       if (ids.size > 2) break;
     }
     return ids;
   }
 
   function workCardFor(anchor, id) {
+    if (!anchor) return null;
     let node = anchor;
-    let best = anchor.parentElement || anchor;
-    for (let depth = 0; node?.parentElement && depth < 9; depth++) {
+    let best = null;
+
+    // Walk upward only while the container belongs to this one work.
+    // Stop before a list/grid/page container that contains multiple work IDs.
+    for (let depth = 0; node && depth < 10; depth++) {
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const ids = itemIdsInside(node);
+        if (ids.size === 1 && ids.has(String(id))) {
+          best = node;
+          const textLen = compactText(node.textContent || '').length;
+          if (/^(ARTICLE|LI)$/i.test(node.tagName) || /card|item|work|post|entry/i.test(String(node.className || ''))) {
+            if (textLen > 0) break;
+          }
+        } else if (ids.size > 1) {
+          break;
+        }
+      }
       node = node.parentElement;
       if (!node || node === document.body || node === document.documentElement) break;
-      const ids = itemIdsInside(node);
-      if (ids.size === 1 && ids.has(id)) {
-        best = node;
-        if (/^(ARTICLE|LI)$/i.test(node.tagName)) break;
-      } else if (ids.size > 1) {
-        break;
-      }
     }
     return best;
   }
@@ -1231,6 +1255,7 @@
   function titleFrom(card, anchors, id) {
     const reject = /^(?:詳細|続きを読む|作品を見る|画像|小説|漫画|イラスト|ステキ!?|ブクマ|ブックマーク)$/i;
     const candidates = [];
+    if (!card) return '作品 ' + id;
     for (const el of card?.querySelectorAll?.('h1,h2,h3,h4,strong,[class*="title"],[class*="subject"]') || []) {
       const t = compactText(el.textContent);
       if (t && t.length <= 180 && !reject.test(t)) candidates.push(t);
@@ -1266,6 +1291,28 @@
       candidates.push(t);
     }
     return candidates.sort((a,b)=>b.length-a.length)[0] || '';
+  }
+
+  function minimalSearchWork(id, state, orderIndex) {
+    return {
+      id:String(id),
+      href:itemHref(id),
+      title:'作品 ' + id,
+      thumb:'',
+      authorName:'',
+      authorHref:'',
+      dateText:'',
+      dateTime:0,
+      caption:'',
+      tags:[],
+      sukiCount:null,
+      bookmarkCount:null,
+      matches:new Set([state.row.name || state.row.word]),
+      detailLoaded:false,
+      detailQueued:false,
+      detailLoading:false,
+      searchOrder:orderIndex
+    };
   }
 
   function normalizeSearchWork(card, anchors, id, state, orderIndex) {
@@ -1353,7 +1400,8 @@
       } catch {}
       if (anchor?.matches?.('a[href]') && !anchors.includes(anchor)) anchors.unshift(anchor);
 
-      works.push(normalizeSearchWork(card || anchor || doc.body,anchors,id,state,orderIndex++));
+      if (card || anchor) works.push(normalizeSearchWork(card || anchor,anchors,id,state,orderIndex++));
+      else works.push(minimalSearchWork(id,state,orderIndex++));
     }
 
     const pageText = compactText(doc.body?.textContent || '');
@@ -1648,6 +1696,8 @@
       }).finally(() => {
         work.detailLoading = false;
         detailActive = Math.max(0,detailActive-1);
+        const status = root?.querySelector('.pbsw-feed-status');
+        if (status) status.textContent = feedStatusText();
         pumpDetailQueue();
       });
     }
@@ -1659,9 +1709,11 @@
     const bad = feedStates.filter(s => s.error).length;
     const visible = sortedWorks().length;
     const excluded = Math.max(0,feedWorks.size-visible);
+    const detailed = [...feedWorks.values()].filter(w => w.detailLoaded).length;
+    const detailText = visible ? ' ／ 詳細 ' + detailed.toLocaleString('ja-JP') + '/' + feedWorks.size.toLocaleString('ja-JP') : '';
     return feedLoading
-      ? '保存検索 ' + total + '件を更新中… 現在 ' + visible.toLocaleString('ja-JP') + '作品' + (excluded ? '（除外 ' + excluded + '）' : '')
-      : '保存検索 ' + ok + '/' + total + '件取得 ／ 表示 ' + visible.toLocaleString('ja-JP') + '作品' + (excluded ? ' ／ 除外 ' + excluded + '作品' : '') + (bad ? ' ／ 失敗 ' + bad + '件' : '');
+      ? '保存検索 ' + total + '件を更新中… 現在 ' + visible.toLocaleString('ja-JP') + '作品' + detailText + (excluded ? '（除外 ' + excluded + '）' : '')
+      : '保存検索 ' + ok + '/' + total + '件取得 ／ 表示 ' + visible.toLocaleString('ja-JP') + '作品' + detailText + (excluded ? ' ／ 除外 ' + excluded + '作品' : '') + (bad ? ' ／ 失敗 ' + bad + '件' : '');
   }
 
   function metricLabel(work) {
@@ -1770,10 +1822,13 @@
 
   function observeFeedCards(works,generation) {
     feedObserver?.disconnect();
-    if (!('IntersectionObserver' in window)) {
-      for (const work of works.slice(0,10)) enqueueDetail(work,generation);
-      return;
-    }
+
+    // Always start the first visible batch immediately. This avoids iOS Safari
+    // cases where IntersectionObserver on a fixed nested scroller never fires.
+    for (const work of works.slice(0,12)) enqueueDetail(work,generation);
+
+    if (!('IntersectionObserver' in window)) return;
+
     feedObserver = new IntersectionObserver(entries => {
       for (const entry of entries) {
         if (!entry.isIntersecting) continue;
@@ -1782,8 +1837,14 @@
         if (work) enqueueDetail(work,generation);
         feedObserver?.unobserve(entry.target);
       }
-    }, {root,rootMargin:'500px 0px',threshold:0.01});
-    for (const card of root.querySelectorAll('.pbsw-feed-card')) feedObserver.observe(card);
+    }, {root,rootMargin:'700px 0px',threshold:0.01});
+
+    for (const card of root.querySelectorAll('.pbsw-feed-card')) {
+      const id = card.dataset.workId;
+      const work = id ? feedWorks.get(id) : null;
+      if (work?.detailLoaded || work?.detailLoading || work?.detailQueued) continue;
+      feedObserver.observe(card);
+    }
   }
 
   function renderFeed() {
