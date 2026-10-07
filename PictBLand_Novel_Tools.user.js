@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.18
+// @version      0.3.19
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -782,6 +782,7 @@
   let feedObserver = null;
   let detailQueue = [];
   let detailActive = 0;
+  let feedAutoExpandTimer = null;
   let feedExcludeTags = readExcludeTags();
 
   function currentSearch() {
@@ -1547,19 +1548,36 @@
     });
   }
 
+  function absolutePageUrl(url) {
+    try { return new URL(url, location.origin).href; } catch { return String(url || ''); }
+  }
+
   async function fetchSearchState(state, url, generation) {
-    if (!url || generation !== feedGeneration || feedAbort?.signal.aborted) return;
+    if (!url || generation !== feedGeneration || feedAbort?.signal.aborted) return false;
+
+    const pageUrl = absolutePageUrl(url);
+    state.seenPages ||= new Set();
+    state.loadedIds ||= new Set();
+
+    if (!pageUrl || state.seenPages.has(pageUrl)) {
+      state.done = true;
+      state.nextHref = '';
+      return false;
+    }
+    state.seenPages.add(pageUrl);
+
+    const before = state.loadedIds.size;
     try {
       // First try a normal same-site request. pictBLand may return only the
       // application shell here, so if no work cards exist, fall back to an
-      // off-screen same-origin iframe and read the fully rendered DOM.
-      let response = await requestHtml(url, feedAbort.signal);
-      if (generation !== feedGeneration) return;
+      // on-screen transparent same-origin iframe and read the rendered DOM.
+      let response = await requestHtml(pageUrl, feedAbort.signal);
+      if (generation !== feedGeneration) return false;
       let parsed = parseSearchPage(response.html,response.url,state);
 
       if (!parsed.works.length && !parsed.empty) {
-        response = await renderedSearchHtml(url,feedAbort.signal);
-        if (generation !== feedGeneration) return;
+        response = await renderedSearchHtml(pageUrl,feedAbort.signal);
+        if (generation !== feedGeneration) return false;
         parsed = parseSearchPage(response.html,response.url,state);
       }
 
@@ -1573,13 +1591,28 @@
         );
       }
 
-      state.nextHref = parsed.nextHref;
-      state.done = !parsed.nextHref;
+      for (const work of parsed.works) {
+        if (work?.id) state.loadedIds.add(String(work.id));
+      }
+      state.pagesFetched = Number(state.pagesFetched || 0) + 1;
+
+      const next = parsed.nextHref ? absolutePageUrl(parsed.nextHref) : '';
+      state.nextHref = next && !state.seenPages.has(next) ? next : '';
+      state.done = !state.nextHref;
       state.error = '';
       mergeWorks(parsed.works);
+
+      // If a page yielded no new IDs, following pagination further is unsafe:
+      // it is usually a repeated/looping page rather than genuinely new data.
+      if (parsed.works.length && state.loadedIds.size === before) {
+        state.done = true;
+        state.nextHref = '';
+      }
+      return state.loadedIds.size > before;
     } catch (e) {
-      if (e?.name === 'AbortError') return;
+      if (e?.name === 'AbortError') return false;
       state.error = String(e?.message || e);
+      return false;
     }
   }
 
@@ -1623,6 +1656,52 @@
       }
     });
     await Promise.allSettled(runners);
+  }
+
+  function stateCoverage(state) {
+    return Number(state?.loadedIds?.size || 0);
+  }
+
+  function coverageComplete(target) {
+    return feedStates.every(state =>
+      !!state.error || !!state.done || stateCoverage(state) >= target
+    );
+  }
+
+  async function ensureCoverage(target, generation) {
+    let rounds = 0;
+    while (generation === feedGeneration && !feedAbort?.signal.aborted && !coverageComplete(target)) {
+      const targets = feedStates.filter(state =>
+        !state.error && !state.done && state.nextHref && stateCoverage(state) < target
+      );
+      if (!targets.length) break;
+
+      let roundProgress = false;
+      await mapLimit(targets, SEARCH_CONCURRENCY, async state => {
+        const before = stateCoverage(state);
+        await fetchSearchState(state,state.nextHref,generation);
+        if (stateCoverage(state) > before || state.done || state.error) roundProgress = true;
+        if (generation === feedGeneration) renderFeed();
+      });
+
+      // Hard stop against broken pagination loops.
+      if (!roundProgress || ++rounds >= 30) break;
+    }
+  }
+
+  async function expandFeed() {
+    if (feedLoading || !feedOpen) return;
+    const generation = feedGeneration;
+    const target = feedVisibleCount + FEED_STEP;
+    feedLoading = true;
+    renderFeed();
+
+    await ensureCoverage(target,generation);
+    if (generation !== feedGeneration) return;
+
+    feedVisibleCount = target;
+    feedLoading = false;
+    renderFeed();
   }
 
   async function fetchDetail(work, signal) {
@@ -1711,9 +1790,26 @@
     const excluded = Math.max(0,feedWorks.size-visible);
     const detailed = [...feedWorks.values()].filter(w => w.detailLoaded).length;
     const detailText = visible ? ' ／ 詳細 ' + detailed.toLocaleString('ja-JP') + '/' + feedWorks.size.toLocaleString('ja-JP') : '';
+    const target = feedVisibleCount;
+    const covered = feedStates.filter(s => s.error || s.done || stateCoverage(s) >= target).length;
+    const coverageText = total ? ' ／ 横断同期 ' + covered + '/' + total + '条件（各最大' + target + '件）' : '';
     return feedLoading
-      ? '保存検索 ' + total + '件を更新中… 現在 ' + visible.toLocaleString('ja-JP') + '作品' + detailText + (excluded ? '（除外 ' + excluded + '）' : '')
-      : '保存検索 ' + ok + '/' + total + '件取得 ／ 表示 ' + visible.toLocaleString('ja-JP') + '作品' + detailText + (excluded ? ' ／ 除外 ' + excluded + '作品' : '') + (bad ? ' ／ 失敗 ' + bad + '件' : '');
+      ? '全保存検索を日付順に揃えています… 現在 ' + visible.toLocaleString('ja-JP') + '作品' + coverageText + detailText + (excluded ? '（除外 ' + excluded + '）' : '')
+      : '保存検索 ' + ok + '/' + total + '件取得 ／ 表示候補 ' + visible.toLocaleString('ja-JP') + '作品' + coverageText + detailText + (excluded ? ' ／ 除外 ' + excluded + '作品' : '') + (bad ? ' ／ 失敗 ' + bad + '件' : '');
+  }
+
+  function renderCoverageBreakdown() {
+    const box = root?.querySelector('.pbsw-feed-coverage');
+    if (!box) return;
+    box.replaceChildren();
+    for (const state of feedStates) {
+      const chip = document.createElement('span');
+      const name = state.row?.name || state.row?.word || '保存検索';
+      const count = stateCoverage(state);
+      chip.textContent = name + ' ' + count + '件' + (state.error ? ' ⚠️' : state.done ? ' ✓' : count >= feedVisibleCount ? ' ✓' : ' …');
+      if (state.error) chip.title = state.error;
+      box.append(chip);
+    }
   }
 
   function metricLabel(work) {
@@ -1853,6 +1949,8 @@
     const status = root.querySelector('.pbsw-feed-status');
     if (status) status.textContent = feedStatusText();
 
+    renderCoverageBreakdown();
+
     const errors = root.querySelector('.pbsw-feed-errors');
     if (errors) {
       const failed = feedStates.filter(s => s.error);
@@ -1897,7 +1995,7 @@
     showMore.disabled = feedLoading;
     older.disabled = feedLoading;
 
-    observeFeedCards(visible,feedGeneration);
+    if (!feedLoading) observeFeedCards(visible,feedGeneration);
   }
 
   async function refreshFeed() {
@@ -1913,16 +2011,20 @@
       row,
       nextHref:firstSearchHref(row),
       done:false,
-      error:''
+      error:'',
+      loadedIds:new Set(),
+      seenPages:new Set(),
+      pagesFetched:0
     }));
     feedObserver?.disconnect();
     resetDetailQueue();
     renderFeed();
 
-    await mapLimit(feedStates,SEARCH_CONCURRENCY,async state => {
-      await fetchSearchState(state,state.nextHref,generation);
-      if (generation === feedGeneration) renderFeed();
-    });
+    // To guarantee the first N global results, each individual saved search
+    // must contribute up to N newest works (or reach its end). Otherwise an
+    // unseen page from one condition can contain works newer than visible rows
+    // from another condition.
+    await ensureCoverage(feedVisibleCount,generation);
 
     if (generation !== feedGeneration) return;
     feedLoading = false;
@@ -1930,22 +2032,7 @@
   }
 
   async function loadOlderFeed() {
-    if (feedLoading) return;
-    const generation = feedGeneration;
-    const targets = feedStates.filter(s => !s.error && !s.done && s.nextHref);
-    if (!targets.length) return;
-    feedLoading = true;
-    renderFeed();
-
-    await mapLimit(targets,SEARCH_CONCURRENCY,async state => {
-      const url = state.nextHref;
-      await fetchSearchState(state,url,generation);
-      if (generation === feedGeneration) renderFeed();
-    });
-
-    if (generation !== feedGeneration) return;
-    feedLoading = false;
-    renderFeed();
+    await expandFeed();
   }
 
   function showManagePage() {
@@ -1977,6 +2064,7 @@
   function closeFeed() {
     feedAbort?.abort();
     feedObserver?.disconnect();
+    clearTimeout(feedAutoExpandTimer);
     resetDetailQueue();
     feedOpen = false;
     if (!root) return;
@@ -2067,6 +2155,8 @@
       #${ROOT_ID} .pbsw-actions button{font-size:12px;padding:7px 9px}
       #${ROOT_ID} .pbsw-empty{background:#fff;border:1px solid #ded9e8;border-radius:12px;padding:18px;color:#716b7b}
       #${ROOT_ID} .pbsw-feed-status{flex:1 1 100%;font-size:12px;color:#716b7b}
+      #${ROOT_ID} .pbsw-feed-coverage{flex:1 1 100%;display:flex;gap:5px;flex-wrap:wrap}
+      #${ROOT_ID} .pbsw-feed-coverage span{font-size:10px;color:#625a70;background:#f0edf4;border-radius:999px;padding:3px 7px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       #${ROOT_ID} .pbsw-feed-errors{flex:1 1 100%;background:#fff2f2;border:1px solid #efcaca;border-radius:9px;padding:8px 10px;color:#8a3b3b}
       #${ROOT_ID} .pbsw-feed-errors[hidden]{display:none}
       #${ROOT_ID} .pbsw-feed-error-row{display:flex;gap:8px;align-items:flex-start;font-size:11px;line-height:1.45}
@@ -2137,6 +2227,7 @@
           <h2>🆕 保存検索の新着</h2>
           <button type="button" class="pbsw-feed-refresh">更新</button>
           <div class="pbsw-feed-status"></div>
+          <div class="pbsw-feed-coverage"></div>
           <div class="pbsw-feed-errors" hidden></div>
           <details class="pbsw-feed-filter">
             <summary class="pbsw-feed-exclude-summary">🚫 除外タグなし</summary>
@@ -2167,14 +2258,21 @@
     root.querySelector('.pbsw-feed-exclude-input').addEventListener('keydown',e=>{
       if(e.key==='Enter'){e.preventDefault();applyExcludeInput();}
     });
-    root.querySelector('.pbsw-feed-show-more').addEventListener('click',()=>{
-      feedVisibleCount+=FEED_STEP;
-      renderFeed();
-    });
-    root.querySelector('.pbsw-feed-load-older').addEventListener('click',()=>void loadOlderFeed());
+    root.querySelector('.pbsw-feed-show-more').addEventListener('click',()=>void expandFeed());
+    root.querySelector('.pbsw-feed-load-older').addEventListener('click',()=>void expandFeed());
     quickInput.addEventListener('keydown',e=>{
       if(e.key==='Enter'){e.preventDefault();runQuickSearch();}
     });
+
+    root.addEventListener('scroll',()=>{
+      if(!feedOpen || feedLoading) return;
+      clearTimeout(feedAutoExpandTimer);
+      feedAutoExpandTimer=setTimeout(()=>{
+        if(!feedOpen || feedLoading) return;
+        const remaining=root.scrollHeight-root.scrollTop-root.clientHeight;
+        if(remaining<700) void expandFeed();
+      },120);
+    },{passive:true});
 
     document.body.append(button,root);
     syncExcludeUi();
@@ -2186,6 +2284,7 @@
     if (!root) return;
     feedAbort?.abort();
     feedObserver?.disconnect();
+    clearTimeout(feedAutoExpandTimer);
     resetDetailQueue();
     feedOpen=false;
     root.classList.add('open');
