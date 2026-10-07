@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.13
+// @version      0.3.14
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
 // @grant        GM.download
 // @grant        GM.xmlhttpRequest
 // @require      https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js
+// @connect      pictbland.net
 // @connect      *.pictbland.net
 // @updateURL    https://raw.githubusercontent.com/dearlylovedxxx-afk/pictbland-toolkit/main/PictBLand_Novel_Tools.meta.js
 // @downloadURL  https://raw.githubusercontent.com/dearlylovedxxx-afk/pictbland-toolkit/main/PictBLand_Novel_Tools.user.js
@@ -951,18 +952,91 @@
     return u.pathname + (u.searchParams.toString() ? '?' + u.searchParams.toString() : '');
   }
 
-  async function requestHtml(url, signal) {
+  function requestHtml(url, signal) {
     const abs = new URL(url, location.origin).href;
-    const response = await fetch(abs, {
-      method:'GET',
-      credentials:'include',
-      redirect:'follow',
-      signal,
-      headers:{Accept:'text/html,application/xhtml+xml'}
+    const gm = globalThis.GM?.xmlhttpRequest || globalThis.GM?.xmlHttpRequest;
+
+    if (typeof gm !== 'function') {
+      return fetch(abs, {
+        method:'GET',
+        credentials:'include',
+        redirect:'follow',
+        signal,
+        headers:{Accept:'text/html,application/xhtml+xml'}
+      }).then(async response => {
+        if (response.status === 429) throw new Error('429：pictBLandのアクセス制限です');
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        return {html:await response.text(), url:response.url || abs};
+      });
+    }
+
+    return new Promise((resolve,reject) => {
+      let settled=false;
+      let handle=null;
+
+      const finish=(ok,value)=>{
+        if(settled)return;
+        settled=true;
+        signal?.removeEventListener?.('abort',onAbort);
+        ok?resolve(value):reject(value instanceof Error?value:new Error(String(value||'取得失敗')));
+      };
+
+      const onAbort=()=>{
+        try{handle?.abort?.();}catch{}
+        const err=new Error('取得を中止しました');
+        err.name='AbortError';
+        finish(false,err);
+      };
+
+      if(signal?.aborted){
+        onAbort();
+        return;
+      }
+      signal?.addEventListener?.('abort',onAbort,{once:true});
+
+      try{
+        handle=gm({
+          method:'GET',
+          url:abs,
+          responseType:'text',
+          anonymous:false,
+          nocache:true,
+          timeout:30000,
+          headers:{
+            Accept:'text/html,application/xhtml+xml',
+            Referer:location.href
+          },
+          onload:res=>{
+            const status=Number(res?.status||0);
+            if(status===429){finish(false,new Error('429：pictBLandのアクセス制限です'));return;}
+            if(status<200||status>=400){finish(false,new Error('HTTP '+status));return;}
+            const html=String(res?.responseText ?? res?.response ?? '');
+            if(!html.trim()){finish(false,new Error('HTMLが空でした'));return;}
+            finish(true,{html,url:res?.finalUrl||res?.responseURL||abs});
+          },
+          onerror:err=>finish(false,new Error('GM通信エラー：'+String(err?.error||err?.message||'取得失敗'))),
+          ontimeout:()=>finish(false,new Error('取得がタイムアウトしました')),
+          onabort:()=>onAbort()
+        });
+
+        if(handle&&typeof handle.then==='function'){
+          handle.then(res=>{
+            if(settled)return;
+            const status=Number(res?.status||0);
+            if(status===429){finish(false,new Error('429：pictBLandのアクセス制限です'));return;}
+            if(status<200||status>=400){finish(false,new Error('HTTP '+status));return;}
+            const html=String(res?.responseText ?? res?.response ?? '');
+            if(!html.trim()){finish(false,new Error('HTMLが空でした'));return;}
+            finish(true,{html,url:res?.finalUrl||res?.responseURL||abs});
+          }).catch(err=>{
+            if(err?.name==='AbortError')finish(false,err);
+            else finish(false,new Error('GM通信エラー：'+String(err?.message||err)));
+          });
+        }
+      }catch(err){
+        finish(false,err);
+      }
     });
-    if (response.status === 429) throw new Error('429：pictBLandのアクセス制限です');
-    if (!response.ok) throw new Error('HTTP ' + response.status);
-    return {html:await response.text(), url:response.url || abs};
   }
 
   function compactText(value) {
@@ -1466,6 +1540,23 @@
     const status = root.querySelector('.pbsw-feed-status');
     if (status) status.textContent = feedStatusText();
 
+    const errors = root.querySelector('.pbsw-feed-errors');
+    if (errors) {
+      const failed = feedStates.filter(s => s.error);
+      errors.replaceChildren();
+      errors.hidden = !failed.length;
+      for (const state of failed) {
+        const row = document.createElement('div');
+        row.className = 'pbsw-feed-error-row';
+        const name = document.createElement('strong');
+        name.textContent = state.row?.name || state.row?.word || '保存検索';
+        const msg = document.createElement('span');
+        msg.textContent = state.error;
+        row.append(name,msg);
+        errors.append(row);
+      }
+    }
+
     const works = sortedWorks();
     const visible = works.slice(0,feedVisibleCount);
     const grid = root.querySelector('.pbsw-feed-grid');
@@ -1663,6 +1754,12 @@
       #${ROOT_ID} .pbsw-actions button{font-size:12px;padding:7px 9px}
       #${ROOT_ID} .pbsw-empty{background:#fff;border:1px solid #ded9e8;border-radius:12px;padding:18px;color:#716b7b}
       #${ROOT_ID} .pbsw-feed-status{flex:1 1 100%;font-size:12px;color:#716b7b}
+      #${ROOT_ID} .pbsw-feed-errors{flex:1 1 100%;background:#fff2f2;border:1px solid #efcaca;border-radius:9px;padding:8px 10px;color:#8a3b3b}
+      #${ROOT_ID} .pbsw-feed-errors[hidden]{display:none}
+      #${ROOT_ID} .pbsw-feed-error-row{display:flex;gap:8px;align-items:flex-start;font-size:11px;line-height:1.45}
+      #${ROOT_ID} .pbsw-feed-error-row+ .pbsw-feed-error-row{margin-top:5px}
+      #${ROOT_ID} .pbsw-feed-error-row strong{flex:0 0 auto;max-width:38%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      #${ROOT_ID} .pbsw-feed-error-row span{overflow-wrap:anywhere}
       #${ROOT_ID} .pbsw-feed-filter{flex:1 1 100%;background:#faf9fc;border:1px solid #ded9e8;border-radius:9px;padding:8px 10px}
       #${ROOT_ID} .pbsw-feed-filter summary{cursor:pointer;font-weight:700}
       #${ROOT_ID} .pbsw-feed-filter-row{display:flex;gap:7px;margin-top:8px}
@@ -1727,6 +1824,7 @@
           <h2>🆕 保存検索の新着</h2>
           <button type="button" class="pbsw-feed-refresh">更新</button>
           <div class="pbsw-feed-status"></div>
+          <div class="pbsw-feed-errors" hidden></div>
           <details class="pbsw-feed-filter">
             <summary class="pbsw-feed-exclude-summary">🚫 除外タグなし</summary>
             <div class="pbsw-feed-filter-row">
