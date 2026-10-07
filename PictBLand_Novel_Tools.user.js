@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.15
+// @version      0.3.16
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1047,7 +1047,7 @@
   function itemIdFromHref(href) {
     try {
       const u = new URL(href, location.origin);
-      return u.origin === location.origin ? (u.pathname.match(/^\/items\/detail\/(\d+)/)?.[1] || '') : '';
+      return u.origin === location.origin ? (u.pathname.match(/^\/items\/(?:detail|index|view)\/(\d+)/)?.[1] || '') : '';
     } catch {
       return '';
     }
@@ -1263,12 +1263,19 @@
     const pageText = compactText(doc.body?.textContent || '');
     const title = compactText(doc.title || '');
     const empty = /(?:該当|検索).{0,20}(?:ありません|0件|見つかりません)|作品.{0,12}0件/i.test(pageText);
+    const hrefSamples = [...doc.querySelectorAll('a[href]')]
+      .map(a => a.getAttribute('href') || '')
+      .filter(Boolean)
+      .filter(href => /item|tag|search/i.test(href))
+      .slice(0,12);
+
     return {
       works,
       nextHref:findNextHref(doc,pageUrl),
       pageText,
       title,
-      empty
+      empty,
+      hrefSamples
     };
   }
 
@@ -1282,7 +1289,10 @@
 
       iframe.setAttribute('aria-hidden','true');
       iframe.tabIndex=-1;
-      iframe.style.cssText='position:fixed!important;left:-10000px!important;top:0!important;width:430px!important;height:900px!important;border:0!important;opacity:.01!important;pointer-events:none!important;z-index:-1!important;';
+      // Keep the iframe inside the visual viewport so pictBLand's lazy/render
+      // observers treat the search page as visible. It stays fully transparent,
+      // non-interactive, and below our tool overlay.
+      iframe.style.cssText='position:fixed!important;inset:0!important;width:100vw!important;height:100dvh!important;border:0!important;opacity:.001!important;pointer-events:none!important;z-index:2147480000!important;background:#fff!important;';
 
       const cleanup=()=>{
         clearTimeout(timer);
@@ -1324,7 +1334,7 @@
           try{
             const doc=iframe.contentDocument;
             if(!doc?.documentElement)return;
-            const count=doc.querySelectorAll('a[href*="/items/detail/"]').length;
+            const count=[...doc.querySelectorAll('a[href]')].filter(a=>itemIdFromHref(a.getAttribute('href')||'')).length;
             const text=compactText(doc.body?.textContent||'');
             const isEmpty=/(?:該当|検索).{0,20}(?:ありません|0件|見つかりません)|作品.{0,12}0件/i.test(text);
 
@@ -1332,9 +1342,21 @@
             else stableTicks=0;
             lastCount=count;
 
+            // Nudge the inner page a little while waiting. Some pictBLand lists
+            // are rendered/lazy-loaded only after viewport/scroll observers run.
+            if(!count){
+              try{
+                const win=iframe.contentWindow;
+                const max=Math.max(0,(doc.documentElement?.scrollHeight||doc.body?.scrollHeight||0)-(win?.innerHeight||800));
+                const y=Math.min(max,Math.max(0,(win?.scrollY||0)+220));
+                win?.scrollTo?.(0,y);
+              }catch{}
+            }
+
             // Wait a little after dynamic rendering settles. An actually empty
             // result page can finish without any item links.
             if((count>0&&stableTicks>=3)||(isEmpty&&stableTicks>=2)){
+              try{iframe.contentWindow?.scrollTo?.(0,0);}catch{}
               const html=doc.documentElement.outerHTML;
               const finalUrl=iframe.contentWindow?.location?.href||abs;
               finish(true,{html,url:finalUrl,timedOut:false});
@@ -1371,8 +1393,13 @@
       }
 
       if (!parsed.works.length && !parsed.empty) {
-        const hint = [parsed.title,parsed.pageText.slice(0,120)].filter(Boolean).join(' ／ ');
-        throw new Error('検索ページは開けましたが作品カードを判定できません' + (hint ? '：'+hint : ''));
+        const hint = [parsed.title,parsed.pageText.slice(0,100)].filter(Boolean).join(' ／ ');
+        const links = (parsed.hrefSamples||[]).slice(0,6).join(' , ');
+        throw new Error(
+          '検索ページは開けましたが作品カードを判定できません'
+          + (hint ? '：'+hint : '')
+          + (links ? ' ／ リンク候補：'+links : '')
+        );
       }
 
       state.nextHref = parsed.nextHref;
