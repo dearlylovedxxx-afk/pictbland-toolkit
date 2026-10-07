@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.14
+// @version      0.3.15
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
+// @noframes
 // @grant        GM.download
 // @grant        GM.xmlhttpRequest
 // @require      https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js
@@ -765,7 +766,7 @@
   const ROOT_ID = 'pbsw-root';
   const MAX_SAVED = 200;
   const FEED_STEP = 50;
-  const SEARCH_CONCURRENCY = 3;
+  const SEARCH_CONCURRENCY = 1;
   const DETAIL_CONCURRENCY = 3;
 
   let root = null;
@@ -1259,20 +1260,121 @@
       works.push(normalizeSearchWork(card, anchors, id, state, orderIndex++));
     }
 
-    if (!works.length) {
-      const text = compactText(doc.body?.textContent || '');
-      if (/ログイン|login/i.test(text)) throw new Error('検索結果を取得できません。pictBLandへのログイン状態を確認してください');
-    }
+    const pageText = compactText(doc.body?.textContent || '');
+    const title = compactText(doc.title || '');
+    const empty = /(?:該当|検索).{0,20}(?:ありません|0件|見つかりません)|作品.{0,12}0件/i.test(pageText);
+    return {
+      works,
+      nextHref:findNextHref(doc,pageUrl),
+      pageText,
+      title,
+      empty
+    };
+  }
 
-    return {works, nextHref:findNextHref(doc,pageUrl)};
+  function renderedSearchHtml(url, signal) {
+    const abs = new URL(url, location.origin).href;
+    return new Promise((resolve,reject) => {
+      const iframe = document.createElement('iframe');
+      let settled=false;
+      let timer=null;
+      let poll=null;
+
+      iframe.setAttribute('aria-hidden','true');
+      iframe.tabIndex=-1;
+      iframe.style.cssText='position:fixed!important;left:-10000px!important;top:0!important;width:430px!important;height:900px!important;border:0!important;opacity:.01!important;pointer-events:none!important;z-index:-1!important;';
+
+      const cleanup=()=>{
+        clearTimeout(timer);
+        clearInterval(poll);
+        signal?.removeEventListener?.('abort',onAbort);
+        try{iframe.remove();}catch{}
+      };
+      const finish=(ok,value)=>{
+        if(settled)return;
+        settled=true;
+        cleanup();
+        ok?resolve(value):reject(value instanceof Error?value:new Error(String(value||'描画取得失敗')));
+      };
+      const onAbort=()=>{
+        const err=new Error('取得を中止しました');
+        err.name='AbortError';
+        finish(false,err);
+      };
+
+      if(signal?.aborted){onAbort();return;}
+      signal?.addEventListener?.('abort',onAbort,{once:true});
+
+      timer=setTimeout(()=>{
+        try{
+          const doc=iframe.contentDocument;
+          const html=doc?.documentElement?.outerHTML||'';
+          const finalUrl=iframe.contentWindow?.location?.href||abs;
+          if(html.trim()) finish(true,{html,url:finalUrl,timedOut:true});
+          else finish(false,new Error('検索ページの描画がタイムアウトしました'));
+        }catch{
+          finish(false,new Error('検索ページの描画がタイムアウトしました'));
+        }
+      },12000);
+
+      iframe.addEventListener('load',()=>{
+        let stableTicks=0;
+        let lastCount=-1;
+        poll=setInterval(()=>{
+          try{
+            const doc=iframe.contentDocument;
+            if(!doc?.documentElement)return;
+            const count=doc.querySelectorAll('a[href*="/items/detail/"]').length;
+            const text=compactText(doc.body?.textContent||'');
+            const isEmpty=/(?:該当|検索).{0,20}(?:ありません|0件|見つかりません)|作品.{0,12}0件/i.test(text);
+
+            if(count===lastCount)stableTicks++;
+            else stableTicks=0;
+            lastCount=count;
+
+            // Wait a little after dynamic rendering settles. An actually empty
+            // result page can finish without any item links.
+            if((count>0&&stableTicks>=3)||(isEmpty&&stableTicks>=2)){
+              const html=doc.documentElement.outerHTML;
+              const finalUrl=iframe.contentWindow?.location?.href||abs;
+              finish(true,{html,url:finalUrl,timedOut:false});
+            }
+          }catch(err){
+            finish(false,new Error('検索ページDOMを読めませんでした：'+String(err?.message||err)));
+          }
+        },350);
+      },{once:true});
+
+      try{
+        (document.body||document.documentElement).append(iframe);
+        iframe.src=abs;
+      }catch(err){
+        finish(false,err);
+      }
+    });
   }
 
   async function fetchSearchState(state, url, generation) {
     if (!url || generation !== feedGeneration || feedAbort?.signal.aborted) return;
     try {
-      const response = await requestHtml(url, feedAbort.signal);
+      // First try a normal same-site request. pictBLand may return only the
+      // application shell here, so if no work cards exist, fall back to an
+      // off-screen same-origin iframe and read the fully rendered DOM.
+      let response = await requestHtml(url, feedAbort.signal);
       if (generation !== feedGeneration) return;
-      const parsed = parseSearchPage(response.html, response.url, state);
+      let parsed = parseSearchPage(response.html,response.url,state);
+
+      if (!parsed.works.length && !parsed.empty) {
+        response = await renderedSearchHtml(url,feedAbort.signal);
+        if (generation !== feedGeneration) return;
+        parsed = parseSearchPage(response.html,response.url,state);
+      }
+
+      if (!parsed.works.length && !parsed.empty) {
+        const hint = [parsed.title,parsed.pageText.slice(0,120)].filter(Boolean).join(' ／ ');
+        throw new Error('検索ページは開けましたが作品カードを判定できません' + (hint ? '：'+hint : ''));
+      }
+
       state.nextHref = parsed.nextHref;
       state.done = !parsed.nextHref;
       state.error = '';
