@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.16
+// @version      0.3.17
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1053,6 +1053,80 @@
     }
   }
 
+  function itemIdFromAny(value) {
+    const s = String(value || '');
+    let m = s.match(/(?:https?:\/\/pictbland\.net)?\/items\/(?:detail|index|view)\/(\d+)/i);
+    if (m) return m[1];
+    m = s.match(/["']?(?:item[_-]?id|itemId)["']?\s*[:=]\s*["']?(\d{2,})/i);
+    return m ? m[1] : '';
+  }
+
+  function deepRoots(doc) {
+    const roots = [doc];
+    const queue = [doc];
+    const seen = new Set(queue);
+    while (queue.length) {
+      const rootNode = queue.shift();
+      let elements = [];
+      try { elements = [...rootNode.querySelectorAll('*')]; } catch {}
+      for (const el of elements) {
+        const shadow = el.shadowRoot;
+        if (shadow && !seen.has(shadow)) {
+          seen.add(shadow);
+          roots.push(shadow);
+          queue.push(shadow);
+        }
+      }
+    }
+    return roots;
+  }
+
+  function collectItemCandidates(doc) {
+    const found = new Map();
+    const add = (id, el, source='') => {
+      if (!/^\d+$/.test(String(id || ''))) return;
+      const key = String(id);
+      if (!found.has(key)) found.set(key, {id:key, elements:[], sources:[]});
+      const row = found.get(key);
+      if (el && !row.elements.includes(el)) row.elements.push(el);
+      if (source && !row.sources.includes(source)) row.sources.push(source);
+    };
+
+    for (const rootNode of deepRoots(doc)) {
+      let elements = [];
+      try { elements = [...rootNode.querySelectorAll('*')]; } catch {}
+      for (const el of elements) {
+        const values = [];
+        const attrs = [
+          'href','data-href','data-url','data-link','data-path','onclick',
+          'data-item-id','data-item_id','data-itemid','data-id','id'
+        ];
+        for (const name of attrs) {
+          const v = el.getAttribute?.(name);
+          if (v) values.push(name + '=' + v);
+        }
+        for (const attr of [...(el.attributes || [])]) {
+          if (!/^data-/i.test(attr.name)) continue;
+          if (!values.some(x => x.startsWith(attr.name + '='))) values.push(attr.name + '=' + attr.value);
+        }
+        for (const value of values) {
+          const id = itemIdFromAny(value);
+          if (id) add(id, el, value.slice(0,160));
+        }
+      }
+
+      let html = '';
+      try { html = rootNode instanceof Document ? rootNode.documentElement?.outerHTML || '' : rootNode.innerHTML || ''; } catch {}
+      const re = /(?:https?:\/\/pictbland\.net)?\/items\/(?:detail|index|view)\/(\d+)/gi;
+      let m;
+      while ((m = re.exec(html))) add(m[1], null, 'html-regex');
+      const re2 = /["']?(?:item[_-]?id|itemId)["']?\s*[:=]\s*["']?(\d{2,})/gi;
+      while ((m = re2.exec(html))) add(m[1], null, 'item-id-regex');
+    }
+
+    return [...found.values()];
+  }
+
   function itemHref(id) {
     return '/items/detail/' + encodeURIComponent(id);
   }
@@ -1245,29 +1319,62 @@
 
   function parseSearchPage(html, pageUrl, state) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
-    const grouped = new Map();
-    for (const a of doc.querySelectorAll('a[href]')) {
-      const id = itemIdFromHref(a.getAttribute('href') || '');
-      if (!id) continue;
-      if (!grouped.has(id)) grouped.set(id, []);
-      grouped.get(id).push(a);
-    }
-
+    const candidates = collectItemCandidates(doc);
     const works = [];
     let orderIndex = 0;
-    for (const [id, anchors] of grouped) {
-      const card = workCardFor(anchors[0], id);
-      works.push(normalizeSearchWork(card, anchors, id, state, orderIndex++));
+    for (const candidate of candidates) {
+      const id = candidate.id;
+      const els = candidate.elements || [];
+      const anchor = els.find(el => el?.matches?.('a[href]')) || els[0] || null;
+
+      let card = anchor ? workCardFor(anchor,id) : null;
+      if (!card && anchor) card = anchor.parentElement || anchor;
+
+      // If the ID only appeared inside serialized JS/HTML, locate a nearby
+      // DOM node carrying that same ID/path and use it as the card seed.
+      if (!card) {
+        for (const rootNode of deepRoots(doc)) {
+          let hit = null;
+          try {
+            hit = [...rootNode.querySelectorAll('*')].find(el => {
+              for (const attr of [...(el.attributes || [])]) {
+                if (itemIdFromAny(attr.value) === id) return true;
+              }
+              return false;
+            });
+          } catch {}
+          if (hit) { card = workCardFor(hit,id) || hit.parentElement || hit; break; }
+        }
+      }
+
+      const anchors = [];
+      try {
+        if (card) for (const a of card.querySelectorAll('a[href]')) if (itemIdFromAny(a.getAttribute('href')||'') === id) anchors.push(a);
+      } catch {}
+      if (anchor?.matches?.('a[href]') && !anchors.includes(anchor)) anchors.unshift(anchor);
+
+      works.push(normalizeSearchWork(card || anchor || doc.body,anchors,id,state,orderIndex++));
     }
 
     const pageText = compactText(doc.body?.textContent || '');
     const title = compactText(doc.title || '');
     const empty = /(?:該当|検索).{0,20}(?:ありません|0件|見つかりません)|作品.{0,12}0件/i.test(pageText);
-    const hrefSamples = [...doc.querySelectorAll('a[href]')]
-      .map(a => a.getAttribute('href') || '')
-      .filter(Boolean)
-      .filter(href => /item|tag|search/i.test(href))
-      .slice(0,12);
+    const hrefSamples = [];
+    for (const rootNode of deepRoots(doc)) {
+      let elements=[];
+      try { elements=[...rootNode.querySelectorAll('*')]; } catch {}
+      for (const el of elements) {
+        for (const attr of [...(el.attributes||[])]) {
+          const value=String(attr.value||'');
+          if (!/(?:item|tag|search|detail|view)/i.test(value)) continue;
+          const sample=attr.name+'='+value.slice(0,180);
+          if (!hrefSamples.includes(sample)) hrefSamples.push(sample);
+          if (hrefSamples.length>=16) break;
+        }
+        if (hrefSamples.length>=16) break;
+      }
+      if (hrefSamples.length>=16) break;
+    }
 
     return {
       works,
@@ -1318,7 +1425,15 @@
       timer=setTimeout(()=>{
         try{
           const doc=iframe.contentDocument;
-          const html=doc?.documentElement?.outerHTML||'';
+          let html=doc?.documentElement?.outerHTML||'';
+          try{
+            const shadowParts=[];
+            for(const rootNode of deepRoots(doc)){
+              if(rootNode===doc)continue;
+              shadowParts.push('<div data-pbsw-shadow-root="1">'+String(rootNode.innerHTML||'')+'</div>');
+            }
+            if(shadowParts.length)html+=shadowParts.join('');
+          }catch{}
           const finalUrl=iframe.contentWindow?.location?.href||abs;
           if(html.trim()) finish(true,{html,url:finalUrl,timedOut:true});
           else finish(false,new Error('検索ページの描画がタイムアウトしました'));
@@ -1334,7 +1449,7 @@
           try{
             const doc=iframe.contentDocument;
             if(!doc?.documentElement)return;
-            const count=[...doc.querySelectorAll('a[href]')].filter(a=>itemIdFromHref(a.getAttribute('href')||'')).length;
+            const count=collectItemCandidates(doc).length;
             const text=compactText(doc.body?.textContent||'');
             const isEmpty=/(?:該当|検索).{0,20}(?:ありません|0件|見つかりません)|作品.{0,12}0件/i.test(text);
 
@@ -1357,7 +1472,15 @@
             // result page can finish without any item links.
             if((count>0&&stableTicks>=3)||(isEmpty&&stableTicks>=2)){
               try{iframe.contentWindow?.scrollTo?.(0,0);}catch{}
-              const html=doc.documentElement.outerHTML;
+              let html=doc.documentElement.outerHTML;
+              try {
+                const shadowParts=[];
+                for(const rootNode of deepRoots(doc)){
+                  if(rootNode===doc)continue;
+                  shadowParts.push('<div data-pbsw-shadow-root="1">'+String(rootNode.innerHTML||'')+'</div>');
+                }
+                if(shadowParts.length) html += shadowParts.join('');
+              }catch{}
               const finalUrl=iframe.contentWindow?.location?.href||abs;
               finish(true,{html,url:finalUrl,timedOut:false});
             }
