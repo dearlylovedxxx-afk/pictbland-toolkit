@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.19
+// @version      0.3.20
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -767,7 +767,11 @@
   const MAX_SAVED = 200;
   const FEED_STEP = 50;
   const SEARCH_CONCURRENCY = 1;
-  const DETAIL_CONCURRENCY = 3;
+  const DETAIL_CONCURRENCY = 2;
+  const REQUEST_INTERVAL_MS = 2200;
+  const SEARCH_CACHE_MS = 120000;
+  const DETAIL_CACHE_MS = 300000;
+  const RATE_LIMIT_COOLDOWN_MS = 600000;
 
   let root = null;
   let quickInput = null;
@@ -784,6 +788,69 @@
   let detailActive = 0;
   let feedAutoExpandTimer = null;
   let feedExcludeTags = readExcludeTags();
+  // The saved-search feed shares a paced request gate across search pages,
+  // visible work details and iframe fallbacks.
+  let networkGate = Promise.resolve();
+  let nextNetworkAt = 0;
+  let blockedUntil = 0;
+  const searchPageCache = new Map();
+  const detailHtmlCache = new Map();
+
+  function abortError() {
+    const error = new Error('取得を中止しました');
+    error.name = 'AbortError';
+    return error;
+  }
+  function rateLimitError() {
+    const error = new Error('429：pictBLandのアクセス制限です。10分間は自動通信を停止します。');
+    error.rateLimited = true;
+    return error;
+  }
+  function cacheGet(cache, key) {
+    const row = cache.get(key);
+    if (!row) return null;
+    if (row.expires <= Date.now()) { cache.delete(key); return null; }
+    return row.value;
+  }
+  function cachePut(cache, key, value, duration) {
+    cache.delete(key);
+    cache.set(key, {value, expires:Date.now() + duration});
+    while (cache.size > 240) cache.delete(cache.keys().next().value);
+  }
+  function sleepAbortable(ms, signal) {
+    if (signal?.aborted) return Promise.reject(abortError());
+    return new Promise((resolve, reject) => {
+      let timer;
+      const onAbort = () => { clearTimeout(timer); signal?.removeEventListener('abort',onAbort); reject(abortError()); };
+      timer = setTimeout(() => { signal?.removeEventListener('abort',onAbort); resolve(); },ms);
+      signal?.addEventListener('abort',onAbort,{once:true});
+    });
+  }
+  async function reserveNetworkSlot(signal) {
+    let release;
+    const preceding = networkGate;
+    networkGate = new Promise(resolve => { release = resolve; });
+    try {
+      await preceding;
+      if (signal?.aborted) throw abortError();
+      if (Date.now() < blockedUntil) throw rateLimitError();
+      const delay = Math.max(0, nextNetworkAt - Date.now());
+      if (delay) await sleepAbortable(delay,signal);
+      if (signal?.aborted) throw abortError();
+      if (Date.now() < blockedUntil) throw rateLimitError();
+      nextNetworkAt = Date.now() + REQUEST_INTERVAL_MS;
+    } finally { release(); }
+  }
+  function copyCachedSearchPage(parsed, state) {
+    return {...parsed, works:(parsed.works || []).map(work => ({
+      ...work,
+      tags:[...(work.tags || [])],
+      matches:new Set([state.row?.name || state.row?.word || '保存検索']),
+      detailLoaded:false,
+      detailLoading:false,
+      detailQueued:false
+    }))};
+  }
 
   function currentSearch() {
     const m = location.pathname.match(/^\/tags\/index\/(.*)$/);
@@ -954,8 +1021,9 @@
     return u.pathname + (u.searchParams.toString() ? '?' + u.searchParams.toString() : '');
   }
 
-  function requestHtml(url, signal) {
+  async function requestHtml(url, signal) {
     const abs = new URL(url, location.origin).href;
+    await reserveNetworkSlot(signal);
     const gm = globalThis.GM?.xmlhttpRequest || globalThis.GM?.xmlHttpRequest;
 
     if (typeof gm !== 'function') {
@@ -966,7 +1034,7 @@
         signal,
         headers:{Accept:'text/html,application/xhtml+xml'}
       }).then(async response => {
-        if (response.status === 429) throw new Error('429：pictBLandのアクセス制限です');
+        if (response.status === 429) { blockedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS; throw rateLimitError(); }
         if (!response.ok) throw new Error('HTTP ' + response.status);
         return {html:await response.text(), url:response.url || abs};
       });
@@ -1010,7 +1078,7 @@
           },
           onload:res=>{
             const status=Number(res?.status||0);
-            if(status===429){finish(false,new Error('429：pictBLandのアクセス制限です'));return;}
+            if(status===429){blockedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;finish(false,rateLimitError());return;}
             if(status<200||status>=400){finish(false,new Error('HTTP '+status));return;}
             const html=String(res?.responseText ?? res?.response ?? '');
             if(!html.trim()){finish(false,new Error('HTMLが空でした'));return;}
@@ -1025,7 +1093,7 @@
           handle.then(res=>{
             if(settled)return;
             const status=Number(res?.status||0);
-            if(status===429){finish(false,new Error('429：pictBLandのアクセス制限です'));return;}
+            if(status===429){blockedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;finish(false,rateLimitError());return;}
             if(status<200||status>=400){finish(false,new Error('HTTP '+status));return;}
             const html=String(res?.responseText ?? res?.response ?? '');
             if(!html.trim()){finish(false,new Error('HTMLが空でした'));return;}
@@ -1571,24 +1639,33 @@
       // First try a normal same-site request. pictBLand may return only the
       // application shell here, so if no work cards exist, fall back to an
       // on-screen transparent same-origin iframe and read the rendered DOM.
-      let response = await requestHtml(pageUrl, feedAbort.signal);
-      if (generation !== feedGeneration) return false;
-      let parsed = parseSearchPage(response.html,response.url,state);
-
-      if (!parsed.works.length && !parsed.empty) {
-        response = await renderedSearchHtml(pageUrl,feedAbort.signal);
+      let parsed;
+      const cached = cacheGet(searchPageCache,pageUrl);
+      if (cached) {
+        parsed = copyCachedSearchPage(cached,state);
+      } else {
+        let response = await requestHtml(pageUrl, feedAbort.signal);
         if (generation !== feedGeneration) return false;
         parsed = parseSearchPage(response.html,response.url,state);
-      }
 
-      if (!parsed.works.length && !parsed.empty) {
-        const hint = [parsed.title,parsed.pageText.slice(0,100)].filter(Boolean).join(' ／ ');
-        const links = (parsed.hrefSamples||[]).slice(0,6).join(' , ');
-        throw new Error(
-          '検索ページは開けましたが作品カードを判定できません'
-          + (hint ? '：'+hint : '')
-          + (links ? ' ／ リンク候補：'+links : '')
-        );
+        if (!parsed.works.length && !parsed.empty) {
+          // The iframe renders another full page, so pace this fallback too.
+          await reserveNetworkSlot(feedAbort.signal);
+          response = await renderedSearchHtml(pageUrl,feedAbort.signal);
+          if (generation !== feedGeneration) return false;
+          parsed = parseSearchPage(response.html,response.url,state);
+        }
+
+        if (!parsed.works.length && !parsed.empty) {
+          const hint = [parsed.title,parsed.pageText.slice(0,100)].filter(Boolean).join(' ／ ');
+          const links = (parsed.hrefSamples||[]).slice(0,6).join(' , ');
+          throw new Error(
+            '検索ページは開けましたが作品カードを判定できません'
+            + (hint ? '：'+hint : '')
+            + (links ? ' ／ リンク候補：'+links : '')
+          );
+        }
+        cachePut(searchPageCache,pageUrl,copyCachedSearchPage(parsed,state),SEARCH_CACHE_MS);
       }
 
       for (const work of parsed.works) {
@@ -1705,7 +1782,12 @@
   }
 
   async function fetchDetail(work, signal) {
-    const response = await requestHtml(work.href, signal);
+    const key = new URL(work.href,location.origin).href;
+    let response = cacheGet(detailHtmlCache,key);
+    if (!response) {
+      response = await requestHtml(key,signal);
+      cachePut(detailHtmlCache,key,response,DETAIL_CACHE_MS);
+    }
     const doc = new DOMParser().parseFromString(response.html, 'text/html');
     const bodyText = compactText(doc.body?.textContent || '');
 
@@ -1768,7 +1850,7 @@
         if (excludedByTag(work)) renderFeed();
         else updateFeedCard(work);
       }).catch(e => {
-        if (e?.name !== 'AbortError') {
+        if (e?.name !== 'AbortError' && !e?.rateLimited) {
           work.detailLoaded = true;
           updateFeedCard(work);
         }
@@ -1947,7 +2029,7 @@
     if (!root) return;
     syncExcludeUi();
     const status = root.querySelector('.pbsw-feed-status');
-    if (status) status.textContent = feedStatusText();
+    if (status) status.textContent = (Date.now() < blockedUntil ? '⚠ pictBLandのアクセス制限を検出：10分間は通信停止 ／ ' : '') + feedStatusText();
 
     renderCoverageBreakdown();
 
@@ -1998,7 +2080,8 @@
     if (!feedLoading) observeFeedCards(visible,feedGeneration);
   }
 
-  async function refreshFeed() {
+  async function refreshFeed(force = false) {
+    if (force) { searchPageCache.clear(); detailHtmlCache.clear(); }
     const rows = readSaved();
     feedAbort?.abort();
     feedAbort = new AbortController();
@@ -2253,7 +2336,7 @@
     root.querySelector('.pbsw-close').addEventListener('click',closePanel);
     root.querySelector('.pbsw-newest-open').addEventListener('click',openFeed);
     root.querySelector('.pbsw-feed-back').addEventListener('click',closeFeed);
-    root.querySelector('.pbsw-feed-refresh').addEventListener('click',()=>void refreshFeed());
+    root.querySelector('.pbsw-feed-refresh').addEventListener('click',()=>void refreshFeed(true));
     root.querySelector('.pbsw-feed-exclude-apply').addEventListener('click',applyExcludeInput);
     root.querySelector('.pbsw-feed-exclude-input').addEventListener('keydown',e=>{
       if(e.key==='Enter'){e.preventDefault();applyExcludeInput();}
