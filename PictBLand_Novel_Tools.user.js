@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.24
+// @version      0.3.25
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1352,7 +1352,10 @@
   }
 
   function isBoilerplateCaption(value) {
-    return /検索避け設定|投稿された作品やコンテンツは|GoogleやYahoo|画像検索からも除外|pictBLandへようこそ|会員登録必須の完全クローズドサービス|BL特化型投稿サイト|地雷避け機能|鍵付き投稿：|さぁ、いますぐ始めましょう|pictBLandは同人・BLが好きな人のため/i.test(compactText(value));
+    const t=compactText(value);
+    // pictBLand's site-wide SEO metadata and welcome copy are never
+    // authored descriptions, even if they appear in a search card or item page.
+    return /検索避け設定|投稿された作品やコンテンツは|GoogleやYahoo|画像検索からも除外|pictBLandへようこそ|会員登録必須の完全クローズドサービス|BL特化型投稿サイト|地雷避け機能|鍵付き投稿：|さぁ、いますぐ始めましょう|pictBLandは同人・BLが好きな人のため|pictBLandはイラスト・小説の投稿や閲覧|pictBLandはBLに特化した投稿SNS|イラスト・小説コミュニケーションサービスです|他の人の作品を見てみたい！|検索避けや鍵付き・除外タグなどの閲覧機能が充実した/i.test(t);
   }
   function validCaption(value,title,author,tags) {
     const t=compactText(value);
@@ -1361,8 +1364,11 @@
     return t;
   }
   function captionFrom(root,title,author,tags,detailPage=false) {
-    const exact=[
-      '[itemprop="description"]','[data-role="caption"]','[data-testid*="caption" i]',
+    // Only work-specific DOM regions count. A broad meta description or a
+    // random paragraph elsewhere in the page is not proof of a caption.
+    const explicit=[
+      '[itemprop="description"]','[data-role="caption"]',
+      '[data-testid*="caption" i]','[data-testid*="description" i]',
       '[class*="item-caption" i]','[class*="item_caption" i]',
       '[class*="item-description" i]','[class*="item_description" i]',
       '[class*="work-caption" i]','[class*="work-description" i]',
@@ -1370,21 +1376,26 @@
       '[class*="item-comment" i]','[id*="item-caption" i]',
       '[id*="item-description" i]','[class*="caption" i]','[id*="caption" i]'
     ];
-    for(const selector of exact)for(const el of root?.querySelectorAll?.(selector)||[]){
-      if(el.closest?.('header,footer,nav,aside,form,[class*="profile" i],[class*="recommend" i]'))continue;
-      const value=validCaption(el.textContent,title,author,tags);
-      if(value)return value;
+    const ignore='header,footer,nav,aside,form,[class*="profile" i],[class*="recommend" i],[class*="welcome" i],[class*="footer" i],[class*="sidebar" i]';
+    for(const selector of explicit){
+      for(const el of root?.querySelectorAll?.(selector)||[]){
+        if(el.closest?.(ignore))continue;
+        const value=validCaption(el.textContent,title,author,tags);
+        if(value)return value;
+      }
     }
+    // A search result card belongs to a single work. For entire detail pages,
+    // restrict generic paragraphs to the item body to avoid bios, footers,
+    // novel text and site advertising.
     const scope=detailPage
       ?root?.querySelector?.('main article,main [class*="item-detail" i],main [class*="work-detail" i],article[class*="item" i]')
       :root;
     const candidates=[];
     for(const el of scope?.querySelectorAll?.('p,[class*="description" i],[class*="summary" i]')||[]){
-      if(el.closest?.('header,footer,nav,aside,form,[class*="profile" i],[class*="recommend" i]'))continue;
+      if(el.closest?.(ignore))continue;
       const value=validCaption(el.textContent,title,author,tags);
       if(value&&value.length<=800)candidates.push(value);
     }
-    // Never search all paragraphs in a whole page: that includes novel text.
     return candidates.sort((a,b)=>b.length-a.length)[0]||'';
   }
   function minimalSearchWork(id, state, orderIndex) {
@@ -1812,11 +1823,44 @@
     renderFeed();
   }
 
-  // The HTTP page may be a generic site shell. A rendered same-origin page
-  // can expose the work caption available to the logged-in browser.
-  function renderedDetailHtml(url,signal) {
+  // Prefer the browser's authenticated same-origin request. In some iOS
+  // userscript engines GM requests do not carry Safari's logged-in cookies.
+  async function requestAuthenticatedDetail(url,signal) {
+    await reserveNetworkSlot(signal);
+    let response;
+    try {
+      response=await fetch(url,{
+        credentials:'include',signal,
+        headers:{Accept:'text/html,application/xhtml+xml'}
+      });
+    } catch(error) {
+      if(signal?.aborted)throw abortError();
+      // Fall back to the userscript request when native fetch is unavailable.
+      return await requestHtml(url,signal);
+    }
+    if(response.status===429){
+      blockedUntil=Date.now()+RATE_LIMIT_COOLDOWN_MS;
+      throw rateLimitError();
+    }
+    if(!response.ok)throw new Error('詳細ページ HTTP '+response.status);
+    return {html:await response.text(),url:response.url||url};
+  }
+
+  function detailCaptionFromDoc(doc,work) {
+    // Work-specific nodes may live in a shadow root in responsive layouts.
+    for(const node of deepRoots(doc)) {
+      const value=captionFrom(node,work.title,work.authorName,work.tags,true);
+      if(value)return value;
+    }
+    return '';
+  }
+
+  // Render within the logged-in browser if the initial HTML is only the site
+  // shell. This obeys existing visibility restrictions and access cooldowns.
+  function renderedDetailHtml(url,work,signal) {
     return new Promise((resolve,reject)=>{
-      const frame=document.createElement('iframe');let finished=false,poll=null,timeout=null,loaded=0;
+      const frame=document.createElement('iframe');
+      let finished=false,poll=null,timeout=null,loaded=0,latest=null;
       frame.setAttribute('aria-hidden','true');frame.tabIndex=-1;
       frame.style.cssText='position:fixed!important;inset:0!important;width:100vw!important;height:100dvh!important;opacity:.001!important;pointer-events:none!important;border:0!important;z-index:2147480000!important;';
       const clean=()=>{clearTimeout(timeout);clearInterval(poll);signal?.removeEventListener('abort',onAbort);frame.remove();};
@@ -1824,16 +1868,28 @@
       const onAbort=()=>finish(false,abortError());
       if(signal?.aborted){onAbort();return;}
       signal?.addEventListener('abort',onAbort,{once:true});
-      timeout=setTimeout(()=>finish(false,new Error('作品ページ描画タイムアウト')),9000);
+      timeout=setTimeout(()=>finish(true,latest),6500);
       frame.addEventListener('load',()=>{
         loaded=Date.now();clearInterval(poll);
         poll=setInterval(()=>{
-          if(Date.now()-loaded<1400)return;
-          try{
+          if(Date.now()-loaded<1000)return;
+          try {
             const doc=frame.contentDocument;
-            if(!doc?.body||!String(frame.contentWindow?.location?.pathname||'').startsWith('/items/detail/'))return;
+            const pathname=String(frame.contentWindow?.location?.pathname||'');
+            if(!doc?.body || pathname!==new URL(url,location.origin).pathname)return;
             const html=doc.documentElement?.outerHTML||'';
-            if(html.length>400)finish(true,{html,url:frame.contentWindow.location.href});
+            if(html.length<400)return;
+            // Preserve shadow content in the snapshot for detail parsing.
+            const extra=[];
+            for(const node of deepRoots(doc)) {
+              if(node===doc)continue;
+              extra.push('<div data-pbsw-detail-shadow="1">'+(node.innerHTML||'')+'</div>');
+            }
+            latest={html:html+extra.join(''),url:frame.contentWindow.location.href};
+            if(detailCaptionFromDoc(doc,work)){
+              finish(true,latest);
+              return;
+            }
           }catch{}
         },350);
       });
@@ -1841,60 +1897,56 @@
       catch(e){finish(false,e);}
     });
   }
-  async function fetchDetail(work, signal) {
-    const key = new URL(work.href,location.origin).href;
-    let response = cacheGet(detailHtmlCache,key);
-    if (!response) {
-      response = await requestHtml(key,signal);
-      cachePut(detailHtmlCache,key,response,DETAIL_CACHE_MS);
+
+  async function fetchDetail(work,signal) {
+    const key=new URL(work.href,location.origin).href;
+    let response=cacheGet(detailHtmlCache,key);
+    if(!response){
+      response=await requestAuthenticatedDetail(key,signal);
     }
     let doc=new DOMParser().parseFromString(response.html,'text/html');
-    const seo=compactText(doc.querySelector('meta[property="og:description"]')?.getAttribute('content')
-      ||doc.querySelector('meta[name="description"]')?.getAttribute('content'));
-    const shellText=compactText(doc.body?.textContent||'').slice(0,6000);
-    if((isBoilerplateCaption(seo) || /検索避けや鍵付き・除外タグ|検索避け設定|投稿された作品やコンテンツは/.test(shellText))
-       && !captionFrom(doc,work.title,work.authorName,work.tags,true)){
-      try{
+    let caption=detailCaptionFromDoc(doc,work);
+    if(!caption){
+      try {
         await reserveNetworkSlot(signal);
-        const rendered=await renderedDetailHtml(key,signal);
-        if(rendered?.html){response=rendered;doc=new DOMParser().parseFromString(rendered.html,'text/html');}
-      }catch(e){if(e?.name==='AbortError'||e?.rateLimited)throw e;}
+        const rendered=await renderedDetailHtml(key,work,signal);
+        if(rendered?.html) {
+          const parsed=new DOMParser().parseFromString(rendered.html,'text/html');
+          const found=detailCaptionFromDoc(parsed,work);
+          if(found){
+            doc=parsed;response=rendered;caption=found;
+          }
+        }
+      } catch(error) {
+        if(error?.name==='AbortError'||error?.rateLimited)throw error;
+      }
     }
-    const bodyText = compactText(doc.body?.textContent || '');
-
-    const tags = tagsFrom(doc);
-    if (tags.length) work.tags = tags;
-
-    const author = authorFrom(doc);
-    if (author.name) { work.authorName = author.name; work.authorHref = author.href; }
-
-    const ogTitle = compactText(doc.querySelector('meta[property="og:title"]')?.getAttribute('content'));
-    const headingTitle = compactText(doc.querySelector('h1,h2,[class*="title"],[class*="subject"]')?.textContent);
-    const title = ogTitle || headingTitle;
-    if (title && !/pictBLand/i.test(title)) work.title = title.replace(/\s*[|｜-]\s*pictBLand.*$/i,'').trim() || work.title;
-
-    const ogImage = doc.querySelector('meta[property="og:image"]')?.getAttribute('content') || '';
-    if (!work.thumb && ogImage) {
-      try { work.thumb = new URL(ogImage,response.url).href; } catch {}
+    // Cache only work-specific successful snapshots, not generic landing-page
+    // SEO HTML that could contaminate many unrelated result cards.
+    if(caption)cachePut(detailHtmlCache,key,response,DETAIL_CACHE_MS);
+    const bodyText=compactText(doc.body?.textContent||'');
+    const tags=tagsFrom(doc);
+    if(tags.length)work.tags=tags;
+    const author=authorFrom(doc);
+    if(author.name){work.authorName=author.name;work.authorHref=author.href;}
+    const ogTitle=compactText(doc.querySelector('meta[property="og:title"]')?.getAttribute('content'));
+    const headingTitle=compactText(doc.querySelector('h1,h2,[class*="title"],[class*="subject"]')?.textContent);
+    const title=ogTitle||headingTitle;
+    if(title && !/pictBLand/i.test(title))work.title=title.replace(/\\s*[|｜-]\\s*pictBLand.*$/i,'').trim()||work.title;
+    const ogImage=doc.querySelector('meta[property="og:image"]')?.getAttribute('content')||'';
+    if(!work.thumb && ogImage && !isBoilerplateCaption(ogTitle)) {
+      try{work.thumb=new URL(ogImage,response.url).href;}catch{}
     }
-
-    const date = dateFrom(doc);
-    if (date.time) { work.dateTime = date.time; work.dateText = date.text; }
-
-    const descriptionMeta=validCaption(
-      doc.querySelector('meta[property="og:description"]')?.getAttribute('content')
-      || doc.querySelector('meta[name="description"]')?.getAttribute('content'),
-      work.title,work.authorName,work.tags
-    );
-    work.caption=captionFrom(doc,work.title,work.authorName,work.tags,true)
-      || descriptionMeta || validCaption(work.caption,work.title,work.authorName,work.tags);
-
-    const suki = metricFromText(bodyText,['ステキ!?','ステキ','いいね']);
-    const bookmark = metricFromText(bodyText,['ブクマ','ブックマーク']);
-    if (suki != null) work.sukiCount = suki;
-    if (bookmark != null) work.bookmarkCount = bookmark;
+    const date=dateFrom(doc);
+    if(date.time){work.dateTime=date.time;work.dateText=date.text;}
+    // Never use <meta name=description>, <meta property=og:description> or
+    // search page promotional excerpts as authored work captions.
+    work.caption=caption || validCaption(work.caption,work.title,work.authorName,work.tags);
+    const suki=metricFromText(bodyText,['ステキ!?','ステキ','いいね']);
+    const bookmark=metricFromText(bodyText,['ブクマ','ブックマーク']);
+    if(suki!=null)work.sukiCount=suki;
+    if(bookmark!=null)work.bookmarkCount=bookmark;
   }
-
   function resetDetailQueue() {
     detailQueue = [];
     detailActive = 0;
