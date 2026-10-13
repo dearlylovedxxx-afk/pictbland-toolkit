@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.22
+// @version      0.3.23
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1351,18 +1351,42 @@
     return {name:'', href:''};
   }
 
-  function captionFrom(rootNode, title, authorName, tags) {
-    const tagSet = new Set((tags || []).map(compactText));
-    const candidates = [];
-    for (const el of rootNode?.querySelectorAll?.('p,[class*="caption"],[class*="description"],[class*="comment"],[class*="summary"]') || []) {
-      const t = compactText(el.textContent);
-      if (!t || t === title || t === authorName || tagSet.has(t) || t.length < 8 || t.length > 800) continue;
-      if (/^(?:投稿日|更新日|ステキ|ブクマ|ブックマーク|タグ|閲覧)/.test(t)) continue;
-      candidates.push(t);
-    }
-    return candidates.sort((a,b)=>b.length-a.length)[0] || '';
+  function isBoilerplateCaption(value) {
+    return /検索避け設定|投稿された作品やコンテンツは|GoogleやYahoo|画像検索からも除外|pictBLandへようこそ|会員登録必須の完全クローズドサービス|BL特化型投稿サイト|地雷避け機能|鍵付き投稿：|さぁ、いますぐ始めましょう|pictBLandは同人・BLが好きな人のため/i.test(compactText(value));
   }
-
+  function validCaption(value,title,author,tags) {
+    const t=compactText(value);
+    if(!t||t===compactText(title)||t===compactText(author)||(tags||[]).some(tag=>t===compactText(tag)))return '';
+    if(t.length<2||t.length>2400||isBoilerplateCaption(t)||/^(投稿日|更新日|ステキ|ブクマ|ブックマーク|タグ|閲覧|コメントを投稿|プロフィール表示|プレミアムサービス)/.test(t))return '';
+    return t;
+  }
+  function captionFrom(root,title,author,tags,detailPage=false) {
+    const exact=[
+      '[itemprop="description"]','[data-role="caption"]','[data-testid*="caption" i]',
+      '[class*="item-caption" i]','[class*="item_caption" i]',
+      '[class*="item-description" i]','[class*="item_description" i]',
+      '[class*="work-caption" i]','[class*="work-description" i]',
+      '[class*="post-caption" i]','[class*="post-description" i]',
+      '[class*="item-comment" i]','[id*="item-caption" i]',
+      '[id*="item-description" i]','[class*="caption" i]','[id*="caption" i]'
+    ];
+    for(const selector of exact)for(const el of root?.querySelectorAll?.(selector)||[]){
+      if(el.closest?.('header,footer,nav,aside,form,[class*="profile" i],[class*="recommend" i]'))continue;
+      const value=validCaption(el.textContent,title,author,tags);
+      if(value)return value;
+    }
+    const scope=detailPage
+      ?root?.querySelector?.('main article,main [class*="item-detail" i],main [class*="work-detail" i],article[class*="item" i]')
+      :root;
+    const candidates=[];
+    for(const el of scope?.querySelectorAll?.('p,[class*="description" i],[class*="summary" i]')||[]){
+      if(el.closest?.('header,footer,nav,aside,form,[class*="profile" i],[class*="recommend" i]'))continue;
+      const value=validCaption(el.textContent,title,author,tags);
+      if(value&&value.length<=800)candidates.push(value);
+    }
+    // Never search all paragraphs in a whole page: that includes novel text.
+    return candidates.sort((a,b)=>b.length-a.length)[0]||'';
+  }
   function minimalSearchWork(id, state, orderIndex) {
     return {
       id:String(id),
@@ -1788,6 +1812,35 @@
     renderFeed();
   }
 
+  // The HTTP page may be a generic site shell. A rendered same-origin page
+  // can expose the work caption available to the logged-in browser.
+  function renderedDetailHtml(url,signal) {
+    return new Promise((resolve,reject)=>{
+      const frame=document.createElement('iframe');let finished=false,poll=null,timeout=null,loaded=0;
+      frame.setAttribute('aria-hidden','true');frame.tabIndex=-1;
+      frame.style.cssText='position:fixed!important;inset:0!important;width:100vw!important;height:100dvh!important;opacity:.001!important;pointer-events:none!important;border:0!important;z-index:2147480000!important;';
+      const clean=()=>{clearTimeout(timeout);clearInterval(poll);signal?.removeEventListener('abort',onAbort);frame.remove();};
+      const finish=(ok,value)=>{if(finished)return;finished=true;clean();ok?resolve(value):reject(value);};
+      const onAbort=()=>finish(false,abortError());
+      if(signal?.aborted){onAbort();return;}
+      signal?.addEventListener('abort',onAbort,{once:true});
+      timeout=setTimeout(()=>finish(false,new Error('作品ページ描画タイムアウト')),9000);
+      frame.addEventListener('load',()=>{
+        loaded=Date.now();clearInterval(poll);
+        poll=setInterval(()=>{
+          if(Date.now()-loaded<1400)return;
+          try{
+            const doc=frame.contentDocument;
+            if(!doc?.body||!String(frame.contentWindow?.location?.pathname||'').startsWith('/items/detail/'))return;
+            const html=doc.documentElement?.outerHTML||'';
+            if(html.length>400)finish(true,{html,url:frame.contentWindow.location.href});
+          }catch{}
+        },350);
+      });
+      try{(document.body||document.documentElement).append(frame);frame.src=url;}
+      catch(e){finish(false,e);}
+    });
+  }
   async function fetchDetail(work, signal) {
     const key = new URL(work.href,location.origin).href;
     let response = cacheGet(detailHtmlCache,key);
@@ -1795,7 +1848,16 @@
       response = await requestHtml(key,signal);
       cachePut(detailHtmlCache,key,response,DETAIL_CACHE_MS);
     }
-    const doc = new DOMParser().parseFromString(response.html, 'text/html');
+    let doc=new DOMParser().parseFromString(response.html,'text/html');
+    const seo=compactText(doc.querySelector('meta[property="og:description"]')?.getAttribute('content')
+      ||doc.querySelector('meta[name="description"]')?.getAttribute('content'));
+    if(isBoilerplateCaption(seo)&&!captionFrom(doc,work.title,work.authorName,work.tags,true)){
+      try{
+        await reserveNetworkSlot(signal);
+        const rendered=await renderedDetailHtml(key,signal);
+        if(rendered?.html){response=rendered;doc=new DOMParser().parseFromString(rendered.html,'text/html');}
+      }catch(e){if(e?.name==='AbortError'||e?.rateLimited)throw e;}
+    }
     const bodyText = compactText(doc.body?.textContent || '');
 
     const tags = tagsFrom(doc);
@@ -1817,13 +1879,13 @@
     const date = dateFrom(doc);
     if (date.time) { work.dateTime = date.time; work.dateText = date.text; }
 
-    const descriptionMeta = compactText(
-      doc.querySelector('meta[property="og:description"]')?.getAttribute('content') ||
-      doc.querySelector('meta[name="description"]')?.getAttribute('content')
+    const descriptionMeta=validCaption(
+      doc.querySelector('meta[property="og:description"]')?.getAttribute('content')
+      || doc.querySelector('meta[name="description"]')?.getAttribute('content'),
+      work.title,work.authorName,work.tags
     );
-    const candidateCaption = captionFrom(doc,work.title,work.authorName,work.tags);
-    const caption = candidateCaption || descriptionMeta;
-    if (caption && !/pictBLandへようこそ/i.test(caption)) work.caption = caption;
+    work.caption=captionFrom(doc,work.title,work.authorName,work.tags,true)
+      || descriptionMeta || validCaption(work.caption,work.title,work.authorName,work.tags);
 
     const suki = metricFromText(bodyText,['ステキ!?','ステキ','いいね']);
     const bookmark = metricFromText(bodyText,['ブクマ','ブックマーク']);
@@ -1969,7 +2031,8 @@
 
     const caption = document.createElement('p');
     caption.className = 'pbsw-feed-caption';
-    caption.textContent = work.caption || '作品情報を取得中…';
+    caption.textContent = work.caption || (work.detailError ? 'キャプション取得不可'
+      : work.detailLoaded ? 'キャプションを取得できませんでした' : '作品情報を取得中…');
 
     const tags = document.createElement('div');
     tags.className = 'pbsw-feed-tags';
@@ -2015,7 +2078,8 @@
     const date = card.querySelector('.pbsw-feed-date');
     if (date) date.textContent = work.dateText || '';
     const caption = card.querySelector('.pbsw-feed-caption');
-    if (caption) caption.textContent = work.caption || '説明なし';
+    if (caption) caption.textContent = work.caption || (work.detailError ? 'キャプション取得不可'
+      : work.detailLoaded ? 'キャプションを取得できませんでした' : '作品情報を取得中…');
     const img = card.querySelector('.pbsw-feed-thumb img');
     if (img && work.thumb && !img.getAttribute('src')) { img.src = work.thumb; img.classList.remove('empty'); }
     const tags = card.querySelector('.pbsw-feed-tags');
