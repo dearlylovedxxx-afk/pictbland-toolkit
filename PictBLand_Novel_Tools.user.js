@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.20
+// @version      0.3.21
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1711,13 +1711,17 @@
     }
   }
 
+  // The same newest-first comparator governs both display and detail requests.
+  // Unknown dates fall back to work IDs, matching the existing feed ordering.
+  function compareNewestWorks(a,b) {
+    if ((b.dateTime||0) !== (a.dateTime||0)) return (b.dateTime||0) - (a.dateTime||0);
+    const bi = Number(b.id), ai = Number(a.id);
+    if (Number.isFinite(bi) && Number.isFinite(ai) && bi !== ai) return bi-ai;
+    return (a.searchOrder||0) - (b.searchOrder||0);
+  }
+
   function allSortedWorks() {
-    return [...feedWorks.values()].sort((a,b) => {
-      if ((b.dateTime||0) !== (a.dateTime||0)) return (b.dateTime||0) - (a.dateTime||0);
-      const bi = Number(b.id), ai = Number(a.id);
-      if (Number.isFinite(bi) && Number.isFinite(ai) && bi !== ai) return bi-ai;
-      return (a.searchOrder||0) - (b.searchOrder||0);
-    });
+    return [...feedWorks.values()].sort(compareNewestWorks);
   }
 
   function sortedWorks() {
@@ -1837,6 +1841,9 @@
   }
 
   function pumpDetailQueue() {
+    // The DOM observer previously enqueued cards in callback/scroll order.
+    // Always choose the newest outstanding work before starting another request.
+    detailQueue.sort((a,b) => compareNewestWorks(a.work,b.work));
     while (detailActive < DETAIL_CONCURRENCY && detailQueue.length) {
       const job = detailQueue.shift();
       const work = job.work;
@@ -1868,10 +1875,12 @@
     const total = feedStates.length;
     const ok = feedStates.filter(s => !s.error).length;
     const bad = feedStates.filter(s => s.error).length;
-    const visible = sortedWorks().length;
+    const visibleWorks = sortedWorks();
+    const visible = visibleWorks.length;
     const excluded = Math.max(0,feedWorks.size-visible);
-    const detailed = [...feedWorks.values()].filter(w => w.detailLoaded).length;
-    const detailText = visible ? ' ／ 詳細 ' + detailed.toLocaleString('ja-JP') + '/' + feedWorks.size.toLocaleString('ja-JP') : '';
+    const displayed = visibleWorks.slice(0,feedVisibleCount);
+    const detailed = displayed.filter(w => w.detailLoaded).length;
+    const detailText = displayed.length ? ' ／ 新着順に詳細 ' + detailed.toLocaleString('ja-JP') + '/' + displayed.length.toLocaleString('ja-JP') : '';
     const target = feedVisibleCount;
     const covered = feedStates.filter(s => s.error || s.done || stateCoverage(s) >= target).length;
     const coverageText = total ? ' ／ 横断同期 ' + covered + '/' + total + '条件（各最大' + target + '件）' : '';
@@ -1999,30 +2008,11 @@
   }
 
   function observeFeedCards(works,generation) {
+    // Fetch details for the displayed batch in newest-first order, including
+    // works below the fold. IntersectionObserver callbacks may arrive in a
+    // different order and must not cause older works to jump ahead.
     feedObserver?.disconnect();
-
-    // Always start the first visible batch immediately. This avoids iOS Safari
-    // cases where IntersectionObserver on a fixed nested scroller never fires.
-    for (const work of works.slice(0,12)) enqueueDetail(work,generation);
-
-    if (!('IntersectionObserver' in window)) return;
-
-    feedObserver = new IntersectionObserver(entries => {
-      for (const entry of entries) {
-        if (!entry.isIntersecting) continue;
-        const id = entry.target?.dataset?.workId;
-        const work = id ? feedWorks.get(id) : null;
-        if (work) enqueueDetail(work,generation);
-        feedObserver?.unobserve(entry.target);
-      }
-    }, {root,rootMargin:'700px 0px',threshold:0.01});
-
-    for (const card of root.querySelectorAll('.pbsw-feed-card')) {
-      const id = card.dataset.workId;
-      const work = id ? feedWorks.get(id) : null;
-      if (work?.detailLoaded || work?.detailLoading || work?.detailQueued) continue;
-      feedObserver.observe(card);
-    }
+    for (const work of works) enqueueDetail(work,generation);
   }
 
   function renderFeed() {
