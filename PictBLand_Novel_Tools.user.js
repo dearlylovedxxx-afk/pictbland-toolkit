@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.21
+// @version      0.3.22
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -848,7 +848,8 @@
       matches:new Set([state.row?.name || state.row?.word || '保存検索']),
       detailLoaded:false,
       detailLoading:false,
-      detailQueued:false
+      detailQueued:false,
+      detailError:''
     }))};
   }
 
@@ -1380,6 +1381,7 @@
       detailLoaded:false,
       detailQueued:false,
       detailLoading:false,
+      detailError:'',
       searchOrder:orderIndex
     };
   }
@@ -1407,6 +1409,7 @@
       detailLoaded:false,
       detailQueued:false,
       detailLoading:false,
+      detailError:'',
       searchOrder:orderIndex
     };
   }
@@ -1834,7 +1837,7 @@
   }
 
   function enqueueDetail(work, generation) {
-    if (!work || work.detailLoaded || work.detailLoading || work.detailQueued) return;
+    if (!work || work.detailLoaded || work.detailLoading || work.detailQueued || work.detailError) return;
     work.detailQueued = true;
     detailQueue.push({work,generation});
     pumpDetailQueue();
@@ -1854,16 +1857,24 @@
       fetchDetail(work,feedAbort.signal).then(() => {
         if (job.generation !== feedGeneration) return;
         work.detailLoaded = true;
+        work.detailError = '';
         if (excludedByTag(work)) renderFeed();
         else updateFeedCard(work);
       }).catch(e => {
-        if (e?.name !== 'AbortError' && !e?.rateLimited) {
-          work.detailLoaded = true;
-          updateFeedCard(work);
+        if (job.generation !== feedGeneration || e?.name === 'AbortError') return;
+        work.detailError = e?.rateLimited
+          ? 'アクセス制限中（時間を置いて更新してください）'
+          : '詳細取得失敗：' + String(e?.message || e || '不明なエラー');
+        work.detailLoaded = false;
+        if (e?.rateLimited) {
+          for (const remaining of detailQueue) remaining.work.detailQueued = false;
+          detailQueue = [];
         }
+        updateFeedCard(work);
       }).finally(() => {
         work.detailLoading = false;
         detailActive = Math.max(0,detailActive-1);
+        if (job.generation === feedGeneration) updateFeedCard(work);
         const status = root?.querySelector('.pbsw-feed-status');
         if (status) status.textContent = feedStatusText();
         pumpDetailQueue();
@@ -1880,7 +1891,11 @@
     const excluded = Math.max(0,feedWorks.size-visible);
     const displayed = visibleWorks.slice(0,feedVisibleCount);
     const detailed = displayed.filter(w => w.detailLoaded).length;
-    const detailText = displayed.length ? ' ／ 新着順に詳細 ' + detailed.toLocaleString('ja-JP') + '/' + displayed.length.toLocaleString('ja-JP') : '';
+    const detailErrors = displayed.filter(w => !!w.detailError).length;
+    const detailText = displayed.length
+      ? ' ／ 新着順に詳細 ' + detailed.toLocaleString('ja-JP') + '/' + displayed.length.toLocaleString('ja-JP')
+        + (detailErrors ? '（取得不可 ' + detailErrors.toLocaleString('ja-JP') + '件）' : '')
+      : '';
     const target = feedVisibleCount;
     const covered = feedStates.filter(s => s.error || s.done || stateCoverage(s) >= target).length;
     const coverageText = total ? ' ／ 横断同期 ' + covered + '/' + total + '条件（各最大' + target + '件）' : '';
@@ -1907,7 +1922,10 @@
     const bits = [];
     if (work.sukiCount != null) bits.push('♥ ' + Number(work.sukiCount).toLocaleString('ja-JP'));
     if (work.bookmarkCount != null) bits.push('🔖 ' + Number(work.bookmarkCount).toLocaleString('ja-JP'));
-    return bits.length ? bits.join('  ') : '詳細取得中…';
+    if (bits.length) return bits.join('  ');
+    if (work.detailError) return '⚠ 詳細取得不可';
+    if (work.detailLoaded) return '件数情報なし';
+    return work.detailLoading ? '詳細取得中…' : '詳細取得待ち…';
   }
 
   function createFeedCard(work) {
@@ -1937,6 +1955,7 @@
     const metric = document.createElement('span');
     metric.className = 'pbsw-feed-metric';
     metric.textContent = metricLabel(work);
+    if (work.detailError) metric.title = work.detailError;
     top.append(title,metric);
 
     const author = document.createElement(work.authorHref ? 'a' : 'span');
@@ -1984,7 +2003,11 @@
     const card = root?.querySelector('.pbsw-feed-card[data-work-id="' + CSS.escape(work.id) + '"]');
     if (!card) return;
     const metric = card.querySelector('.pbsw-feed-metric');
-    if (metric) metric.textContent = metricLabel(work);
+    if (metric) {
+      metric.textContent = metricLabel(work);
+      metric.title = work.detailError || (work.detailLoaded && work.sukiCount == null && work.bookmarkCount == null
+        ? '詳細ページにステキ数・ブックマーク数の情報がありませんでした' : '');
+    }
     const title = card.querySelector('.pbsw-feed-title');
     if (title) title.textContent = work.title;
     const author = card.querySelector('.pbsw-feed-author');
