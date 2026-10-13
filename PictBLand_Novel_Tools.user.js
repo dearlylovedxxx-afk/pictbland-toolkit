@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.23
+// @version      0.3.24
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1851,7 +1851,9 @@
     let doc=new DOMParser().parseFromString(response.html,'text/html');
     const seo=compactText(doc.querySelector('meta[property="og:description"]')?.getAttribute('content')
       ||doc.querySelector('meta[name="description"]')?.getAttribute('content'));
-    if(isBoilerplateCaption(seo)&&!captionFrom(doc,work.title,work.authorName,work.tags,true)){
+    const shellText=compactText(doc.body?.textContent||'').slice(0,6000);
+    if((isBoilerplateCaption(seo) || /検索避けや鍵付き・除外タグ|検索避け設定|投稿された作品やコンテンツは/.test(shellText))
+       && !captionFrom(doc,work.title,work.authorName,work.tags,true)){
       try{
         await reserveNetworkSlot(signal);
         const rendered=await renderedDetailHtml(key,signal);
