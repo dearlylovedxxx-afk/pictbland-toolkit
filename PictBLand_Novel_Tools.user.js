@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.25
+// @version      0.3.26
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1323,7 +1323,7 @@
   }
 
   function titleFrom(card, anchors, id) {
-    const reject = /^(?:詳細|続きを読む|作品を見る|画像|小説|漫画|イラスト|ステキ!?|ブクマ|ブックマーク)$/i;
+    const reject = /^(?:詳細|続きを読む|作品を見る|画像|小説|漫画|イラスト|ステキ!?|ブクマ|ブックマーク|一般会員|プレミアム会員|フォロワー限定公開作品|Locked Works)$/i;
     const candidates = [];
     if (!card) return '作品 ' + id;
     for (const el of card?.querySelectorAll?.('h1,h2,h3,h4,strong,[class*="title"],[class*="subject"]') || []) {
@@ -1336,6 +1336,13 @@
       const alt = compactText(a.querySelector('img')?.getAttribute('alt'));
       if (alt && alt.length <= 180 && !reject.test(alt)) candidates.push(alt);
     }
+    // Some 2026 UI cards expose work titles as attributes rather than headings.
+    for (const el of [card, ...anchors]) {
+      for (const key of ['data-title','data-item-title','title','aria-label']) {
+        const t=compactText(el?.getAttribute?.(key)||'');
+        if(t && t.length<=180 && !reject.test(t) && !/^作品\\s*\\d+$/.test(t))candidates.push(t);
+      }
+    }
     return candidates.sort((a,b)=>b.length-a.length)[0] || ('作品 ' + id);
   }
 
@@ -1345,7 +1352,7 @@
         const u = new URL(a.getAttribute('href') || '', location.origin);
         if (!/^\/users\/[^/]+\/?$/.test(u.pathname)) continue;
         const name = compactText(a.textContent);
-        if (name) return {name, href:u.pathname};
+        if (name && !/^(?:一般会員|プレミアム会員|会員|ユーザー|プロフィール)$/.test(name)) return {name, href:u.pathname};
       } catch {}
     }
     return {name:'', href:''};
@@ -1469,6 +1476,18 @@
       } catch {}
     }
     return candidates[0] || '';
+  }
+
+  function parsedSearchQuality(parsed) {
+    // A bare item ID (often from JSON/scripts) is not a hydrated work card.
+    // Prefer rendered DOM if most candidates have no actual work title.
+    const works=parsed?.works||[];
+    let meaningful=0;
+    for (const work of works) {
+      if (work?.title && work.title!=='作品 '+work.id
+        && !/^(?:一般会員|プレミアム会員|フォロワー限定公開作品|Locked Works)$/.test(work.title))meaningful++;
+    }
+    return {count:works.length,meaningful};
   }
 
   function parseSearchPage(html, pageUrl, state) {
@@ -1686,12 +1705,28 @@
         if (generation !== feedGeneration) return false;
         parsed = parseSearchPage(response.html,response.url,state);
 
-        if (!parsed.works.length && !parsed.empty) {
-          // The iframe renders another full page, so pace this fallback too.
-          await reserveNetworkSlot(feedAbort.signal);
-          response = await renderedSearchHtml(pageUrl,feedAbort.signal);
-          if (generation !== feedGeneration) return false;
-          parsed = parseSearchPage(response.html,response.url,state);
+        const initialQuality=parsedSearchQuality(parsed);
+        const missingCards=!parsed.empty && (initialQuality.count===0
+          || initialQuality.meaningful < Math.max(1,Math.floor(initialQuality.count*0.45)));
+        if (missingCards) {
+          // Work-ID references in HTML/JSON are not enough to claim that
+          // details were obtained. Give the logged-in rendered UI a chance.
+          try {
+            await reserveNetworkSlot(feedAbort.signal);
+            const rendered=await renderedSearchHtml(pageUrl,feedAbort.signal);
+            if (generation !== feedGeneration) return false;
+            const hydrated=parseSearchPage(rendered.html,rendered.url,state);
+            const quality=parsedSearchQuality(hydrated);
+            // Keep the raw result if rendering failed or lost most cards.
+            if (quality.count && (quality.meaningful>initialQuality.meaningful
+                || (quality.meaningful===initialQuality.meaningful
+                    && quality.count>=initialQuality.count))) {
+              parsed=hydrated;
+            }
+          } catch(e) {
+            if(e?.name==='AbortError' || e?.rateLimited)throw e;
+            // Retain IDs if no work-specific metadata is rendered either.
+          }
         }
 
         if (!parsed.works.length && !parsed.empty) {
@@ -1931,8 +1966,9 @@
     if(author.name){work.authorName=author.name;work.authorHref=author.href;}
     const ogTitle=compactText(doc.querySelector('meta[property="og:title"]')?.getAttribute('content'));
     const headingTitle=compactText(doc.querySelector('h1,h2,[class*="title"],[class*="subject"]')?.textContent);
-    const title=ogTitle||headingTitle;
-    if(title && !/pictBLand/i.test(title))work.title=title.replace(/\\s*[|｜-]\\s*pictBLand.*$/i,'').trim()||work.title;
+    const title=headingTitle || ogTitle;
+    if(title && !/pictBLand|一般会員|プレミアム会員/i.test(title))
+      work.title=title.replace(/\\s*[|｜-]\\s*pictBLand.*$/i,'').trim()||work.title;
     const ogImage=doc.querySelector('meta[property="og:image"]')?.getAttribute('content')||'';
     if(!work.thumb && ogImage && !isBoilerplateCaption(ogTitle)) {
       try{work.thumb=new URL(ogImage,response.url).href;}catch{}
@@ -2008,9 +2044,11 @@
     const displayed = visibleWorks.slice(0,feedVisibleCount);
     const detailed = displayed.filter(w => w.detailLoaded).length;
     const detailErrors = displayed.filter(w => !!w.detailError).length;
+    const noTitle = displayed.filter(w => !w.title || w.title==='作品 '+w.id).length;
     const detailText = displayed.length
       ? ' ／ 新着順に詳細 ' + detailed.toLocaleString('ja-JP') + '/' + displayed.length.toLocaleString('ja-JP')
         + (detailErrors ? '（取得不可 ' + detailErrors.toLocaleString('ja-JP') + '件）' : '')
+        + (noTitle ? ' ／ タイトル未取得 ' + noTitle.toLocaleString('ja-JP') + '件' : '')
       : '';
     const target = feedVisibleCount;
     const covered = feedStates.filter(s => s.error || s.done || stateCoverage(s) >= target).length;
