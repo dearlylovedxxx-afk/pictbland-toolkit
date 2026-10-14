@@ -1226,28 +1226,30 @@
     return ids;
   }
 
-  function workCardFor(anchor, id) {
-    if (!anchor) return null;
-    let node = anchor;
-    let best = null;
-
-    // Walk upward only while the container belongs to this one work.
-    // Stop before a list/grid/page container that contains multiple work IDs.
-    for (let depth = 0; node && depth < 10; depth++) {
-      if (node.nodeType === Node.ELEMENT_NODE) {
-        const ids = itemIdsInside(node);
-        if (ids.size === 1 && ids.has(String(id))) {
-          best = node;
-          const textLen = compactText(node.textContent || '').length;
-          if (/^(ARTICLE|LI)$/i.test(node.tagName) || /card|item|work|post|entry/i.test(String(node.className || ''))) {
-            if (textLen > 0) break;
-          }
-        } else if (ids.size > 1) {
-          break;
-        }
-      }
-      node = node.parentElement;
-      if (!node || node === document.body || node === document.documentElement) break;
+  function workCardFor(anchor,id) {
+    if(!anchor)return null;
+    let best=null,bestScore=-Infinity,node=anchor;
+    // A thumbnail's clickable element is not necessarily the whole work card.
+    for(let depth=0;node&&depth<12;depth++,node=node.parentElement){
+      if(node.nodeType!==1)continue;
+      const ids=itemIdsInside(node);
+      if(ids.size>1)break;
+      if(ids.size!==1||!ids.has(String(id)))continue;
+      const t=compactText(node.textContent||'');
+      if(!t||t.length>2400)continue;
+      const cls=String(node.className||'');
+      let score=0;
+      if(/^(ARTICLE|LI)$/i.test(node.tagName))score+=12;
+      if(/card|item|work|post|entry|result/i.test(cls))score+=6;
+      if(/(?:小説|アルバム|イラスト|漫画)\s*[：:]/.test(t.slice(0,220)))score+=28;
+      if(/20\d{2}[\/.-]\d{1,2}[\/.-]\d{1,2}/.test(t))score+=8;
+      if(node.querySelector('h1,h2,h3,h4,[class*="title" i]'))score+=14;
+      if(node.querySelector('a[href*="/tags/index/"]'))score+=7;
+      if(node.querySelector('a[href*="/users/"]'))score+=5;
+      if(t.length>=50)score+=8;
+      if(t.length>=100)score+=3;
+      if(t.length>1200)score-=12;
+      if(score>bestScore){best=node;bestScore=score;}
     }
     return best;
   }
@@ -1322,28 +1324,29 @@
     return null;
   }
 
-  function titleFrom(card, anchors, id) {
-    const reject = /^(?:詳細|続きを読む|作品を見る|画像|小説|漫画|イラスト|ステキ!?|ブクマ|ブックマーク|一般会員|プレミアム会員|フォロワー限定公開作品|Locked Works)$/i;
-    const candidates = [];
-    if (!card) return '作品 ' + id;
-    for (const el of card?.querySelectorAll?.('h1,h2,h3,h4,strong,[class*="title"],[class*="subject"]') || []) {
-      const t = compactText(el.textContent);
-      if (t && t.length <= 180 && !reject.test(t)) candidates.push(t);
+  function titleFrom(card,anchors,id) {
+    const fallback='作品 '+id;
+    if(!card)return fallback;
+    const candidates=[];
+    const add=(raw,priority)=>{
+      const t=compactText(raw);
+      if(!t||t.length>180||/^作品\s*\d+$/.test(t))return;
+      if(/^(?:詳細|続きを読む|作品を見る|画像|小説|漫画|アルバム|イラスト|ステキ!?|ブクマ|ブックマーク|一般会員|プレミアム会員|フォロワー限定公開作品|Locked Works|フォロ限|鍵付)$/i.test(t))return;
+      if(/^(?:小説|アルバム|イラスト|漫画)\s*[：:]|^20\d{2}[\/.-]\d|^#/.test(t))return;
+      if(/検索避け設定|pictBLandは/i.test(t))return;
+      candidates.push({title:t,priority});
+    };
+    for(const el of card.querySelectorAll('a[href],h1,h2,h3,h4,[class*="title" i],[class*="subject" i]')){
+      const link=el.matches('a[href]');
+      const actualId=link?itemIdFromHref(el.getAttribute('href')||''):'';
+      const named=/^H[1-4]$/i.test(el.tagName)||/title|subject/i.test(String(el.className||''));
+      if(link&&actualId!==String(id)&&!named)continue;
+      add(el.textContent,actualId===String(id)?100:named?85:60);
     }
-    for (const a of anchors) {
-      const t = compactText(a.textContent);
-      if (t && t.length <= 180 && !reject.test(t)) candidates.push(t);
-      const alt = compactText(a.querySelector('img')?.getAttribute('alt'));
-      if (alt && alt.length <= 180 && !reject.test(alt)) candidates.push(alt);
-    }
-    // Some 2026 UI cards expose work titles as attributes rather than headings.
-    for (const el of [card, ...anchors]) {
-      for (const key of ['data-title','data-item-title','title','aria-label']) {
-        const t=compactText(el?.getAttribute?.(key)||'');
-        if(t && t.length<=180 && !reject.test(t) && !/^作品\\s*\\d+$/.test(t))candidates.push(t);
-      }
-    }
-    return candidates.sort((a,b)=>b.length-a.length)[0] || ('作品 ' + id);
+    for(const el of [card,...anchors])for(const key of ['data-title','data-item-title','title','aria-label'])
+      add(el?.getAttribute?.(key),30);
+    candidates.sort((a,b)=>b.priority-a.priority||a.title.length-b.title.length);
+    return candidates[0]?.title||fallback;
   }
 
   function authorFrom(rootNode) {
