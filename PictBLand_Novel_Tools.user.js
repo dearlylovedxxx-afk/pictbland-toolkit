@@ -1434,6 +1434,9 @@
       dateText:'',
       dateTime:0,
       caption:'',
+      workType:'',
+      characterCount:null,
+      imageCount:null,
       tags:[],
       sukiCount:null,
       bookmarkCount:null,
@@ -1452,6 +1455,7 @@
     const author = authorFrom(card);
     const date = dateFrom(card);
     const text = compactText(card?.textContent || '');
+    const format = workFormatFromCard(card);
     return {
       id,
       href:itemHref(id),
@@ -1462,6 +1466,7 @@
       dateText:date.text,
       dateTime:date.time,
       caption:captionFrom(card,title,author.name,tags),
+      ...format,
       tags,
       sukiCount:metricFromText(text,['ステキ!?','ステキ','いいね']),
       bookmarkCount:metricFromText(text,['ブクマ','ブックマーク']),
@@ -1795,6 +1800,9 @@
       if (!old.thumb && work.thumb) old.thumb = work.thumb;
       if (!old.authorName && work.authorName) { old.authorName = work.authorName; old.authorHref = work.authorHref; }
       if (!old.caption && work.caption) old.caption = work.caption;
+      if (!old.workType && work.workType) old.workType=work.workType;
+      if (old.characterCount==null && work.characterCount!=null) old.characterCount=work.characterCount;
+      if (old.imageCount==null && work.imageCount!=null) old.imageCount=work.imageCount;
       if (!old.tags.length && work.tags.length) old.tags = work.tags;
       if (!old.dateTime && work.dateTime) { old.dateTime = work.dateTime; old.dateText = work.dateText; }
       if (old.sukiCount == null && work.sukiCount != null) old.sukiCount = work.sukiCount;
@@ -2117,6 +2125,10 @@
 
     const info = document.createElement('div');
     info.className = 'pbsw-feed-info';
+    const kind = document.createElement('div');
+    kind.className='pbsw-feed-kind';
+    kind.textContent=formatWorkLabel(work);
+    kind.hidden=!kind.textContent;
 
     const top = document.createElement('div');
     top.className = 'pbsw-feed-top';
@@ -2167,7 +2179,7 @@
       matches.append(more);
     }
 
-    info.append(top,author,date,caption,tags,matches);
+    info.append(kind,top,author,date,caption,tags,matches);
     card.append(thumb,info);
     return card;
   }
@@ -2183,6 +2195,8 @@
     }
     const title = card.querySelector('.pbsw-feed-title');
     if (title) title.textContent = work.title;
+    const kind=card.querySelector('.pbsw-feed-kind');
+    if(kind){kind.textContent=formatWorkLabel(work);kind.hidden=!kind.textContent;}
     const author = card.querySelector('.pbsw-feed-author');
     if (author) author.textContent = work.authorName || '作者不明';
     const date = card.querySelector('.pbsw-feed-date');
@@ -2444,6 +2458,7 @@
       #${ROOT_ID} .pbsw-feed-thumb img{display:block;width:100%;height:100%;min-height:128px;object-fit:cover;background:#ece8f2}
       #${ROOT_ID} .pbsw-feed-thumb img.empty{visibility:hidden}
       #${ROOT_ID} .pbsw-feed-info{padding:10px;min-width:0}
+      #${ROOT_ID} .pbsw-feed-kind{font-size:11px;font-weight:800;color:#7356a8;margin-bottom:4px}
       #${ROOT_ID} .pbsw-feed-top{display:flex;gap:7px;align-items:flex-start}
       #${ROOT_ID} .pbsw-feed-title{font-weight:800;text-decoration:none;line-height:1.35;overflow-wrap:anywhere;flex:1}
       #${ROOT_ID} .pbsw-feed-metric{font-size:11px;color:#755096;white-space:nowrap;font-weight:700}
