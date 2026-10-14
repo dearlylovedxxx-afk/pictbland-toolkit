@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.26
+// @version      0.3.27
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1414,7 +1414,7 @@
     const count=match?Number(match[2].replace(/[０-９]/g,ch=>String.fromCharCode(ch.charCodeAt(0)-0xFEE0)).replace(/[,，]/g,'')):0;
     const kind=match?.[1]||(prefix.match(/(?:^|\s)(小説|アルバム|イラスト|漫画)(?=\s|[：:])/u)?.[1]||'');
     return {workType:kind,characterCount:kind==='小説'&&count>0?count:null,
-      imageCount:kind!=='小説'&&count>0?count:null};
+      imageCount:kind==='イラスト'&&!count?1:kind!=='小説'&&count>0?count:null};
   }
 
   function formatWorkLabel(work) {
