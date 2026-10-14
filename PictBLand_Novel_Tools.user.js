@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.27
+// @version      0.3.28
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1355,7 +1355,9 @@
         const u = new URL(a.getAttribute('href') || '', location.origin);
         if (!/^\/users\/[^/]+\/?$/.test(u.pathname)) continue;
         const name = compactText(a.textContent);
-        if (name && !/^(?:一般会員|プレミアム会員|会員|ユーザー|プロフィール)$/.test(name)) return {name, href:u.pathname};
+        if (name && !/^(?:一般会員|プレミアム会員|会員|ユーザー|プロフィール|ホーム|マイページ|ログイン|新着|設定)$/.test(name)
+          && !a.closest('nav,header,footer,aside,[class*="navigation" i],[class*="menu" i]'))
+          return {name, href:u.pathname};
       } catch {}
     }
     return {name:'', href:''};
@@ -1373,6 +1375,63 @@
     if(t.length<2||t.length>2400||isBoilerplateCaption(t)||/^(投稿日|更新日|ステキ|ブクマ|ブックマーク|タグ|閲覧|コメントを投稿|プロフィール表示|プレミアムサービス)/.test(t))return '';
     return t;
   }
+
+  // Read individual text nodes in title-to-tag order. The 2026 result
+  // cards often place their description inside nested spans without
+  // a caption/description class.
+  function captionFromOrderedNodes(nodes,title,author,tags){
+    const normalizedTitle=compactText(title);
+    if(!normalizedTitle||/^作品\s*\d+$/.test(normalizedTitle))return '';
+    const start=nodes.findIndex(row=>row.text===normalizedTitle
+      || (row.text.includes(normalizedTitle) && row.text.length<normalizedTitle.length+35));
+    if(start<0)return '';
+    const pieces=[];
+    let visited=0;
+    for(let i=start+1;i<nodes.length&&visited<40;i++,visited++){
+      const row=nodes[i],t=compactText(row.text);
+      if(!t)continue;
+      if(row.role==='tag'||row.role==='author'||row.role==='next-work'){
+        if(pieces.length)break;
+        continue;
+      }
+      if(row.role==='action')continue;
+      if(/^(?:ホーム|一般会員|プレミアム会員|フォロ限|鍵付|R[-‐]?18(?:G)?|作品を見る|ブクマ|ステキ!?|コメント|通報|投稿者|もっと見る|続きを見る|新着|人気順)$/.test(t))continue;
+      if(/^20\d{2}[\/.-]\d{1,2}[\/.-]\d{1,2}|^(?:小説|イラスト|アルバム|漫画)\s*[：:]/.test(t))continue;
+      if(/^#\S+(?:\s+#\S+)*$/.test(t)) {if(pieces.length)break;continue;}
+      const valid=validCaption(t,title,author,tags);
+      if(!valid || valid.length<4 || valid.length>800)continue;
+      if(valid===normalizedTitle||normalizedTitle.includes(valid))continue;
+      if(pieces.length && pieces.includes(valid))continue;
+      pieces.push(valid);
+      if(pieces.join(' ').length>=500||pieces.length>=6)break;
+    }
+    return validCaption(pieces.join(' '),title,author,tags);
+  }
+
+  function captionTextNodes(card){
+    if(!card)return [];
+    const doc=card.ownerDocument||document;
+    const walker=doc.createTreeWalker(card,NodeFilter.SHOW_TEXT);
+    const nodes=[];
+    let n;
+    for(let steps=0;(n=walker.nextNode())&&steps<450;steps++){
+      const el=n.parentElement;
+      if(!el||el.closest('script,style,template,svg,nav,header,footer,aside,form,[hidden]'))continue;
+      const text=compactText(n.nodeValue);
+      if(!text)continue;
+      const role=el.closest('a[href*="/tags/"]')?'tag'
+        :el.closest('a[href*="/users/"]')?'author'
+        :el.closest('a[href*="/items/"]')?'item-link'
+        :el.closest('button,[role="button"]')?'action':'text';
+      nodes.push({text,role,tag:el.tagName||'',className:String(el.className||'').slice(0,75)});
+    }
+    return nodes;
+  }
+
+  function captionFromSearchCard(card,title,author,tags){
+    return captionFromOrderedNodes(captionTextNodes(card),title,author,tags);
+  }
+
   function captionFrom(root,title,author,tags,detailPage=false) {
     // Search cards can contain the authored description directly, without
     // the .caption or .description class; avoid metadata from the site shell.
@@ -1465,7 +1524,7 @@
       authorHref:author.href,
       dateText:date.text,
       dateTime:date.time,
-      caption:captionFrom(card,title,author.name,tags),
+      caption:captionFrom(card,title,author.name,tags) || captionFromSearchCard(card,title,author.name,tags),
       ...format,
       tags,
       sukiCount:metricFromText(text,['ステキ!?','ステキ','いいね']),
@@ -1513,6 +1572,45 @@
     return {count:works.length,meaningful};
   }
 
+
+  // Optional on-demand diagnostic, no cookies, account tokens, entire HTML,
+  // request headers or cross-origin URLs are collected or transmitted.
+  const captionDiagnostics = new Map();
+  function rememberCaptionDiagnostic(card,work){
+    if(!card||!work||captionDiagnostics.size>=4||work.caption)return;
+    const nodes=captionTextNodes(card).slice(0,65);
+    captionDiagnostics.set(String(work.id),{
+      id:String(work.id),
+      title:String(work.title||''),
+      kind:formatWorkLabel(work),
+      cardTag:card.tagName,
+      cardClass:String(card.className||'').slice(0,120),
+      textNodes:nodes.map(n=>({t:n.text.slice(0,130),role:n.role,tag:n.tag,cls:n.className})),
+      captionAlgorithm:'v0.3.28-title-to-tag'
+    });
+  }
+
+  function copyCaptionDiagnostics(){
+    const records=[...captionDiagnostics.values()];
+    if(!records.length){
+      alert('診断データがありません。「更新」を押して作品を再取得してから試してください。');
+      return;
+    }
+    const text=JSON.stringify({version:'0.3.28',captions:records},null,2);
+    const fallback=()=>{
+      const box=document.createElement('textarea');
+      box.value=text;
+      box.readOnly=true;
+      box.style.cssText='position:fixed;inset:12%;width:76%;height:70%;z-index:2147483647;background:white;color:#222;padding:14px';
+      document.body.append(box);box.focus();box.select();
+      alert('診断データを選択しました。コピーして、このチャットに貼り付けてください。貼り付け前に作品の内容を確認できます。');
+      box.addEventListener('blur',()=>setTimeout(()=>box.remove(),2000),{once:true});
+    };
+    if(navigator.clipboard?.writeText){
+      navigator.clipboard.writeText(text).then(()=>alert('診断データをコピーしました。必要な内容だけチャットに貼り付けてください。')).catch(fallback);
+    }else fallback();
+  }
+
   function parseSearchPage(html, pageUrl, state) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
     const candidates = collectItemCandidates(doc);
@@ -1549,8 +1647,11 @@
       } catch {}
       if (anchor?.matches?.('a[href]') && !anchors.includes(anchor)) anchors.unshift(anchor);
 
-      if (card || anchor) works.push(normalizeSearchWork(card || anchor,anchors,id,state,orderIndex++));
-      else works.push(minimalSearchWork(id,state,orderIndex++));
+      if (card || anchor) {
+        const work=normalizeSearchWork(card || anchor,anchors,id,state,orderIndex++);
+        works.push(work);
+        rememberCaptionDiagnostic(card||anchor,work);
+      } else works.push(minimalSearchWork(id,state,orderIndex++));
     }
 
     const pageText = compactText(doc.body?.textContent || '');
@@ -2298,7 +2399,7 @@
   }
 
   async function refreshFeed(force = false) {
-    if (force) { searchPageCache.clear(); detailHtmlCache.clear(); }
+    if (force) { searchPageCache.clear(); detailHtmlCache.clear(); captionDiagnostics.clear(); }
     const rows = readSaved();
     feedAbort?.abort();
     feedAbort = new AbortController();
@@ -2527,6 +2628,7 @@
           <button type="button" class="pbsw-feed-back">← 保存検索へ</button>
           <h2>🆕 保存検索の新着</h2>
           <button type="button" class="pbsw-feed-refresh">更新</button>
+          <button type="button" class="pbsw-feed-diagnose">🔎 取得診断をコピー</button>
           <div class="pbsw-feed-status"></div>
           <div class="pbsw-feed-coverage"></div>
           <div class="pbsw-feed-errors" hidden></div>
@@ -2555,6 +2657,7 @@
     root.querySelector('.pbsw-newest-open').addEventListener('click',openFeed);
     root.querySelector('.pbsw-feed-back').addEventListener('click',closeFeed);
     root.querySelector('.pbsw-feed-refresh').addEventListener('click',()=>void refreshFeed(true));
+    root.querySelector('.pbsw-feed-diagnose').addEventListener('click',copyCaptionDiagnostics);
     root.querySelector('.pbsw-feed-exclude-apply').addEventListener('click',applyExcludeInput);
     root.querySelector('.pbsw-feed-exclude-input').addEventListener('keydown',e=>{
       if(e.key==='Enter'){e.preventDefault();applyExcludeInput();}
