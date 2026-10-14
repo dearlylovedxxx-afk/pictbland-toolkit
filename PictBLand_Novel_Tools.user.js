@@ -1640,6 +1640,7 @@
       },12000);
 
       iframe.addEventListener('load',()=>{
+        const loadedAt=Date.now();
         let stableTicks=0;
         let lastCount=-1;
         poll=setInterval(()=>{
@@ -1667,7 +1668,14 @@
 
             // Wait a little after dynamic rendering settles. An actually empty
             // result page can finish without any item links.
-            if((count>0&&stableTicks>=3)||(isEmpty&&stableTicks>=2)){
+            // Prevent resolving on IDs in an early SPA shell before the
+            // actual work-card text and metadata have rendered.
+            const waited=Date.now()-loadedAt;
+            const named=[...doc.querySelectorAll('a[href*="/items/detail/"]')]
+              .filter(a=>compactText(a.textContent||'').length>=4).length;
+            if((count>0&&stableTicks>=3&&waited>=2200
+                  && (named>0||waited>=6500))
+               ||(isEmpty&&stableTicks>=2)){
               try{iframe.contentWindow?.scrollTo?.(0,0);}catch{}
               let html=doc.documentElement.outerHTML;
               try {
@@ -1989,18 +1997,26 @@
     const tags=tagsFrom(doc);
     if(tags.length)work.tags=tags;
     const author=authorFrom(doc);
-    if(author.name){work.authorName=author.name;work.authorHref=author.href;}
+    if(author.name && !work.authorName){work.authorName=author.name;work.authorHref=author.href;}
     const ogTitle=compactText(doc.querySelector('meta[property="og:title"]')?.getAttribute('content'));
     const headingTitle=compactText(doc.querySelector('h1,h2,[class*="title"],[class*="subject"]')?.textContent);
     const title=headingTitle || ogTitle;
-    if(title && !/pictBLand|一般会員|プレミアム会員/i.test(title))
+    // Never let an incomplete detail-page shell overwrite a correct result
+    // card title already visible to the user.
+    if((!work.title || work.title==='作品 '+work.id)
+      && title && !/pictBLand|一般会員|プレミアム会員/i.test(title))
       work.title=title.replace(/\\s*[|｜-]\\s*pictBLand.*$/i,'').trim()||work.title;
     const ogImage=doc.querySelector('meta[property="og:image"]')?.getAttribute('content')||'';
     if(!work.thumb && ogImage && !isBoilerplateCaption(ogTitle)) {
       try{work.thumb=new URL(ogImage,response.url).href;}catch{}
     }
     const date=dateFrom(doc);
-    if(date.time){work.dateTime=date.time;work.dateText=date.text;}
+    if(date.time && !work.dateTime){work.dateTime=date.time;work.dateText=date.text;}
+    const original=doc.body?.textContent||'';
+    const cardType=workFormatFromCard({textContent:original.slice(0,300)});
+    if(!work.workType && cardType.workType)work.workType=cardType.workType;
+    if(work.characterCount==null && cardType.characterCount!=null)work.characterCount=cardType.characterCount;
+    if(work.imageCount==null && cardType.imageCount!=null)work.imageCount=cardType.imageCount;
     // Never use <meta name=description>, <meta property=og:description> or
     // search page promotional excerpts as authored work captions.
     work.caption=caption || validCaption(work.caption,work.title,work.authorName,work.tags);
