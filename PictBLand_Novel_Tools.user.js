@@ -1455,7 +1455,7 @@
         if(p.closest('nav,header,footer,aside,form,[class*="profile" i]'))continue;
         const text=validCaption(p.textContent,title,author,tags);
         if(text && text.length>=4 && text.length<=1200
-          && text!==compactText(title) && !/^(?:20\\d{2}[\\/.-]\\d|小説[：:]|アルバム[：:]|イラスト[：:]|漫画[：:])/.test(text))
+          && text!==compactText(title) && !/^(?:小説|アルバム|イラスト|漫画)[：:]/.test(text))
           return text;
       }
     }
