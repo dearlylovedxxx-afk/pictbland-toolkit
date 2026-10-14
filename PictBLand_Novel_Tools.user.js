@@ -1374,40 +1374,55 @@
     return t;
   }
   function captionFrom(root,title,author,tags,detailPage=false) {
-    // Only work-specific DOM regions count. A broad meta description or a
-    // random paragraph elsewhere in the page is not proof of a caption.
-    const explicit=[
-      '[itemprop="description"]','[data-role="caption"]',
-      '[data-testid*="caption" i]','[data-testid*="description" i]',
-      '[class*="item-caption" i]','[class*="item_caption" i]',
-      '[class*="item-description" i]','[class*="item_description" i]',
+    // Search cards can contain the authored description directly, without
+    // the .caption or .description class; avoid metadata from the site shell.
+    const exact=[
+      '[itemprop="description"]','[data-role="caption"]','[data-testid*="caption" i]',
+      '[data-testid*="description" i]','[class*="item-caption" i]',
+      '[class*="item_description" i]','[class*="item-description" i]',
       '[class*="work-caption" i]','[class*="work-description" i]',
       '[class*="post-caption" i]','[class*="post-description" i]',
       '[class*="item-comment" i]','[id*="item-caption" i]',
       '[id*="item-description" i]','[class*="caption" i]','[id*="caption" i]'
     ];
-    const ignore='header,footer,nav,aside,form,[class*="profile" i],[class*="recommend" i],[class*="welcome" i],[class*="footer" i],[class*="sidebar" i]';
-    for(const selector of explicit){
-      for(const el of root?.querySelectorAll?.(selector)||[]){
-        if(el.closest?.(ignore))continue;
-        const value=validCaption(el.textContent,title,author,tags);
-        if(value)return value;
-      }
+    const ignore='header,footer,nav,aside,form,[class*="profile" i],[class*="recommend" i],[class*="welcome" i],[class*="sidebar" i]';
+    for(const selector of exact)for(const el of root?.querySelectorAll?.(selector)||[]){
+      if(el.closest?.(ignore))continue;
+      const text=validCaption(el.textContent,title,author,tags);
+      if(text)return text;
     }
-    // A search result card belongs to a single work. For entire detail pages,
-    // restrict generic paragraphs to the item body to avoid bios, footers,
-    // novel text and site advertising.
     const scope=detailPage
       ?root?.querySelector?.('main article,main [class*="item-detail" i],main [class*="work-detail" i],article[class*="item" i]')
       :root;
+    if(!scope)return '';
     const candidates=[];
-    for(const el of scope?.querySelectorAll?.('p,[class*="description" i],[class*="summary" i]')||[]){
-      if(el.closest?.(ignore))continue;
-      const value=validCaption(el.textContent,title,author,tags);
-      if(value&&value.length<=800)candidates.push(value);
+    for(const el of scope.querySelectorAll(detailPage?'p,[class*="description" i],[class*="summary" i]':'p,div,span')){
+      if(el.closest?.(ignore)||el.children.length>2)continue;
+      if(el.querySelector('a[href*="/tags/"],a[href*="/users/"],a[href*="/items/"]'))continue;
+      const text=validCaption(el.textContent,title,author,tags);
+      if(!text||text.length<8||text.length>800||text.startsWith(compactText(title)))continue;
+      if(/(?:小説|アルバム|イラスト|漫画)\s*[：:]\s*[0-9０-９,，]+/.test(text))continue;
+      if(/^(?:20\d{2}[\/.-]\d|フォロ限|鍵付|R18|一般会員|プレミアムサービス)/.test(text))continue;
+      candidates.push(text);
     }
     return candidates.sort((a,b)=>b.length-a.length)[0]||'';
   }
+
+  function workFormatFromCard(card) {
+    const prefix=compactText(card?.textContent||'').slice(0,250);
+    const match=prefix.match(/(小説|アルバム|イラスト|漫画)\s*[：:]\s*([0-9０-９,，]+)\s*(文字|枚)/);
+    const count=match?Number(match[2].replace(/[０-９]/g,ch=>String.fromCharCode(ch.charCodeAt(0)-0xFEE0)).replace(/[,，]/g,'')):0;
+    const kind=match?.[1]||(prefix.match(/(?:^|\s)(小説|アルバム|イラスト|漫画)(?=\s|[：:])/u)?.[1]||'');
+    return {workType:kind,characterCount:kind==='小説'&&count>0?count:null,
+      imageCount:kind!=='小説'&&count>0?count:null};
+  }
+
+  function formatWorkLabel(work) {
+    if(!work?.workType)return '';
+    const count=work.workType==='小説'?work.characterCount:work.imageCount;
+    return work.workType+(count==null?'':'・'+Number(count).toLocaleString('ja-JP')+(work.workType==='小説'?'文字':'枚'));
+  }
+
   function minimalSearchWork(id, state, orderIndex) {
     return {
       id:String(id),
