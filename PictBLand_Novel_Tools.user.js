@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.28
+// @version      0.3.29
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1350,6 +1350,22 @@
   }
 
   function authorFrom(rootNode) {
+    // Native 2026 search result cards use <a class="item-card__author">.
+    // Their author URLs are not guaranteed to use the old /users/... form.
+    const nativeAuthor=rootNode?.querySelector?.('a.item-card__author,[class*="item-card__author"] a[href]');
+    if(nativeAuthor) {
+      const name=compactText(nativeAuthor.textContent);
+      const invalid=/^(?:一般会員|プレミアム会員|会員|ユーザー|プロフィール|ホーム|マイページ|ログイン|新着|設定)$/;
+      if(name && !invalid.test(name)){
+        let href='';
+        try {
+          const url=new URL(nativeAuthor.getAttribute('href')||'',location.origin);
+          if(url.origin===location.origin && !['/','/home','/login'].includes(url.pathname))
+            href=url.pathname+url.search;
+        }catch{}
+        return {name,href};
+      }
+    }
     for (const a of rootNode?.querySelectorAll?.('a[href]') || []) {
       try {
         const u = new URL(a.getAttribute('href') || '', location.origin);
@@ -1429,6 +1445,20 @@
   }
 
   function captionFromSearchCard(card,title,author,tags){
+    // The real article.history-work-card.item-card puts the visible
+    // description in a plain <p> immediately after a.item-card__link.
+    // Only trust paragraphs inside a single native work card.
+    if(card?.matches?.('article.history-work-card.item-card,article.item-card')
+      || card?.querySelector?.('a.item-card__link')){
+      const paragraphs=card.querySelectorAll('p');
+      for(const p of paragraphs){
+        if(p.closest('nav,header,footer,aside,form,[class*="profile" i]'))continue;
+        const text=validCaption(p.textContent,title,author,tags);
+        if(text && text.length>=4 && text.length<=1200
+          && text!==compactText(title) && !/^(?:20\\d{2}[\\/.-]\\d|小説[：:]|アルバム[：:]|イラスト[：:]|漫画[：:])/.test(text))
+          return text;
+      }
+    }
     return captionFromOrderedNodes(captionTextNodes(card),title,author,tags);
   }
 
@@ -1524,7 +1554,7 @@
       authorHref:author.href,
       dateText:date.text,
       dateTime:date.time,
-      caption:captionFrom(card,title,author.name,tags) || captionFromSearchCard(card,title,author.name,tags),
+      caption:captionFromSearchCard(card,title,author.name,tags) || captionFrom(card,title,author.name,tags),
       ...format,
       tags,
       sukiCount:metricFromText(text,['ステキ!?','ステキ','いいね']),
@@ -1579,6 +1609,9 @@
   function rememberCaptionDiagnostic(card,work){
     if(!card||!work||captionDiagnostics.size>=4||work.caption)return;
     const nodes=captionTextNodes(card).slice(0,65);
+    // Skip empty anonymous divs when a real article card is available.
+    if(!nodes.length || (!card.matches?.('article.item-card,article.history-work-card.item-card')
+      && nodes.length<3))return;
     captionDiagnostics.set(String(work.id),{
       id:String(work.id),
       title:String(work.title||''),
