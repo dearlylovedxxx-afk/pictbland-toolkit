@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.34
+// @version      0.3.35
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -210,6 +210,21 @@
       throw new Error('本文の表示設定が見つからないため、自動抽出できませんでした');
     const dropLine = /^(?:ステキ[!！]?|非公開ステキ|コメント|コメントする|コメントを投稿|表紙を表示|小説のみ表示|表示設定|文字サイズ|行間|縦書き|横書き|閉じる|作品を通報|いいね|ブックマーク|シェア|ツール|pictBLandツール|小説TXT|画像保存|保存検索|Niji Cloud|メニュー|︙|…|次頁|前頁|次ページ|前ページ)$/;
     const endAt = /^(?:コメント一覧|感想一覧|作品へのコメント|関連作品|おすすめ作品|この作者の作品|他の作品|タグ一覧|作品情報|ページの先頭へ|プライバシーポリシー|利用規約)$/;
+    // pictBLand's 2026 reader mounts the display-options popover in the
+    // document even when the panel is collapsed. Some text nodes are combined:
+    // "フォント：標準フォント：ゴシックフォント：明朝".
+    // Match the COMPLETE UI line, not prose mentioning a font or line spacing.
+    const uiGroup = /^(?:(?:文字(?:サイズ)?|テキストサイズ)[：:](?:小|中|大|特大|標準)|フォント[：:](?:標準フォント|ゴシックフォント|明朝フォント|標準|ゴシック|明朝)|行間[：:](?:狭い|標準|広い)|(?:背景(?:色)?|文字色)[：:](?:白|黒|標準|ライト|ダーク|セピア))+$/;
+    const optionOnly = /^(?:文字(?:サイズ)?|テキストサイズ|フォント|行間|背景(?:色)?|文字色|小|中|大|特大|標準|標準フォント|ゴシック|ゴシックフォント|明朝|明朝フォント|狭い|広い|白|黒|ライト|ダーク|セピア)$/;
+    const isUiDisplaySetting = (line, beforeBody) => {
+      const normalized = String(line||'').normalize('NFKC')
+        .replace(/[\s\u00a0　]/g,'')
+        .replace(/：/g,':');
+      if (uiGroup.test(normalized)) return true;
+      // Standalone short options should only be dropped before the story;
+      // the same words may occur as legitimate prose later in the novel.
+      return beforeBody && optionOnly.test(normalized);
+    };
     let best = null;
     for (const start of starts) {
       let body = [];
@@ -220,6 +235,7 @@
         const t = short(line);
         if (endAt.test(t) && started) break;
         if (dropLine.test(t)) continue;
+        if (isUiDisplaySetting(t, !started)) continue;
         if (/^(?:ホーム|通知|検索|マイページ|フォロー|ブックマーク管理)$/.test(t) && !started) continue;
         if (/^本文\s*[0-9０-９]+\s*[\/／]\s*[0-9０-９]+\s*(?:頁|ページ)?$/.test(t)) break;
         if (t && (t.length >= 3 || /[。！？!?「」]/.test(t))) {
@@ -758,7 +774,7 @@
     bar.className = 'pbnt-bar';
 
     const title = document.createElement('strong');
-    title.textContent = '📖 pictBLand 小説TXT v0.3.34';
+    title.textContent = '📖 pictBLand 小説TXT v0.3.35';
 
     const restore = document.createElement('button');
     restore.type = 'button';
