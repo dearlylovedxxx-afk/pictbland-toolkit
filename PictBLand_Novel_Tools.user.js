@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.33
+// @version      0.3.34
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -63,7 +63,7 @@
   function renderedDocumentText() {
     const clone = document.body.cloneNode(true);
     clone.querySelectorAll(
-      'script,style,noscript,svg,canvas,iframe,#' + ROOT_ID + ',#' + BUTTON_ID
+      'script,style,noscript,svg,canvas,iframe,#' + ROOT_ID + ',#' + BUTTON_ID +       ',#pbi-root,#pbsw-root,#pictbland-tools-unified-bar,#pictbland-tools-unified-launch,#pictbland-tools-unified-placeholder'
     ).forEach(node => node.remove());
 
     clone.querySelectorAll('ruby').forEach(ruby => {
@@ -162,25 +162,88 @@
   }
 
   function extractPagesFromDocument() {
-    // A block-aware clone preserves novel line breaks. If the site counter
-    // has been split by CSS/layout wrappers, try the browser's visual text.
+    // Keep the existing paginated reader first, but the current pictBLand
+    // reader also supports continuous novels with NO "本文 1 / n" at all.
     const sources = [renderedDocumentText()];
     const visual = document.body?.innerText || '';
     if (visual && visual !== sources[0]) sources.push(visual);
-    let best = null;
+    let bestPaged = null;
+    let bestPlain = null;
     let lastError = null;
     for (const source of sources) {
       try {
         const result = extractPagesFromSnapshot(source);
         const score = result.availablePages * 1000000 +
           result.pages.reduce((sum,page)=>sum+page.length,0);
-        if (!best || score > best.score) best = {result,score};
+        if (!bestPaged || score > bestPaged.score) bestPaged = {result,score};
+      } catch (error) {
+        lastError = error;
+      }
+      try {
+        const result = extractUnpaginatedNovelFromSnapshot(source);
+        const score = result.pages[0].replace(/\s/g,'').length;
+        if (!bestPlain || score > bestPlain.score) bestPlain = {result,score};
       } catch (error) {
         lastError = error;
       }
     }
-    if (best) return best.result;
-    throw lastError || new Error('本文ページを取得できませんでした');
+    if (bestPaged) return bestPaged.result;
+    if (bestPlain) return bestPlain.result;
+    throw lastError || new Error('小説の本文を見つけられませんでした');
+  }
+
+  // Fallback for the 2026 single-scroll reader (no page counter).
+  // On the actual novel page, "表示設定" is the reader's last toolbar.
+  // Extract from immediately after that toolbar; do not take title, tags,
+  // novel description or toolbar labels as the author's story.
+  function extractUnpaginatedNovelFromSnapshot(snapshot) {
+    const lines = normalizeNewlines(snapshot).split('\n');
+    const short = value => String(value||'').replace(/\u00a0/g,' ').replace(/[ \t　]+/g,' ').trim();
+    const starts = [];
+    for(let i=0;i<lines.length;i++){
+      const line = short(lines[i]);
+      if (/^表示設定$/.test(line) ||
+          (line.startsWith('表示設定') && line.length<=14 && !line.includes('設定を変更')))
+        starts.push(i);
+    }
+    if(!starts.length)
+      throw new Error('本文の表示設定が見つからないため、自動抽出できませんでした');
+    const dropLine = /^(?:ステキ[!！]?|非公開ステキ|コメント|コメントする|コメントを投稿|表紙を表示|小説のみ表示|表示設定|文字サイズ|行間|縦書き|横書き|閉じる|作品を通報|いいね|ブックマーク|シェア|ツール|pictBLandツール|小説TXT|画像保存|保存検索|Niji Cloud|メニュー|︙|…|次頁|前頁|次ページ|前ページ)$/;
+    const endAt = /^(?:コメント一覧|感想一覧|作品へのコメント|関連作品|おすすめ作品|この作者の作品|他の作品|タグ一覧|作品情報|ページの先頭へ|プライバシーポリシー|利用規約)$/;
+    let best = null;
+    for (const start of starts) {
+      let body = [];
+      let proseChars = 0;
+      let started = false;
+      for (let i=start+1;i<lines.length;i++) {
+        const line = String(lines[i]||'').replace(/[ \t]+$/g,'');
+        const t = short(line);
+        if (endAt.test(t) && started) break;
+        if (dropLine.test(t)) continue;
+        if (/^(?:ホーム|通知|検索|マイページ|フォロー|ブックマーク管理)$/.test(t) && !started) continue;
+        if (/^本文\s*[0-9０-９]+\s*[\/／]\s*[0-9０-９]+\s*(?:頁|ページ)?$/.test(t)) break;
+        if (t && (t.length >= 3 || /[。！？!?「」]/.test(t))) {
+          started = true;
+          proseChars += t.replace(/\s/g,'').length;
+        }
+        body.push(line);
+      }
+      // Don't treat a blank/locked novel or a UI-only fragment as saved text.
+      const text = cleanupPlainText(body.join('\n'),3);
+      if (proseChars < 50 || text.replace(/\s/g,'').length < 50) continue;
+      const result = {
+        pages:[text],
+        markerTotal:0,
+        markerCount:0,
+        availablePages:1,
+        missingPages:[],
+        extractionMode:'continuous-unpaginated'
+      };
+      const score = text.length;
+      if (!best || score > best.score) best = {result,score};
+    }
+    if(best) return best.result;
+    throw new Error('ページ番号がない本文の開始・終了を特定できませんでした');
   }
 
   function extractPagesFromSnapshot(snapshot) {
@@ -618,10 +681,12 @@
       if (titleInput) titleInput.value = title;
       drawPages(original.pages);
       const totalChars = original.pages.reduce((sum, page) => sum + Array.from(page).length, 0);
-      statusNode.textContent = extracted.missingPages.length
-        ? `⚠️ 本文${extracted.markerTotal}頁のうち${extracted.availablePages}頁のみ取得（未取得：${extracted.missingPages.join('、')}頁）。TXTは取得済み部分だけです。次頁を開いて再取得してください。取得済み${totalChars.toLocaleString('ja-JP')}字`
-        : `取得成功：${extracted.availablePages}ページ／${totalChars.toLocaleString('ja-JP')}字` +
-          `（ページ区切り ${extracted.markerCount}個検出）`;
+      statusNode.textContent = extracted.extractionMode === 'continuous-unpaginated'
+        ? `本文を直接抽出：${totalChars.toLocaleString('ja-JP')}字（ページ番号なし）。本文の末尾まで入っているかプレビューで確認してから保存してください。`
+        : extracted.missingPages.length
+          ? `⚠️ 本文${extracted.markerTotal}頁のうち${extracted.availablePages}頁のみ取得（未取得：${extracted.missingPages.join('、')}頁）。TXTは取得済み部分だけです。次頁を開いて再取得してください。取得済み${totalChars.toLocaleString('ja-JP')}字`
+          : `取得成功：${extracted.availablePages}ページ／${totalChars.toLocaleString('ja-JP')}字` +
+            `（ページ区切り ${extracted.markerCount}個検出）`;
     } catch (err) {
       original = null;
       statusNode.textContent = `取得失敗：${err?.message || err}`;
@@ -693,7 +758,7 @@
     bar.className = 'pbnt-bar';
 
     const title = document.createElement('strong');
-    title.textContent = '📖 pictBLand 小説TXT v0.3.33';
+    title.textContent = '📖 pictBLand 小説TXT v0.3.34';
 
     const restore = document.createElement('button');
     restore.type = 'button';
