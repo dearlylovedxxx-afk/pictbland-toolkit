@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.31
+// @version      0.3.32
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -121,7 +121,7 @@
     const compact = String(line || '').replace(/\u00a0/g, ' ').trim();
     if (!compact || compact.length > 100) return null;
 
-    const match = compact.match(/(\d+)\s*\/\s*(\d+)/);
+    const match = compact.match(/^(?:本文\s*)?(\d+)\s*\/\s*(\d+)\s*(?:頁|ページ|p(?:age)?)?$/i);
     if (!match) return null;
 
     const page = Number(match[1]);
@@ -130,20 +130,24 @@
       return null;
     }
 
-    const rest = compact
-      .replace(match[0], '')
-      .replace(/[|｜・·\s]/g, '');
-    if (rest && !/^(?:前のページ)?(?:次のページ)?$/.test(rest)) return null;
-
     return { page, total };
   }
 
   function cleanExtractedSegment(lines) {
-    const navOnly = /^(?:前のページ|次のページ|前頁|次頁|前へ|次へ|作品に戻る|縦狭|縦普|縦広|横極|横狭|横普|無|ゴ|明)(?:\s*[>＞›»〈<])?$/;
-    const out = lines
-      .map(line => String(line || '').replace(/[ \t]+$/g, ''))
-      .filter(line => !navOnly.test(line.trim()));
-
+    const navOnly = /^(?:前のページ|次のページ|前頁|次頁|次ページ|前へ|次へ|作品に戻る|縦狭|縦普|縦広|横極|横狭|横普|無|ゴ|明)(?:\s*[>＞›»〈<])?$/;
+    // The 2026 viewer may mount only the current page. Do not take the
+    // site footer, action bar or recommendation cards as novel text.
+    const footer = /^(?:ステキ[!！]?|非公開ステキ|コメント(?:を投稿)?|作品を通報|表紙を表示|小説のみ表示|ブックマーク(?:に追加)?|シェアする|共有する|pictBLandツール)$/;
+    const out = [];
+    let hasBody = false;
+    for (const line of lines) {
+      const cleaned = String(line || '').replace(/[ \t]+$/g, '');
+      const trimmed = cleaned.trim();
+      if (navOnly.test(trimmed)) continue;
+      if (hasBody && footer.test(trimmed)) break;
+      out.push(cleaned);
+      if (trimmed.length > 1) hasBody = true;
+    }
     return cleanupPlainText(out.join('\n'), 3);
   }
 
@@ -225,7 +229,9 @@
     return {
       pages,
       markerTotal: chosen.total,
-      markerCount: chosenMarkers.length
+      markerCount: chosenMarkers.length,
+      availablePages: pages.filter(Boolean).length,
+      missingPages: pages.map((value,index)=>value?'':index+1).filter(Boolean)
     };
   }
 
@@ -531,7 +537,9 @@
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 30000);
-    statusNode.textContent = 'TXTをダウンロードしました。';
+    statusNode.textContent = original.incompletePages?.length
+      ? '⚠️ 取得済み部分のみTXTに保存しました。未取得ページ：' + original.incompletePages.join('、') + '頁'
+      : 'TXTをダウンロードしました。';
   }
 
   async function shareText() {
@@ -572,15 +580,17 @@
         title,
         author,
         pages: extracted.pages.map(normalizePictMarkup),
+        incompletePages: extracted.missingPages,
         url: location.href
       };
 
       if (titleInput) titleInput.value = title;
       drawPages(original.pages);
       const totalChars = original.pages.reduce((sum, page) => sum + Array.from(page).length, 0);
-      statusNode.textContent =
-        `取得成功：${original.pages.length}ページ／${totalChars.toLocaleString('ja-JP')}字` +
-        `（ページ区切り ${extracted.markerCount}個検出）`;
+      statusNode.textContent = extracted.missingPages.length
+        ? `⚠️ 本文${extracted.markerTotal}頁のうち${extracted.availablePages}頁のみ取得（未取得：${extracted.missingPages.join('、')}頁）。TXTは取得済み部分だけです。次頁を開いて再取得してください。取得済み${totalChars.toLocaleString('ja-JP')}字`
+        : `取得成功：${extracted.availablePages}ページ／${totalChars.toLocaleString('ja-JP')}字` +
+          `（ページ区切り ${extracted.markerCount}個検出）`;
     } catch (err) {
       original = null;
       statusNode.textContent = `取得失敗：${err?.message || err}`;
@@ -845,6 +855,7 @@
     return {...parsed, works:(parsed.works || []).map(work => ({
       ...work,
       tags:[...(work.tags || [])],
+      accessBadges:[...(work.accessBadges || [])],
       matches:new Set([state.row?.name || state.row?.word || '保存検索']),
       detailLoaded:false,
       detailLoading:false,
@@ -1512,6 +1523,55 @@
     return work.workType+(count==null?'':'・'+Number(count).toLocaleString('ja-JP')+(work.workType==='小説'?'文字':'枚'));
   }
 
+
+  // Visibility/rating badges are distinct from user-defined tags.
+  // Only read the card header or explicit badge-like nodes; never infer
+  // these from an unrelated caption mentioning "R18"/"鍵付".
+  function accessBadgesFromCard(card, title = '') {
+    if (!card) return [];
+    const whole = compactText(card.textContent || '');
+    const cleanTitle = compactText(title);
+    const titleAt = cleanTitle ? whole.indexOf(cleanTitle) : -1;
+    const header = titleAt >= 0 && titleAt <= 300
+      ? whole.slice(0, titleAt) : whole.slice(0, 95);
+    const samples = [header];
+    for (const node of card.querySelectorAll?.('[class*="badge" i],[class*="chip" i],[class*="rating" i],[class*="visibility" i],[class*="access" i],[class*="restrict" i],[class*="status" i],[class*="locked" i]') || []) {
+      const raw = compactText(node.textContent || '');
+      if (raw && raw.length <= 35 && !node.querySelector('a[href*="/tags/index/"]'))
+        samples.push(raw);
+    }
+    const content = samples.join(' ');
+    const names = [];
+    if (/(?:^|[^\w])R[-‐‑－]?18G(?=$|[^\w])/i.test(content)) names.push('R18G');
+    else if (/(?:^|[^\w])R[-‐‑－]?18(?=$|[^\w])/i.test(content)) names.push('R18');
+    if (/鍵付|鍵付き|パスワード限定/.test(content)) names.push('鍵付');
+    if (/フォロ限|フォロワー限定|フォロー限定/.test(content)) names.push('フォロ限');
+    const other = [
+      ['相互限',/相互限|相互フォロー限定/],
+      ['リスト限',/リスト限|リスト限定/],
+      ['マイ限',/マイピク限定|マイ限/],
+      ['期間限定',/期間限定公開|期間限定/],
+      ['全体公開',/全体公開/],
+    ];
+    for (const [label, re] of other) if (re.test(content)) names.push(label);
+    return names;
+  }
+
+  function updateFeedAccessBadges(holder, work) {
+    if (!holder) return;
+    holder.replaceChildren();
+    const labels = Array.isArray(work.accessBadges) ? work.accessBadges : [];
+    holder.hidden = !labels.length;
+    for (const label of labels) {
+      const chip = document.createElement('span');
+      chip.textContent = label;
+      if (/^R18/.test(label)) chip.className = 'age';
+      else if (label === '鍵付') chip.className = 'locked';
+      else chip.className = 'visibility';
+      holder.append(chip);
+    }
+  }
+
   function minimalSearchWork(id, state, orderIndex) {
     return {
       id:String(id),
@@ -1527,6 +1587,7 @@
       characterCount:null,
       imageCount:null,
       tags:[],
+      accessBadges:[],
       sukiCount:null,
       bookmarkCount:null,
       matches:new Set([state.row.name || state.row.word]),
@@ -1557,6 +1618,7 @@
       caption:captionFromSearchCard(card,title,author.name,tags) || captionFrom(card,title,author.name,tags),
       ...format,
       tags,
+      accessBadges:accessBadgesFromCard(card,title),
       sukiCount:metricFromText(text,['ステキ!?','ステキ','いいね']),
       bookmarkCount:metricFromText(text,['ブクマ','ブックマーク']),
       matches:new Set([state.row.name || state.row.word]),
@@ -1946,6 +2008,7 @@
       if (old.characterCount==null && work.characterCount!=null) old.characterCount=work.characterCount;
       if (old.imageCount==null && work.imageCount!=null) old.imageCount=work.imageCount;
       if (!old.tags.length && work.tags.length) old.tags = work.tags;
+      old.accessBadges = [...new Set([...(old.accessBadges||[]),...(work.accessBadges||[])])];
       if (!old.dateTime && work.dateTime) { old.dateTime = work.dateTime; old.dateText = work.dateText; }
       if (old.sukiCount == null && work.sukiCount != null) old.sukiCount = work.sukiCount;
       if (old.bookmarkCount == null && work.bookmarkCount != null) old.bookmarkCount = work.bookmarkCount;
@@ -2130,6 +2193,9 @@
     const bodyText=compactText(doc.body?.textContent||'');
     const tags=tagsFrom(doc);
     if(tags.length)work.tags=tags;
+    const detailedBadges=accessBadgesFromCard(doc.body,work.title);
+    if(detailedBadges.length)
+      work.accessBadges=[...new Set([...(work.accessBadges||[]),...detailedBadges])];
     const author=authorFrom(doc);
     if(author.name && !work.authorName){work.authorName=author.name;work.authorHref=author.href;}
     const ogTitle=compactText(doc.querySelector('meta[property="og:title"]')?.getAttribute('content'));
@@ -2279,6 +2345,9 @@
     kind.className='pbsw-feed-kind';
     kind.textContent=formatWorkLabel(work);
     kind.hidden=!kind.textContent;
+    const access = document.createElement('div');
+    access.className='pbsw-feed-access';
+    updateFeedAccessBadges(access,work);
 
     const top = document.createElement('div');
     top.className = 'pbsw-feed-top';
@@ -2329,7 +2398,7 @@
       matches.append(more);
     }
 
-    info.append(kind,top,author,date,caption,tags,matches);
+    info.append(kind,access,top,author,date,caption,tags,matches);
     card.append(thumb,info);
     return card;
   }
@@ -2347,6 +2416,7 @@
     if (title) title.textContent = work.title;
     const kind=card.querySelector('.pbsw-feed-kind');
     if(kind){kind.textContent=formatWorkLabel(work);kind.hidden=!kind.textContent;}
+    updateFeedAccessBadges(card.querySelector('.pbsw-feed-access'),work);
     const author = card.querySelector('.pbsw-feed-author');
     if (author) author.textContent = work.authorName || '作者不明';
     const date = card.querySelector('.pbsw-feed-date');
@@ -2609,6 +2679,11 @@
       #${ROOT_ID} .pbsw-feed-thumb img.empty{visibility:hidden}
       #${ROOT_ID} .pbsw-feed-info{padding:10px;min-width:0}
       #${ROOT_ID} .pbsw-feed-kind{font-size:11px;font-weight:800;color:#7356a8;margin-bottom:4px}
+      #${ROOT_ID} .pbsw-feed-access{display:flex;flex-wrap:wrap;gap:5px;margin:3px 0 7px}
+      #${ROOT_ID} .pbsw-feed-access[hidden]{display:none}
+      #${ROOT_ID} .pbsw-feed-access span{font-size:10px;font-weight:800;line-height:1.3;padding:3px 6px;border-radius:6px;background:#e8e9ed;color:#40444c}
+      #${ROOT_ID} .pbsw-feed-access span.age{background:#f9e8e8;color:#a44249}
+      #${ROOT_ID} .pbsw-feed-access span.locked{background:#2d2930;color:#fff}
       #${ROOT_ID} .pbsw-feed-top{display:flex;gap:7px;align-items:flex-start}
       #${ROOT_ID} .pbsw-feed-title{font-weight:800;text-decoration:none;line-height:1.35;overflow-wrap:anywhere;flex:1}
       #${ROOT_ID} .pbsw-feed-metric{font-size:11px;color:#755096;white-space:nowrap;font-weight:700}
