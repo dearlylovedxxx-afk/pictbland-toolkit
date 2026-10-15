@@ -1,14 +1,13 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.29
+// @version      0.3.30
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
 // @noframes
 // @grant        GM.download
 // @grant        GM.xmlhttpRequest
-// @require      https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js
 // @connect      pictbland.net
 // @connect      *.pictbland.net
 // @updateURL    https://raw.githubusercontent.com/dearlylovedxxx-afk/pictbland-toolkit/main/PictBLand_Novel_Tools.meta.js
@@ -3206,71 +3205,178 @@
   }
 
 
+  // ZIP STORE format: PNG bytes are already compressed, so no external
+  // library is required. Avoid synchronous zipSync and large regex recursion.
+  // UTF-8 file names are flagged explicitly (ZIP general purpose bit 11).
+  const zipCrcTable = (() => {
+    const table = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let j = 0; j < 8; j++) c = c & 1 ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      table[n] = c >>> 0;
+    }
+    return table;
+  })();
+
+  function zipCrc32(bytes) {
+    let crc = 0xffffffff;
+    for (let i = 0; i < bytes.length; i++) {
+      crc = zipCrcTable[(crc ^ bytes[i]) & 255] ^ (crc >>> 8);
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+
+  function makeStoreZipBlob(files) {
+    if (!files.length) throw new Error('ZIPに入れる画像がありません');
+    if (files.length > 65535) throw new Error('ZIPのファイル数上限を超えました');
+    const encoder = new TextEncoder();
+    const parts = [], central = [];
+    let offset = 0;
+    for (const {name, bytes} of files) {
+      const filename = encoder.encode(name);
+      const size = bytes.byteLength;
+      if (!filename.length || filename.length > 65535 || size > 0xffffffff ||
+          offset + 30 + filename.length + size > 0xffffffff) {
+        throw new Error('ZIPのサイズ上限（4GB）を超えました');
+      }
+      const crc = zipCrc32(bytes);
+      const local = new Uint8Array(30);
+      const lv = new DataView(local.buffer);
+      lv.setUint32(0, 0x04034b50, true); // local file header signature
+      lv.setUint16(4, 20, true);         // version to extract
+      lv.setUint16(6, 0x0800, true);     // UTF-8 file names
+      lv.setUint16(8, 0, true);          // STORED, no compression
+      lv.setUint32(14, crc, true);
+      lv.setUint32(18, size, true);
+      lv.setUint32(22, size, true);
+      lv.setUint16(26, filename.length, true);
+      parts.push(local, filename, bytes);
+
+      const directory = new Uint8Array(46);
+      const dv = new DataView(directory.buffer);
+      dv.setUint32(0, 0x02014b50, true); // central directory
+      dv.setUint16(4, 20, true);
+      dv.setUint16(6, 20, true);
+      dv.setUint16(8, 0x0800, true);
+      dv.setUint16(10, 0, true);
+      dv.setUint32(16, crc, true);
+      dv.setUint32(20, size, true);
+      dv.setUint32(24, size, true);
+      dv.setUint16(28, filename.length, true);
+      dv.setUint32(42, offset, true);
+      central.push(directory, filename);
+      offset += local.byteLength + filename.byteLength + size;
+    }
+    const directoryOffset = offset;
+    for (const chunk of central) {
+      offset += chunk.byteLength;
+      if (offset > 0xffffffff) throw new Error('ZIPのサイズ上限（4GB）を超えました');
+      parts.push(chunk);
+    }
+    const ending = new Uint8Array(22);
+    const v = new DataView(ending.buffer);
+    v.setUint32(0, 0x06054b50, true);  // end of central directory
+    v.setUint16(8, files.length, true);
+    v.setUint16(10, files.length, true);
+    v.setUint32(12, offset - directoryOffset, true);
+    v.setUint32(16, directoryOffset, true);
+    parts.push(ending);
+    return new Blob(parts, {type:'application/zip'});
+  }
+
+  let preparedZipUrl = '';
+  let zipBusy = false;
+  function clearPreparedZipLink() {
+    root?.querySelector('.pbi-zip-ready-link')?.remove();
+    if (preparedZipUrl) {
+      URL.revokeObjectURL(preparedZipUrl);
+      preparedZipUrl = '';
+    }
+  }
+
+  function offerZipDownload(blob, name) {
+    clearPreparedZipLink();
+    preparedZipUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.className = 'pbi-zip-ready-link';
+    link.href = preparedZipUrl;
+    link.download = name;
+    link.textContent = '⬇️ ZIPを保存（ダウンロードが始まらない場合はこちらをクリック）';
+    link.style.cssText = 'display:block;margin:8px auto 6px;max-width:980px;' +
+      'padding:10px 12px;background:#ebf7ee;border:1px solid #8ac89a;border-radius:9px;' +
+      'font-weight:700;color:#176e36;text-decoration:underline;cursor:pointer;';
+    statusNode.insertAdjacentElement('afterend', link);
+    // Browsers can reject programmatic downloads after asynchronous image
+    // conversion. Keep the real, user-clickable link until the next ZIP build.
+    try { link.click(); } catch (error) {
+      console.warn('[pictBLand][ZIP automatic download]', String(error));
+    }
+  }
+
   async function saveRowsAsZip(entries, zipName) {
+    clearPreparedZipLink();
     if (!entries.length) {
-      statusNode.textContent = 'ZIPに入れる画像がありません。';
+      statusNode.textContent = 'ZIPに入れる画像がありません。選択や保存範囲を確認してください。';
       return;
     }
 
-    if (!globalThis.fflate?.zipSync) {
-      statusNode.textContent = 'ZIP機能を読み込めませんでした。スクリプトを再読み込みしてください。';
-      return;
-    }
-
-    const files = {};
-    let ok = 0;
+    const files = [];
     let failed = 0;
-
+    let firstError = '';
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
-      statusNode.textContent =
-        'ZIP準備中… ' + (i + 1) + ' / ' + entries.length + '（PNG変換）';
-
+      statusNode.textContent = 'ZIP準備中… ' + (i + 1) + ' / ' + entries.length + '（画像をPNG変換）';
       try {
         const png = await getPngBlob(entry.row.url);
         const bytes = new Uint8Array(await png.arrayBuffer());
-        files[buildFileName(entry.index, found.length)] = bytes;
-        ok++;
-      } catch {
+        files.push({name:buildFileName(entry.index, found.length), bytes});
+      } catch (error) {
         failed++;
+        if (!firstError) firstError = String(error?.message || error || '取得失敗');
       }
-
-      // iOSでUIが固まらないように一度イベントループへ返す。
       await sleep(0);
     }
 
-    if (!ok) {
-      statusNode.textContent = 'ZIPに追加できる画像がありませんでした。';
+    if (!files.length) {
+      statusNode.textContent = 'ZIP作成失敗：画像を取得できませんでした。' +
+        (firstError ? ' 理由：' + firstError : '');
       return;
     }
+    statusNode.textContent = 'ZIP生成中… ' + files.length + '枚';
+    const zip = makeStoreZipBlob(files);
+    offerZipDownload(zip, zipName);
+    statusNode.textContent = 'ZIP準備完了：' + files.length + '枚（' +
+      (zip.size / 1024 / 1024).toFixed(1) + 'MB）' +
+      (failed ? '／取得失敗 ' + failed + '枚（' + firstError + '）' : '') +
+      '。ダウンロードが始まらない場合は下のリンクをクリックしてください。';
+  }
 
-    statusNode.textContent = 'ZIPを書き出し中… ' + ok + '枚';
-
+  async function runZipSave(button, entries, name) {
+    if (zipBusy) {
+      statusNode.textContent = '別のZIPを作成中です。完了までお待ちください。';
+      return;
+    }
+    zipBusy = true;
+    const buttons = [...root.querySelectorAll('.pbi-zip-selected, .pbi-zip-range')];
+    const original = button?.textContent;
+    for (const el of buttons) el.disabled = true;
+    if (button) button.textContent = '📦 ZIP作成中…';
     try {
-      // PNGは既に圧縮済みなのでZIP側はlevel 0。
-      // JSZipよりメモリ負荷と処理時間を抑えやすい。
-      const zipped = globalThis.fflate.zipSync(files, {level: 0});
-      const blob = new Blob([zipped], {type:'application/zip'});
-      await saveBlob(blob, zipName);
-
-      statusNode.textContent = failed
-        ? 'ZIP保存完了：' + ok + '枚／失敗 ' + failed + '枚'
-        : 'ZIP保存完了：' + ok + '枚';
-    } catch (err) {
-      statusNode.textContent =
-        'ZIP作成に失敗しました：' + (err?.message || err || '不明なエラー');
+      await saveRowsAsZip(entries, name);
+    } catch (error) {
+      statusNode.textContent = 'ZIP作成エラー：' + String(error?.message || error || '不明なエラー');
+      console.error('[pictBLand][ZIP]', error);
+    } finally {
+      zipBusy = false;
+      for (const el of buttons) el.disabled = false;
+      if (button && original) button.textContent = original;
     }
   }
 
   async function saveSelectedZip() {
     const entries = selectedRows().map(x => ({row:x.row,index:x.index}));
-    const btn = root?.querySelector('.pbi-zip-selected');
-    if (btn) btn.disabled = true;
-    try {
-      await saveRowsAsZip(entries, buildZipName('選択'));
-    } finally {
-      if (btn) btn.disabled = false;
-    }
+    const button = root?.querySelector('.pbi-zip-selected');
+    await runZipSave(button, entries, buildZipName('選択'));
   }
 
   async function saveRangeZip() {
@@ -3278,20 +3384,12 @@
       statusNode.textContent = '保存できる画像がありません。';
       return;
     }
-
     const {start, end} = readRange();
     const entries = found.slice(start - 1, end).map((row, offset) => ({
-      row,
-      index: start - 1 + offset
+      row, index: start - 1 + offset
     }));
-
-    const btn = root?.querySelector('.pbi-zip-range');
-    if (btn) btn.disabled = true;
-    try {
-      await saveRowsAsZip(entries, buildZipName(start + '-' + end));
-    } finally {
-      if (btn) btn.disabled = false;
-    }
+    const button = root?.querySelector('.pbi-zip-range');
+    await runZipSave(button, entries, buildZipName(start + '-' + end));
   }
 
   function selectedRows() {
