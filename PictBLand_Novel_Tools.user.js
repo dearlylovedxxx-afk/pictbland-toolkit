@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.30
+// @version      0.3.31
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
 // @noframes
 // @grant        GM.download
-// @grant        GM.xmlhttpRequest
+// @grant        GM.xmlHttpRequest
+// @grant        GM_xmlhttpRequest
 // @connect      pictbland.net
 // @connect      *.pictbland.net
 // @updateURL    https://raw.githubusercontent.com/dearlylovedxxx-afk/pictbland-toolkit/main/PictBLand_Novel_Tools.meta.js
@@ -3055,75 +3056,103 @@
     return base + (label ? '_' + label : '') + '.zip';
   }
 
+  // Use privileged userscript networking for image hosts: regular fetch is
+  // blocked by CORS on many pictBLand album images.
+  // Tampermonkey/Violentmonkey: GM.xmlHttpRequest and/or GM_xmlhttpRequest.
+  // Older Macaque builds may expose GM.xmlhttpRequest (lowercase r).
   function gmXhrBlob(url) {
-    const fn = globalThis.GM?.xmlhttpRequest || globalThis.GM?.xmlHttpRequest;
-    if (typeof fn !== 'function') return Promise.reject(new Error('GM.xmlhttpRequest が利用できません'));
+    const gm = globalThis.GM;
+    const modern = typeof gm?.xmlHttpRequest === 'function'
+      ? gm.xmlHttpRequest.bind(gm)
+      : typeof gm?.xmlhttpRequest === 'function'
+        ? gm.xmlhttpRequest.bind(gm)
+        : null;
+    const legacy = typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : null;
+    const request = modern || legacy;
+    if (!request) return Promise.reject(new Error(
+      'ユーザースクリプトの画像取得権限が利用できません（GM.xmlHttpRequest / GM_xmlhttpRequest）'
+    ));
 
     return new Promise((resolve, reject) => {
       let settled = false;
       const done = (ok, value) => {
         if (settled) return;
         settled = true;
-        ok ? resolve(value) : reject(value instanceof Error ? value : new Error(String(value || '取得失敗')));
+        clearTimeout(timer);
+        if (ok) resolve(value);
+        else reject(value instanceof Error ? value : new Error(String(value || '画像取得失敗')));
       };
-
-      const timer = setTimeout(() => done(false, new Error('画像取得がタイムアウトしました')), 45000);
-
+      const timer = setTimeout(
+        () => done(false, new Error('画像取得が45秒でタイムアウトしました')), 45000
+      );
+      const acceptResponse = res => {
+        if (settled) return;
+        const status = Number(res?.status || 0);
+        if (status < 200 || status >= 300) {
+          done(false, new Error('画像サーバーの応答：HTTP ' + (status || '不明')));
+          return;
+        }
+        const data = res?.response;
+        const blob = data instanceof Blob ? data
+          : data instanceof ArrayBuffer ? new Blob([data])
+          : ArrayBuffer.isView(data) ? new Blob([data])
+          : null;
+        if (blob?.size) done(true, blob);
+        else done(false, new Error('通信は成功しましたが画像データが空でした'));
+      };
       try {
-        const maybe = fn({
+        const result = request({
           method: 'GET',
           url,
           responseType: 'blob',
+          timeout: 45000,
           anonymous: false,
-          nocache: true,
-          headers: {
-            Referer: location.href
-          },
-          onload: res => {
-            clearTimeout(timer);
-            if (res.status >= 200 && res.status < 300 && res.response) done(true, res.response);
-            else done(false, new Error('HTTP ' + res.status));
-          },
-          onerror: err => {
-            clearTimeout(timer);
-            done(false, new Error(err?.error || err?.message || '画像取得に失敗しました'));
-          },
-          ontimeout: () => {
-            clearTimeout(timer);
-            done(false, new Error('画像取得がタイムアウトしました'));
-          }
+          // pictBLand sometimes checks the detail page as referer.
+          headers: {Referer: location.href},
+          onload: acceptResponse,
+          onerror: err => done(false, new Error(String(
+            err?.error || err?.message || '拡張機能から画像サーバーに接続できません'
+          ))),
+          ontimeout: () => done(false, new Error('画像サーバーの応答がタイムアウトしました'))
         });
-        if (maybe && typeof maybe.then === 'function') {
-          maybe.then(res => {
-            if (settled) return;
-            clearTimeout(timer);
-            if (res?.status >= 200 && res?.status < 300 && res.response) done(true, res.response);
-          }).catch(err => {
-            if (settled) return;
-            clearTimeout(timer);
-            done(false, err);
-          });
+        if (result && typeof result.then === 'function') {
+          result.then(acceptResponse).catch(err => done(false, err));
         }
-      } catch (err) {
-        clearTimeout(timer);
-        done(false, err);
+      } catch (error) {
+        done(false, error);
       }
     });
   }
 
   async function getBlob(url) {
+    let gmError = null;
     try {
-      const blob = await gmXhrBlob(url);
-      if (blob instanceof Blob && blob.size) return blob;
-    } catch {}
+      return await gmXhrBlob(url);
+    } catch (error) {
+      gmError = error;
+    }
 
-    const res = await fetch(url, {
-      credentials: 'include',
-      referrer: location.href,
-      cache: 'no-store'
-    });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    return await res.blob();
+    // Keep a same-origin/CORS fallback for managers that cannot expose GM APIs.
+    // Do not replace the real GM error with an unhelpful "Failed to fetch".
+    try {
+      const res = await fetch(url, {
+        credentials: 'include',
+        referrer: location.href,
+        cache: 'no-store'
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const blob = await res.blob();
+      if (!(blob instanceof Blob) || !blob.size)
+        throw new Error('画像データが空でした');
+      return blob;
+    } catch (fetchError) {
+      const gmReason = String(gmError?.message || gmError || '不明');
+      const nativeReason = String(fetchError?.message || fetchError || '不明');
+      let host = '画像サーバー';
+      try { host = new URL(url).hostname; } catch {}
+      throw new Error(host + '：拡張機能経由 ' + gmReason +
+        ' ／ 通常取得 ' + nativeReason);
+    }
   }
 
   async function blobToPng(blob) {
