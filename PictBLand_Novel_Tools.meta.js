@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.30
+// @version      0.3.31
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
 // @noframes
 // @grant        GM.download
-// @grant        GM.xmlhttpRequest
+// @grant        GM.xmlHttpRequest
+// @grant        GM_xmlhttpRequest
 // @connect      pictbland.net
 // @connect      *.pictbland.net
 // @updateURL    https://raw.githubusercontent.com/dearlylovedxxx-afk/pictbland-toolkit/main/PictBLand_Novel_Tools.meta.js
