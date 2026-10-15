@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.32
+// @version      0.3.33
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -118,7 +118,7 @@
   }
 
   function parseMarker(line) {
-    const compact = String(line || '').replace(/\u00a0/g, ' ').trim();
+    const compact = String(line || '').normalize('NFKC').replace(/\u00a0/g, ' ').trim();
     if (!compact || compact.length > 100) return null;
 
     const match = compact.match(/^(?:本文\s*)?(\d+)\s*\/\s*(\d+)\s*(?:頁|ページ|p(?:age)?)?$/i);
@@ -151,9 +151,40 @@
     return cleanupPlainText(out.join('\n'), 3);
   }
 
+  // The 2026 page counter is split across DOM nodes on some mobile layouts:
+  // 本文 + 1 / 2 + 頁. Rejoin only the counter, leaving the actual novel
+  // paragraphs and their original line breaks untouched.
+  function normalizeNovelMarkerLines(value) {
+    return normalizeNewlines(value).replace(
+      /本文\s*[0-9０-９]+\s*[\/／]\s*[0-9０-９]+\s*(?:頁|ページ)?/g,
+      match => '\n' + match.replace(/\s+/g, ' ').trim() + '\n'
+    );
+  }
+
   function extractPagesFromDocument() {
-    const snapshot = renderedDocumentText();
-    const lines = snapshot.split('\n');
+    // A block-aware clone preserves novel line breaks. If the site counter
+    // has been split by CSS/layout wrappers, try the browser's visual text.
+    const sources = [renderedDocumentText()];
+    const visual = document.body?.innerText || '';
+    if (visual && visual !== sources[0]) sources.push(visual);
+    let best = null;
+    let lastError = null;
+    for (const source of sources) {
+      try {
+        const result = extractPagesFromSnapshot(source);
+        const score = result.availablePages * 1000000 +
+          result.pages.reduce((sum,page)=>sum+page.length,0);
+        if (!best || score > best.score) best = {result,score};
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (best) return best.result;
+    throw lastError || new Error('本文ページを取得できませんでした');
+  }
+
+  function extractPagesFromSnapshot(snapshot) {
+    const lines = normalizeNovelMarkerLines(snapshot).split('\n');
     const markers = [];
 
     for (let i = 0; i < lines.length; i++) {
@@ -162,7 +193,7 @@
     }
 
     if (!markers.length) {
-      throw new Error('ページ番号（例：1 / 3）を見つけられませんでした。小説作品ページか確認してください。');
+      throw new Error('本文ページ番号を検出できませんでした（v0.3.33）。本文の表示部分が読み込まれているか確認してください。');
     }
 
     const byTotal = new Map();
@@ -241,7 +272,7 @@
 
     // まず作品本文の「1 / n」より上にある、見た目が見出しらしい要素を探す。
     const all = [...document.querySelectorAll('body *')];
-    const marker = all.find(el => /^\s*1\s*\/\s*\d+\s*$/.test((el.textContent || '').trim()));
+    const marker = all.find(el => /^(?:本文\s*)?1\s*[\/／]\s*\d+\s*(?:頁|ページ)?$/.test((el.textContent || '').trim().replace(/\s+/g, ' ')));
     const markerY = marker ? marker.getBoundingClientRect().top + window.scrollY : Infinity;
 
     const candidates = [];
@@ -662,7 +693,7 @@
     bar.className = 'pbnt-bar';
 
     const title = document.createElement('strong');
-    title.textContent = '📖 pictBLand 小説TXT';
+    title.textContent = '📖 pictBLand 小説TXT v0.3.33';
 
     const restore = document.createElement('button');
     restore.type = 'button';
