@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.36
+// @version      0.3.37
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1764,6 +1764,41 @@
     return candidates[0] || '';
   }
 
+  // A userscript manager may receive an anonymous welcome page even when
+  // the user is logged in inside Safari. Never treat that page as a valid empty feed.
+  function isGuestSearchPage(doc, responseUrl = '') {
+    let path = '';
+    try { path = new URL(responseUrl, location.origin).pathname; } catch {}
+    if (/^\/users\/(?:login|signin)(?:\/|$)/i.test(path)) return true;
+    const guestPanel = doc?.querySelector?.(
+      '.wel_loginitems,[class*="wel_loginitems"],form[action*="/users/login"]'
+    );
+    if (!guestPanel) return false;
+    // Avoid diagnosing a real search-results document as a login page just
+    // because a global navigation bar happens to contain a login button.
+    return !doc?.querySelector?.('a[href*="/items/detail/"],article.item-card');
+  }
+
+  // Same-origin browser requests carry Safari's own cookies, unlike some
+  // iOS userscript-manager GM requests. This is only a recovery path.
+  async function requestBrowserSearchHtml(url, signal) {
+    const abs = new URL(url, location.origin);
+    if (abs.origin !== location.origin) throw new Error('検索URLのドメインが一致しません');
+    await reserveNetworkSlot(signal);
+    const response = await fetch(abs.href, {
+      method:'GET', credentials:'include', redirect:'follow',
+      cache:'no-store', signal, headers:{Accept:'text/html,application/xhtml+xml'}
+    });
+    if (response.status === 429) {
+      blockedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+      throw rateLimitError();
+    }
+    if (!response.ok) throw new Error('ブラウザ通信 HTTP ' + response.status);
+    if (new URL(response.url || abs.href).origin !== location.origin)
+      throw new Error('検索先が異なるドメインへ移動しました');
+    return {html:await response.text(),url:response.url || abs.href};
+  }
+
   function parsedSearchQuality(parsed) {
     // A bare item ID (often from JSON/scripts) is not a hydrated work card.
     // Prefer rendered DOM if most candidates have no actual work title.
@@ -1820,7 +1855,8 @@
 
   function parseSearchPage(html, pageUrl, state) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
-    const candidates = collectItemCandidates(doc);
+    const loginPage = isGuestSearchPage(doc, pageUrl);
+    const candidates = loginPage ? [] : collectItemCandidates(doc);
     const works = [];
     let orderIndex = 0;
     for (const candidate of candidates) {
@@ -1886,7 +1922,8 @@
       nextHref:findNextHref(doc,pageUrl),
       pageText,
       title,
-      empty,
+      empty:empty && !loginPage,
+      loginPage,
       hrefSamples
     };
   }
@@ -2043,6 +2080,30 @@
         let response = await requestHtml(pageUrl, feedAbort.signal);
         if (generation !== feedGeneration) return false;
         parsed = parseSearchPage(response.html,response.url,state);
+        let sawGuestPage = !!parsed.loginPage;
+        // GM requests on Safari/Macaque may omit the logged-in browser session.
+        // Retry only a guest response with cookie-bearing first-party fetch,
+        // then the canonical word URL when a saved legacy URL is malformed.
+        if (parsed.loginPage) {
+          const urls = [pageUrl];
+          const canonical = state.pagesFetched === 0
+            ? absolutePageUrl(searchHrefForWord(state.row?.word || '')) : '';
+          if (canonical && !urls.includes(canonical)) urls.push(canonical);
+          for (const candidateUrl of urls) {
+            try {
+              const browserResponse = await requestBrowserSearchHtml(candidateUrl,feedAbort.signal);
+              if (generation !== feedGeneration) return false;
+              const browserParsed = parseSearchPage(browserResponse.html,browserResponse.url,state);
+              sawGuestPage ||= !!browserParsed.loginPage;
+              if (!browserParsed.loginPage) {
+                parsed=browserParsed;
+                break;
+              }
+            } catch (error) {
+              if (error?.name === 'AbortError' || error?.rateLimited) throw error;
+            }
+          }
+        }
 
         const initialQuality=parsedSearchQuality(parsed);
         const missingCards=!parsed.empty && (initialQuality.count===0
@@ -2055,11 +2116,12 @@
             const rendered=await renderedSearchHtml(pageUrl,feedAbort.signal);
             if (generation !== feedGeneration) return false;
             const hydrated=parseSearchPage(rendered.html,rendered.url,state);
+            sawGuestPage ||= !!hydrated.loginPage;
             const quality=parsedSearchQuality(hydrated);
-            // Keep the raw result if rendering failed or lost most cards.
-            if (quality.count && (quality.meaningful>initialQuality.meaningful
+            // Never replace valid cards with an anonymous login page.
+            if (!hydrated.loginPage && (quality.count && (quality.meaningful>initialQuality.meaningful
                 || (quality.meaningful===initialQuality.meaningful
-                    && quality.count>=initialQuality.count))) {
+                    && quality.count>=initialQuality.count)))) {
               parsed=hydrated;
             }
           } catch(e) {
@@ -2069,6 +2131,8 @@
         }
 
         if (!parsed.works.length && !parsed.empty) {
+          if (parsed.loginPage || sawGuestPage)
+            throw new Error('pictBLandのログイン案内が返されました。Safariでこの検索語を直接開き、ログイン状態を確認してから「更新」を押してください。');
           const hint = [parsed.title,parsed.pageText.slice(0,100)].filter(Boolean).join(' ／ ');
           const links = (parsed.hrefSamples||[]).slice(0,6).join(' , ');
           throw new Error(
