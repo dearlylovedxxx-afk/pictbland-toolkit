@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.35
+// @version      0.3.36
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1454,7 +1454,7 @@
     const add=(raw,priority)=>{
       const t=compactText(raw);
       if(!t||t.length>180||/^作品\s*\d+$/.test(t))return;
-      if(/^(?:詳細|続きを読む|作品を見る|画像|小説|漫画|アルバム|イラスト|ステキ!?|ブクマ|ブックマーク|一般会員|プレミアム会員|フォロワー限定公開作品|Locked Works|フォロ限|鍵付)$/i.test(t))return;
+      if(/^(?:詳細|続きを読む|作品を見る|画像|小説|漫画|アルバム|イラスト|ステキ!?|ブクマ|ブックマーク|一般会員|プレミアム会員|フォロワー限定公開作品|Locked Works|フォロ限|鍵付|相互のみ|相互限)$/i.test(t))return;
       if(/^(?:小説|アルバム|イラスト|漫画)\s*[：:]|^20\d{2}[\/.-]\d|^#/.test(t))return;
       if(/検索避け設定|pictBLandは/i.test(t))return;
       candidates.push({title:t,priority});
@@ -1534,7 +1534,7 @@
         continue;
       }
       if(row.role==='action')continue;
-      if(/^(?:ホーム|一般会員|プレミアム会員|フォロ限|鍵付|R[-‐]?18(?:G)?|作品を見る|ブクマ|ステキ!?|コメント|通報|投稿者|もっと見る|続きを見る|新着|人気順)$/.test(t))continue;
+      if(/^(?:ホーム|一般会員|プレミアム会員|フォロ限|鍵付|相互のみ|相互限|R[-‐]?18(?:G)?|作品を見る|ブクマ|ステキ!?|コメント|通報|投稿者|もっと見る|続きを見る|新着|人気順)$/.test(t))continue;
       if(/^20\d{2}[\/.-]\d{1,2}[\/.-]\d{1,2}|^(?:小説|イラスト|アルバム|漫画)\s*[：:]/.test(t))continue;
       if(/^#\S+(?:\s+#\S+)*$/.test(t)) {if(pieces.length)break;continue;}
       const valid=validCaption(t,title,author,tags);
@@ -1614,7 +1614,7 @@
       const text=validCaption(el.textContent,title,author,tags);
       if(!text||text.length<8||text.length>800||text.startsWith(compactText(title)))continue;
       if(/(?:小説|アルバム|イラスト|漫画)\s*[：:]\s*[0-9０-９,，]+/.test(text))continue;
-      if(/^(?:20\d{2}[\/.-]\d|フォロ限|鍵付|R18|一般会員|プレミアムサービス)/.test(text))continue;
+      if(/^(?:20\d{2}[\/.-]\d|フォロ限|鍵付|相互のみ|相互限|R18|一般会員|プレミアムサービス)/.test(text))continue;
       candidates.push(text);
     }
     return candidates.sort((a,b)=>b.length-a.length)[0]||'';
@@ -1659,7 +1659,7 @@
     if (/鍵付|鍵付き|パスワード限定/.test(content)) names.push('鍵付');
     if (/フォロ限|フォロワー限定|フォロー限定/.test(content)) names.push('フォロ限');
     const other = [
-      ['相互限',/相互限|相互フォロー限定/],
+      ['相互のみ',/相互のみ|相互限|相互フォロー限定|相互フォロワー限定/],
       ['リスト限',/リスト限|リスト限定/],
       ['マイ限',/マイピク限定|マイ限/],
       ['期間限定',/期間限定公開|期間限定/],
