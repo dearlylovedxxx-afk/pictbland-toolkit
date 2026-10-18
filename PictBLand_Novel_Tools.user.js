@@ -2113,7 +2113,9 @@
           // details were obtained. Give the logged-in rendered UI a chance.
           try {
             await reserveNetworkSlot(feedAbort.signal);
-            const rendered=await renderedSearchHtml(pageUrl,feedAbort.signal);
+            const canonicalIframe = sawGuestPage && state.pagesFetched === 0
+              ? absolutePageUrl(searchHrefForWord(state.row?.word || '')) : '';
+            const rendered=await renderedSearchHtml(canonicalIframe || pageUrl,feedAbort.signal);
             if (generation !== feedGeneration) return false;
             const hydrated=parseSearchPage(rendered.html,rendered.url,state);
             sawGuestPage ||= !!hydrated.loginPage;
@@ -2643,6 +2645,16 @@
         const msg = document.createElement('span');
         msg.textContent = state.error;
         row.append(name,msg);
+        const target = searchHrefForWord(state.row?.word || '');
+        if (target) {
+          const link = document.createElement('a');
+          link.href = target;
+          link.target = '_blank';
+          link.rel = 'noopener noreferrer';
+          link.textContent = '↗ この検索を開く';
+          link.style.cssText = 'font-size:11px;color:#7356a8;text-decoration:underline;white-space:nowrap;';
+          row.append(link);
+        }
         errors.append(row);
       }
     }
