@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.37
+// @version      0.3.38
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -213,9 +213,11 @@
     // pictBLand's 2026 reader mounts the display-options popover in the
     // document even when the panel is collapsed. Some text nodes are combined:
     // "フォント：標準フォント：ゴシックフォント：明朝".
+    // Current UI may concatenate labels and options without punctuation:
+    // "書体標準ゴシック明朝", "行間狭い標準広い", followed by theme colors.
     // Match the COMPLETE UI line, not prose mentioning a font or line spacing.
-    const uiGroup = /^(?:(?:文字(?:サイズ)?|テキストサイズ)[：:](?:小|中|大|特大|標準)|フォント[：:](?:標準フォント|ゴシックフォント|明朝フォント|標準|ゴシック|明朝)|行間[：:](?:狭い|標準|広い)|(?:背景(?:色)?|文字色)[：:](?:白|黒|標準|ライト|ダーク|セピア))+$/;
-    const optionOnly = /^(?:文字(?:サイズ)?|テキストサイズ|フォント|行間|背景(?:色)?|文字色|小|中|大|特大|標準|標準フォント|ゴシック|ゴシックフォント|明朝|明朝フォント|狭い|広い|白|黒|ライト|ダーク|セピア)$/;
+    const uiGroup = /^(?:(?:文字(?:サイズ)?|テキストサイズ)(?::)?(?:小|中|大|特大|標準)+|(?:フォント|書体)(?::)?(?:標準フォント|ゴシックフォント|明朝フォント|標準|ゴシック|明朝)+|行間(?::)?(?:狭い|標準|広い)+|(?:テーマ|背景(?:色)?|文字色)(?::)?(?:標準|白|生成り|ミント|グレー|黒|ライト|ダーク|セピア)+)+$/;
+    const optionOnly = /^(?:文字(?:サイズ)?|テキストサイズ|フォント|書体|行間|テーマ|背景(?:色)?|文字色|小|中|大|特大|標準|標準フォント|ゴシック|ゴシックフォント|明朝|明朝フォント|狭い|広い|白|生成り|ミント|グレー|黒|ライト|ダーク|セピア)$/;
     const isUiDisplaySetting = (line, beforeBody) => {
       const normalized = String(line||'').normalize('NFKC')
         .replace(/[\s\u00a0　]/g,'')
@@ -774,7 +776,7 @@
     bar.className = 'pbnt-bar';
 
     const title = document.createElement('strong');
-    title.textContent = '📖 pictBLand 小説TXT v0.3.35';
+    title.textContent = '📖 pictBLand 小説TXT v0.3.38';
 
     const restore = document.createElement('button');
     restore.type = 'button';
