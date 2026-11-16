@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.40
+// @version      0.3.41
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -52,10 +52,16 @@
   }
 
   function normalizeNovelEllipses(text) {
-    // Three consecutive ASCII periods correspond to one Japanese ellipsis.
-    // Round up partial groups, but leave a single sentence-ending period alone.
-    return String(text ?? '').replace(/\.{2,}/g, dots =>
-      '…'.repeat(Math.ceil(dots.length / 3))
+    // The reader can render ellipses as ASCII/fullwidth periods or middle dots.
+    // Treat every three dots as one ellipsis; a final partial group rounds up.
+    // Match at least two dots, optionally separated by horizontal whitespace.
+    // Never alter a single period, Japanese full stop, or existing "…".
+    return String(text ?? '').replace(
+      /(?:[.．・･·․‧][ \t\u00a0　]*){1,}[.．・･·․‧]/g,
+      match => {
+        const dotCount = (match.match(/[.．・･·․‧]/g) || []).length;
+        return '…'.repeat(Math.ceil(dotCount / 3));
+      }
     );
   }
 
@@ -784,7 +790,7 @@
     bar.className = 'pbnt-bar';
 
     const title = document.createElement('strong');
-    title.textContent = '📖 pictBLand 小説TXT v0.3.40';
+    title.textContent = '📖 pictBLand 小説TXT v0.3.41';
 
     const restore = document.createElement('button');
     restore.type = 'button';
