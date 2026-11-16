@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.39
+// @version      0.3.40
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -49,6 +49,14 @@
       .replace(/\u2753\uFE0F?/g, '？')
       .replace(/!/g, '！')
       .replace(/\?/g, '？');
+  }
+
+  function normalizeNovelEllipses(text) {
+    // Three consecutive ASCII periods correspond to one Japanese ellipsis.
+    // Round up partial groups, but leave a single sentence-ending period alone.
+    return String(text ?? '').replace(/\.{2,}/g, dots =>
+      '…'.repeat(Math.ceil(dots.length / 3))
+    );
   }
 
   function cleanupPlainText(text, maxBreaks = 3) {
@@ -444,7 +452,7 @@
       .filter(line => !navOnly.test(line.trim()))
       .join('\n');
 
-    return cleanupPlainText(out, 3);
+    return normalizeNovelEllipses(cleanupPlainText(out, 3));
   }
 
   function safeFileName(name) {
@@ -526,7 +534,7 @@
     if (!original || !pagesHost) return '';
     const pages = [...pagesHost.querySelectorAll('.pbnt-page')]
       .filter(card => card.querySelector('.pbnt-include')?.checked)
-      .map(card => cleanupPlainText(card.querySelector('textarea')?.value || '', 3))
+      .map(card => normalizeNovelEllipses(cleanupPlainText(card.querySelector('textarea')?.value || '', 3)))
       .filter(Boolean);
 
     const parts = [];
@@ -776,7 +784,7 @@
     bar.className = 'pbnt-bar';
 
     const title = document.createElement('strong');
-    title.textContent = '📖 pictBLand 小説TXT v0.3.39';
+    title.textContent = '📖 pictBLand 小説TXT v0.3.40';
 
     const restore = document.createElement('button');
     restore.type = 'button';
