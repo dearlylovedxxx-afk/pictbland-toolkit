@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.41
+// @version      0.3.42
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -32,6 +32,7 @@
   let dialogueSpacingToggle = null;
   let titleInput = null;
   let original = null;
+  let shareInProgress = false;
 
   function normalizeNewlines(text) {
     return String(text ?? '')
@@ -669,26 +670,33 @@
   }
 
   async function shareText() {
-    if (!original) return;
+    if (!original || shareInProgress) return;
     const text = buildOutput();
     if (!text.trim()) {
       statusNode.textContent = '共有する本文がありません。';
       return;
     }
 
-    const file = new File([text], safeFileName(titleInput?.value.trim() || original.title), { type: 'text/plain;charset=utf-8' });
-    if (!navigator.share || !navigator.canShare?.({ files: [file] })) {
+    // iOS "Save to Files" can treat a Web Share title/text as a second item.
+    // Send only ONE named TXT file; do not supply title, text, or URL fields.
+    const file = new File([text], safeFileName(titleInput?.value.trim() || original.title), { type: 'text/plain' });
+    const shareData = { files: [file] };
+    if (typeof navigator.share !== 'function' || !navigator.canShare?.(shareData)) {
       statusNode.textContent = 'このブラウザではファイル共有に対応していません。ダウンロードをお使いください。';
       return;
     }
 
+    shareInProgress = true;
+    statusNode.textContent = '作品名付きTXTファイル1件を共有シートに送信中…';
     try {
-      await navigator.share({ files: [file], title: titleInput?.value.trim() || original.title || 'pictBLand小説' });
-      statusNode.textContent = '共有シートへ渡しました。';
+      await navigator.share(shareData);
+      statusNode.textContent = '共有シートを閉じました。ファイルアプリで保存できたか確認してください。';
     } catch (err) {
       statusNode.textContent = err?.name === 'AbortError'
         ? '共有をキャンセルしました。'
         : `共有できませんでした：${err?.message || err}`;
+    } finally {
+      shareInProgress = false;
     }
   }
 
@@ -790,7 +798,7 @@
     bar.className = 'pbnt-bar';
 
     const title = document.createElement('strong');
-    title.textContent = '📖 pictBLand 小説TXT v0.3.41';
+    title.textContent = '📖 pictBLand 小説TXT v0.3.42';
 
     const restore = document.createElement('button');
     restore.type = 'button';
