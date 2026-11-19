@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.42
+// @version      0.3.43
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -798,7 +798,7 @@
     bar.className = 'pbnt-bar';
 
     const title = document.createElement('strong');
-    title.textContent = '📖 pictBLand 小説TXT v0.3.42';
+    title.textContent = '📖 pictBLand 小説TXT v0.3.43';
 
     const restore = document.createElement('button');
     restore.type = 'button';
@@ -1000,24 +1000,76 @@
     }))};
   }
 
-  function currentSearch() {
-    const m = location.pathname.match(/^\/tags\/index\/(.*)$/);
-    if (!m) return null;
-    let raw = m[1] || '';
-    let decoded = raw;
-    try { decoded = decodeURIComponent(raw); } catch {}
-    const word = decoded.replace(/^\++|\++$/g, '').trim();
-    return word ? {word, href: location.pathname + location.search} : null;
+  const PENDING_REBIND_KEY = 'pictbland-saved-search-rebind-id-v1';
+
+  function isPrivateSearchHref(href, word = '') {
+    if (!href) return false;
+    try {
+      const url = new URL(href, location.origin);
+      if (url.origin !== location.origin) return false;
+      const m = url.pathname.match(/^\/tags\/index\/([^/]+)\/?$/);
+      if (!m) return false;
+      const slug = decodeURIComponent(m[1]);
+      // Old keyword URLs (+word+ and plain /word) no longer work.
+      if (!/^[a-zA-Z0-9_-]{6,}$/.test(slug) || slug.includes('+')) return false;
+      if (word && slug.toLocaleLowerCase('ja-JP') === String(word).trim().toLocaleLowerCase('ja-JP')) return false;
+      return true;
+    } catch { return false; }
   }
 
-  function searchHrefForWord(word) {
-    const clean = String(word || '').trim();
-    if (!clean) return '';
-    const encoded = encodeURIComponent(clean)
-      .replace(/%20/g, '+')
-      .replace(/%2B/gi, '+')
-      .replace(/%2D/gi, '-');
-    return '/tags/index/+' + encoded.replace(/^\++|\++$/g, '') + '+';
+  function currentSearch() {
+    const href = location.pathname + location.search;
+    if (!isPrivateSearchHref(href)) return null;
+    // The private identifier contains no search word; never invent one.
+    const matched = readSaved().find(row =>
+      isPrivateSearchHref(row.href, row.word) && row.href === href
+    );
+    return matched ? {word:matched.word,href} : null;
+  }
+
+  // The site now issues owner-specific search URLs itself. A word is no
+  // longer sufficient to construct a valid URL; do not guess the token.
+  function searchHrefForWord() { return ''; }
+
+  function bindCurrentSearch() {
+    const href = location.pathname + location.search;
+    if (!isPrivateSearchHref(href)) {
+      alert('pictBLandの標準検索で作品一覧を開いてから、もう一度お試しください。旧形式のURLは登録できません。');
+      return;
+    }
+    const rows = readSaved();
+    if (!rows.length) {
+      alert('紐づける保存検索がありません。先に保存検索へ検索語を登録してください。');
+      return;
+    }
+    let id = '';
+    try { id = localStorage.getItem(PENDING_REBIND_KEY) || ''; } catch {}
+    let selected = rows.find(row => row.id === id);
+    if (!selected) {
+      const message = 'この検索結果を紐づける保存検索の番号を入力してください。\n'
+        + rows.map((row,i) => (i+1) + '. ' + (row.name || row.word)).join('\n');
+      const choice = prompt(message,'1');
+      if (choice == null) return;
+      const index = Number(choice) - 1;
+      if (!Number.isInteger(index) || !rows[index]) {
+        alert('保存検索の番号が正しくありません。');
+        return;
+      }
+      selected = rows[index];
+    }
+    selected.href = href;
+    selected.updatedAt = Date.now();
+    writeSaved(rows);
+    try { localStorage.removeItem(PENDING_REBIND_KEY); } catch {}
+    alert('「' + (selected.name || selected.word) + '」に、本人専用の新しい検索結果URLを登録しました。');
+  }
+
+  function beginRebind(id) {
+    const row = readSaved().find(item => item.id === id);
+    if (!row) return;
+    try { localStorage.setItem(PENDING_REBIND_KEY,id); } catch {}
+    closePanel();
+    alert('「' + row.word + '」をpictBLand本来の検索欄から検索してください。\n作品一覧が開いたら「🔖 保存検索」→「この検索結果を紐づけ」を押してください。\n既存の検索名・除外設定は保持します。');
   }
 
   function readSaved() {
@@ -1101,7 +1153,7 @@
     const name = prompt(existing ? 'この検索語は保存済みです。表示名を変更しますか？' : '保存名を入力してください。', existing?.name || clean);
     if (name === null || !name.trim()) return;
     const now = Date.now();
-    const resolvedHref = href || existing?.href || searchHrefForWord(clean);
+    const resolvedHref = href || existing?.href || '';
     if (existing) {
       existing.name = name.trim();
       existing.href = resolvedHref;
@@ -1119,10 +1171,17 @@
   }
 
   function runSearch(word, href='') {
-    const target = href || searchHrefForWord(word);
-    if (!target) return;
-    if (root) root.classList.remove('open');
-    location.assign(new URL(target, location.origin).href);
+    if (isPrivateSearchHref(href,word)) {
+      if (root) root.classList.remove('open');
+      location.assign(new URL(href,location.origin).href);
+      return;
+    }
+    const row = readSaved().find(item => item.word === word);
+    if (row) beginRebind(row.id);
+    else {
+      closePanel();
+      alert('検索語「' + word + '」をpictBLand本来の検索欄から検索し、結果画面で保存検索に登録してください。');
+    }
   }
 
   function runQuickSearch() {
@@ -1134,7 +1193,9 @@
   function saveQuickSearch() {
     const word = quickInput?.value?.trim() || '';
     if (!word) return;
-    saveWord(word, searchHrefForWord(word));
+    saveWord(word, '');
+    const row = readSaved().find(item => item.word === word);
+    if (row) beginRebind(row.id);
   }
 
   function rename(id) {
@@ -1162,9 +1223,9 @@
   }
 
   function firstSearchHref(row) {
-    const target = row?.href || searchHrefForWord(row?.word || '');
-    if (!target) return '';
-    const u = new URL(target, location.origin);
+    // Only use the private result URL actually issued to this user.
+    if (!isPrivateSearchHref(row?.href,row?.word)) return '';
+    const u = new URL(row.href, location.origin);
     for (const key of ['ctop','page','p','offset']) u.searchParams.delete(key);
     return u.pathname + (u.searchParams.toString() ? '?' + u.searchParams.toString() : '');
   }
@@ -1793,14 +1854,16 @@
   function isGuestSearchPage(doc, responseUrl = '') {
     let path = '';
     try { path = new URL(responseUrl, location.origin).pathname; } catch {}
-    if (/^\/users\/(?:login|signin)(?:\/|$)/i.test(path)) return true;
+    if (/^\/users\/(?:login(?:2|_edit)?|signin|welcome2?)(?:\/|$)/i.test(path)) return true;
+    const works = doc?.querySelector?.('a[href*="/items/detail/"],article.item-card,[data-item-id]');
+    if (works) return false;
     const guestPanel = doc?.querySelector?.(
       '.wel_loginitems,[class*="wel_loginitems"],form[action*="/users/login"]'
     );
-    if (!guestPanel) return false;
-    // Avoid diagnosing a real search-results document as a login page just
-    // because a global navigation bar happens to contain a login button.
-    return !doc?.querySelector?.('a[href*="/items/detail/"],article.item-card');
+    if (guestPanel) return true;
+    const txt = compactText(doc?.body?.textContent || '');
+    return /pictBLandへようこそ|BLを愛する人のための創作コミュニティ/.test(txt)
+      && /ログイン|新規会員登録|無料ではじめる/.test(txt);
   }
 
   // Same-origin browser requests carry Safari's own cookies, unlike some
@@ -2101,7 +2164,14 @@
       if (cached) {
         parsed = copyCachedSearchPage(cached,state);
       } else {
-        let response = await requestHtml(pageUrl, feedAbort.signal);
+        let response;
+        try {
+          // Same-site fetch should use the signed-in Safari session.
+          response = await requestBrowserSearchHtml(pageUrl, feedAbort.signal);
+        } catch (error) {
+          if (error?.name === 'AbortError' || error?.rateLimited) throw error;
+          response = await requestHtml(pageUrl, feedAbort.signal);
+        }
         if (generation !== feedGeneration) return false;
         parsed = parseSearchPage(response.html,response.url,state);
         let sawGuestPage = !!parsed.loginPage;
@@ -2726,8 +2796,8 @@
     feedStates = rows.map(row => ({
       row,
       nextHref:firstSearchHref(row),
-      done:false,
-      error:'',
+      done:!isPrivateSearchHref(row.href,row.word),
+      error:isPrivateSearchHref(row.href,row.word) ? '' : '旧形式の検索URLは使用できません。pictBLandの検索結果を開き「この検索結果を紐づけ」で新URLを登録してください。',
       loadedIds:new Set(),
       seenPages:new Set(),
       pagesFetched:0
@@ -2800,6 +2870,8 @@
       ? '現在の検索語：' + current.word
       : '検索語を入力するか、保存済みの検索語をタップしてください。';
     saveCurrentBtn.hidden = !current;
+    const bindBtn = root.querySelector('.pbsw-bind-current');
+    if (bindBtn) bindBtn.hidden = !isPrivateSearchHref(location.pathname + location.search);
     newestBtn.disabled = !rows.length;
     list.replaceChildren();
 
@@ -2823,7 +2895,8 @@
       const name = document.createElement('strong');
       name.textContent = row.name || row.word;
       const word = document.createElement('span');
-      word.textContent = '🔎 ' + row.word;
+      word.textContent = '🔎 ' + row.word +
+        (isPrivateSearchHref(row.href,row.word) ? '　✅ 新URL登録済み' : '　⚠️ URL再登録が必要');
       open.append(name,word);
 
       const actions = document.createElement('div');
@@ -2834,6 +2907,7 @@
       };
       actions.append(
         make('🔎 検索する',()=>runSearch(row.word,row.href)),
+        make('🔗 URL再登録',()=>beginRebind(row.id)),
         make('名前変更',()=>rename(row.id)),
         make('↑',()=>move(row.id,-1),index===0),
         make('↓',()=>move(row.id,1),index===rows.length-1),
@@ -2933,6 +3007,7 @@
           <h2>🔖 pictBLand 保存検索</h2>
           <button type="button" class="pbsw-newest-open">🆕 保存検索の新着</button>
           <button type="button" class="pbsw-save-current">現在の検索語を保存</button>
+          <button type="button" class="pbsw-bind-current" hidden>🔗 この検索結果を紐づけ</button>
           <button type="button" class="pbsw-close">閉じる</button>
           <div class="pbsw-current"></div>
           <div class="pbsw-quick">
@@ -2971,6 +3046,7 @@
 
     quickInput=root.querySelector('.pbsw-input');
     root.querySelector('.pbsw-save-current').addEventListener('click',saveCurrent);
+    root.querySelector('.pbsw-bind-current').addEventListener('click',bindCurrentSearch);
     root.querySelector('.pbsw-search').addEventListener('click',runQuickSearch);
     root.querySelector('.pbsw-save-input').addEventListener('click',saveQuickSearch);
     root.querySelector('.pbsw-close').addEventListener('click',closePanel);
