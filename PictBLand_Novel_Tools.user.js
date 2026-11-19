@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.43
+// @version      0.3.44
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -75,8 +75,8 @@
       .replace(/^\n+|\n+$/g, '');
   }
 
-  function renderedDocumentText() {
-    const clone = document.body.cloneNode(true);
+  function renderedDocumentText(rootNode = document.body) {
+    const clone = rootNode.cloneNode(true);
     clone.querySelectorAll(
       'script,style,noscript,svg,canvas,iframe,#' + ROOT_ID + ',#' + BUTTON_ID +       ',#pbi-root,#pbsw-root,#pictbland-tools-unified-bar,#pictbland-tools-unified-launch,#pictbland-tools-unified-placeholder'
     ).forEach(node => node.remove());
@@ -176,9 +176,67 @@
     );
   }
 
+  // Recover exact page breaks from page containers when the 2026 reader
+  // displays every page within one continuous DOM. Never split at an
+  // arbitrary character count: only page-specific elements or markers.
+  function extractStructuredNovelPages() {
+    const selectors = [
+      '[data-novel-page]', '[data-novel-page-index]',
+      '.novel-page-content', '.novel_page_content',
+      '.novel-body-page', '.novel_body_page',
+      '#novel-body [data-page-index]',
+      '[class*="novel-page-"]', '[id^="novel-page-"]'
+    ];
+    let best=null;
+    for(const selector of selectors){
+      let nodes;
+      try{nodes=[...document.querySelectorAll(selector)];}catch{continue;}
+      nodes=nodes.filter(node=>{
+        if(node.closest('nav,header,footer,[role="navigation"]'))return false;
+        return !nodes.some(other=>other!==node&&node.contains(other));
+      });
+      if(nodes.length<2||nodes.length>500)continue;
+      const pages=nodes.map(node=>cleanupPlainText(renderedDocumentText(node),3));
+      const chars=pages.map(p=>p.replace(/\s/g,'').length);
+      if(chars.some(n=>n<50)||new Set(pages).size!==pages.length)continue;
+      const combined=pages.reduce((sum,page)=>sum+page.length,0);
+      if(combined>1000000)continue;
+      // Prefer the group with the most reliably separated prose.
+      const score=pages.length*1000000+combined;
+      if(!best||score>best.score)best={pages,score};
+    }
+    if(!best)return null;
+    return {
+      pages:best.pages,markerTotal:best.pages.length,markerCount:best.pages.length,
+      availablePages:best.pages.length,missingPages:[],
+      extractionMode:'structured-pages'
+    };
+  }
+
+  function splitAtExplicitNovelBreaks(value) {
+    // These literal editing tags may be retained in new reader markup.
+    // Match entire lines only, so a mention inside prose is not cut.
+    const marker=/^[ \t　]*(?:(?:\[\[?newpage\]?\])|(?:\[\[?pagebreak\]?\])|(?:\[\[?page\]?\])|(?:<!--\s*(?:pagebreak|newpage)\s*-->)|(?:〔改ページ〕)|(?:［改ページ］)|(?:---\s*改ページ\s*---))[ \t　]*$/i;
+    const parts=[],current=[];
+    let found=false;
+    for(const line of normalizeNewlines(value).split('\n')){
+      if(marker.test(line)){
+        const currentText=cleanupPlainText(current.join('\n'),3);
+        if(currentText)parts.push(currentText);
+        current.length=0;
+        found=true;
+      }else current.push(line);
+    }
+    const last=cleanupPlainText(current.join('\n'),3);
+    if(last)parts.push(last);
+    return found&&parts.length>1?parts:null;
+  }
+
   function extractPagesFromDocument() {
     // Keep the existing paginated reader first, but the current pictBLand
     // reader also supports continuous novels with NO "本文 1 / n" at all.
+    const structured = extractStructuredNovelPages();
+    if(structured) return structured;
     const sources = [renderedDocumentText()];
     const visual = document.body?.innerText || '';
     if (visual && visual !== sources[0]) sources.push(visual);
@@ -203,7 +261,15 @@
       }
     }
     if (bestPaged) return bestPaged.result;
-    if (bestPlain) return bestPlain.result;
+    if (bestPlain) {
+      const parts=splitAtExplicitNovelBreaks(bestPlain.result.pages[0]);
+      if(parts)return {
+        pages:parts,markerTotal:parts.length,markerCount:parts.length-1,
+        availablePages:parts.length,missingPages:[],
+        extractionMode:'explicit-pagebreaks'
+      };
+      return bestPlain.result;
+    }
     throw lastError || new Error('小説の本文を見つけられませんでした');
   }
 
@@ -559,41 +625,68 @@
     ) + '\n';
   }
 
+  function capturePageCards() {
+    return [...pagesHost.querySelectorAll('.pbnt-page')].map(card=>({
+      text:card.querySelector('textarea')?.value||'',
+      checked:card.querySelector('.pbnt-include')?.checked!==false
+    }));
+  }
+
   function drawPages(pages) {
     pagesHost.replaceChildren();
-
-    pages.forEach((page, index) => {
-      const text = normalizePictMarkup(page);
-      const card = document.createElement('section');
-      card.className = 'pbnt-page';
-
-      const head = document.createElement('div');
-      head.className = 'pbnt-page-head';
-
-      const label = document.createElement('label');
-      const include = document.createElement('input');
-      include.type = 'checkbox';
-      include.checked = true;
-      include.className = 'pbnt-include';
-      label.append(include, document.createTextNode(` ページ ${index + 1} を保存`));
-
-      const chars = document.createElement('span');
-      chars.textContent = `${Array.from(text).length.toLocaleString('ja-JP')}字`;
-
-      const textarea = document.createElement('textarea');
-      textarea.value = text;
-      textarea.spellcheck = false;
-      textarea.setAttribute('aria-label', `ページ${index + 1} 本文`);
-      textarea.addEventListener('input', () => {
-        chars.textContent = `${Array.from(textarea.value).length.toLocaleString('ja-JP')}字`;
+    pages.forEach((value,index)=>{
+      const input=typeof value==='string'?{text:normalizePictMarkup(value),checked:true}:value;
+      const text=String(input?.text||'');
+      const card=document.createElement('section');
+      card.className='pbnt-page';
+      if(input.checked===false)card.classList.add('pbnt-excluded');
+      const head=document.createElement('div');
+      head.className='pbnt-page-head';
+      const label=document.createElement('label');
+      const include=document.createElement('input');
+      include.type='checkbox';
+      include.checked=input.checked!==false;
+      include.className='pbnt-include';
+      label.append(include,document.createTextNode(' ページ '+(index+1)+' を保存'));
+      const chars=document.createElement('span');
+      chars.textContent=Array.from(text).length.toLocaleString('ja-JP')+'字';
+      const textarea=document.createElement('textarea');
+      textarea.value=text;
+      textarea.spellcheck=false;
+      textarea.setAttribute('aria-label','ページ'+(index+1)+' 本文');
+      textarea.addEventListener('input',()=>{
+        chars.textContent=Array.from(textarea.value).length.toLocaleString('ja-JP')+'字';
       });
-
-      include.addEventListener('change', () => {
-        card.classList.toggle('pbnt-excluded', !include.checked);
+      include.addEventListener('change',()=>{
+        card.classList.toggle('pbnt-excluded',!include.checked);
       });
-
-      head.append(label, chars);
-      card.append(head, textarea);
+      const actions=document.createElement('div');
+      actions.className='pbnt-page-actions';
+      const split=document.createElement('button');
+      split.type='button';
+      split.textContent='✂️ カーソル位置でページを分割';
+      split.title='本文の分割したい位置にカーソルを置いてから押すと、続きが次ページになります';
+      split.addEventListener('click',()=>{
+        const pos=textarea.selectionStart;
+        const before=textarea.value.slice(0,pos);
+        const after=textarea.value.slice(pos);
+        if(!before.trim()||!after.trim()){
+          statusNode.textContent='ページを分けたい位置（本文の途中）にカーソルを置いてから「分割」を押してください。';
+          textarea.focus();
+          return;
+        }
+        const entries=capturePageCards();
+        entries.splice(index,1,
+          {text:before,checked:include.checked},
+          {text:after,checked:include.checked});
+        drawPages(entries);
+        const next=pagesHost.querySelectorAll('.pbnt-page')[index+1];
+        next?.scrollIntoView?.({block:'nearest'});
+        statusNode.textContent='ページ '+(index+1)+' を分割し、全'+entries.length+'ページにしました。各ページの保存チェックを個別に変更できます。';
+      });
+      actions.append(split);
+      head.append(label,chars);
+      card.append(head,textarea,actions);
       pagesHost.append(card);
     });
   }
@@ -722,7 +815,7 @@
       drawPages(original.pages);
       const totalChars = original.pages.reduce((sum, page) => sum + Array.from(page).length, 0);
       statusNode.textContent = extracted.extractionMode === 'continuous-unpaginated'
-        ? `本文を直接抽出：${totalChars.toLocaleString('ja-JP')}字（ページ番号なし）。本文の末尾まで入っているかプレビューで確認してから保存してください。`
+        ? `本文を直接抽出：${totalChars.toLocaleString('ja-JP')}字（元のページ区切りは未検出）。本文の途中にカーソルを置き「✂️ カーソル位置でページを分割」でページごとに分けられます。`
         : extracted.missingPages.length
           ? `⚠️ 本文${extracted.markerTotal}頁のうち${extracted.availablePages}頁のみ取得（未取得：${extracted.missingPages.join('、')}頁）。TXTは取得済み部分だけです。次頁を開いて再取得してください。取得済み${totalChars.toLocaleString('ja-JP')}字`
           : `取得成功：${extracted.availablePages}ページ／${totalChars.toLocaleString('ja-JP')}字` +
@@ -760,6 +853,8 @@
       .pbnt-page-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:7px;font-size:13px;font-weight:700}
       .pbnt-page-head span{font-size:11px;color:#727d88;font-weight:400}
       .pbnt-page textarea{display:block;width:100%;min-height:46vh;resize:vertical;border:1px solid #ccd2d9;border-radius:8px;padding:12px;background:#fff;color:#202124;font:15px/1.8 ui-monospace,SFMono-Regular,Menlo,'Noto Sans JP',monospace;white-space:pre-wrap}
+      .pbnt-page-actions{display:flex;gap:8px;margin:8px 0 2px}
+      .pbnt-page-actions button{border:1px solid #ccd2d9;border-radius:7px;background:#f8f9fb;color:#343942;padding:7px 10px;font-size:12px;font-weight:600}
       .pbnt-error{background:#fff3f3;color:#b42318;border:1px solid #f3c3c3;border-radius:8px;padding:12px}
       @media(max-width:600px){
         #${BUTTON_ID}{right:12px;bottom:max(76px,env(safe-area-inset-bottom));padding:10px 13px}
