@@ -4515,7 +4515,7 @@
       }
     }
     const rows=order.filter(k=>items.has(k) &&
-      Number(deleted[k]||0)<time(items.get(k))).map(k=>items.get(k)).slice(0,200);
+      (!deleted[k] || Number(deleted[k])<time(items.get(k)))).map(k=>items.get(k)).slice(0,200);
     return {rows,deleted};
   }
   function validate(text){
@@ -4598,6 +4598,9 @@
   async function credentialDelete(){
     if(typeof GM!=='undefined'&&typeof GM.deleteValue==='function')return await GM.deleteValue(AUTH_KEY);
     if(typeof GM_deleteValue==='function')return GM_deleteValue(AUTH_KEY);
+    // Some mobile userscript engines expose setValue without deleteValue.
+    if(typeof GM!=='undefined'&&typeof GM.setValue==='function')return await GM.setValue(AUTH_KEY,null);
+    if(typeof GM_setValue==='function')return GM_setValue(AUTH_KEY,null);
   }
   function message(value){status=value;drawStatus();}
   function drawStatus(){
@@ -4621,8 +4624,11 @@
     saveDeleted(deleted);
     lastLocal=next;
     if(next!==previous){
-      localStorage.setItem('pictbland-search-backup-'+Date.now(),
-        localStorage.getItem(KEY)||'[]');
+      const backupKey='pictbland-search-backup-'+Date.now();
+      localStorage.setItem(backupKey,localStorage.getItem(KEY)||'[]');
+      // Keep only the three most recent copies to avoid localStorage quota growth.
+      const backups=Object.keys(localStorage).filter(k=>k.startsWith('pictbland-search-backup-')).sort();
+      for(const stale of backups.slice(0,Math.max(0,backups.length-3)))localStorage.removeItem(stale);
       localStorage.setItem(KEY,next);
       try{window.__pictblandSavedSearchUi?.render?.();}catch{}
     }
