@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.44
+// @version      0.3.45
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -9,8 +9,16 @@
 // @grant        GM.download
 // @grant        GM.xmlHttpRequest
 // @grant        GM_xmlhttpRequest
+// @grant        GM.getValue
+// @grant        GM.setValue
+// @grant        GM.deleteValue
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
 // @connect      pictbland.net
 // @connect      *.pictbland.net
+// @connect      webdav.pcloud.com
+// @connect      ewebdav.pcloud.com
 // @updateURL    https://raw.githubusercontent.com/dearlylovedxxx-afk/pictbland-toolkit/main/PictBLand_Novel_Tools.meta.js
 // @downloadURL  https://raw.githubusercontent.com/dearlylovedxxx-afk/pictbland-toolkit/main/PictBLand_Novel_Tools.user.js
 // ==/UserScript==
@@ -4427,4 +4435,363 @@
 
   if(document.body)build();
   else addEventListener('DOMContentLoaded',build,{once:true});
+})();
+
+
+
+// ---- pictBLand 保存検索: private pCloud WebDAV device synchronization ----
+(() => {
+  'use strict';
+  if(window.__pbSavedSearchCloudV1)return;
+  window.__pbSavedSearchCloudV1=true;
+  const KEY='pictbland-saved-search-words-v1';
+  const READY_KEY='pictbland-pcloud-webdav-ready-v1';
+  const DELETED_KEY='pictbland-pcloud-webdav-deleted-v1';
+  const AUTH_KEY='pictbland-pcloud-webdav-credentials-v1';
+  const CLOUD_FILE='pictbland-saved-searches-sync-v1.json';
+  const POLL=4000,REFRESH=90000;
+  let auth=null,connected=false,running=false,again=false,head=null;
+  let lastLocal='',lastRemoteAt=0,nextChangeTimer=null,status='未接続';
+
+  function key(word){return String(word||'').trim().normalize('NFKC').toLocaleLowerCase('ja-JP');}
+  function time(row){return Math.max(0,Number(row?.updatedAt||row?.createdAt||0)||0);}
+  function href(value){
+    try{
+      if(!value)return '';
+      const url=new URL(value,'https://pictbland.net');
+      return url.origin==='https://pictbland.net' &&
+        /^\/tags\/index\/[a-zA-Z0-9_-]{6,}\/?$/.test(url.pathname)
+        ? url.pathname+url.search:'';
+    }catch{return '';}
+  }
+  function readLocal(){
+    try{
+      const value=JSON.parse(localStorage.getItem(KEY)||'[]');
+      return Array.isArray(value)?value.filter(row=>row&&typeof row.word==='string'&&row.word.trim()):[];
+    }catch{return [];}
+  }
+  function clean(rows){
+    if(!Array.isArray(rows)||rows.length>1000)throw Error('保存検索の件数が不正です');
+    const seen=new Set(),result=[];
+    for(const row of rows){
+      const word=String(row?.word||'').trim().slice(0,250),id=key(word);
+      if(!id||seen.has(id))continue;
+      seen.add(id);
+      result.push({
+        id:String(row?.id||'').slice(0,90)||crypto.randomUUID(),word,
+        name:String(row.name||word).slice(0,250),href:href(row.href),
+        createdAt:Math.max(0,Number(row.createdAt||0)||0),
+        updatedAt:Math.max(0,Number(row.updatedAt||0)||0)
+      });
+    }
+    return result.slice(0,200);
+  }
+  function getDeleted(){
+    try{
+      const value=JSON.parse(localStorage.getItem(DELETED_KEY)||'{}');
+      if(!value||typeof value!=='object'||Array.isArray(value))return {};
+      return Object.fromEntries(Object.entries(value)
+        .filter(([k,v])=>k&&k.length<260&&Number.isFinite(Number(v))&&Number(v)>0)
+        .map(([k,v])=>[k,Number(v)]).slice(-500));
+    }catch{return {};}
+  }
+  function saveDeleted(value){localStorage.setItem(DELETED_KEY,JSON.stringify(value));}
+  function signature(){return JSON.stringify(clean(readLocal()));}
+  function merge(local,remote,localDeleted,remoteDeleted){
+    const deleted={...remoteDeleted};
+    for(const [k,t] of Object.entries(localDeleted))
+      deleted[k]=Math.max(Number(deleted[k]||0),Number(t)||0);
+    const items=new Map(),order=[];
+    for(const rows of [remote,local]){
+      for(const row of rows){
+        const k=key(row.word);
+        if(!items.has(k)){items.set(k,row);order.push(k);continue;}
+        const old=items.get(k);
+        if(time(row)>time(old) ||
+           (time(row)===time(old)&&href(row.href)&&!href(old.href)))
+          items.set(k,row);
+        else if(!href(old.href)&&href(row.href))
+          items.set(k,{...old,href:href(row.href)});
+      }
+    }
+    const rows=order.filter(k=>items.has(k) &&
+      Number(deleted[k]||0)<time(items.get(k))).map(k=>items.get(k)).slice(0,200);
+    return {rows,deleted};
+  }
+  function validate(text){
+    let data;
+    try{data=JSON.parse(text);}catch{throw Error('pCloud上のファイルをJSONとして読み取れません');}
+    if(!data||data.schema!==1||!Array.isArray(data.rows)||
+       !data.deleted||typeof data.deleted!=='object'||Array.isArray(data.deleted))
+      throw Error('pCloudの同期ファイル形式が異なります。上書きしません');
+    const deleted=Object.fromEntries(Object.entries(data.deleted)
+      .filter(([k,v])=>k&&k.length<260&&Number.isFinite(Number(v))&&Number(v)>0)
+      .map(([k,v])=>[k,Number(v)]).slice(-500));
+    return {rows:clean(data.rows),deleted};
+  }
+  function cloudUrl(){return (auth?.region==='EU'?'https://ewebdav.pcloud.com':'https://webdav.pcloud.com')+'/'+CLOUD_FILE;}
+  function basicAuth(){
+    if(!auth?.email||!auth?.password)throw Error('pCloudの認証情報がありません');
+    const bytes=new TextEncoder().encode(auth.email+':'+auth.password);
+    return 'Basic '+btoa(Array.from(bytes,b=>String.fromCharCode(b)).join(''));
+  }
+  function request(method,body='',etag='',createOnly=false){
+    return new Promise((resolve,reject)=>{
+      const modern=typeof GM!=='undefined'?(GM.xmlHttpRequest||GM.xmlhttpRequest):null;
+      const legacy=typeof GM_xmlhttpRequest==='function'?GM_xmlhttpRequest:null;
+      const fn=typeof modern==='function'?modern.bind(GM):legacy;
+      if(!fn){reject(Error('この端末のスクリプトアプリはpCloudへの直接通信に対応していません'));return;}
+      let done=false;
+      const finish=(error,value)=>{
+        if(done)return;done=true;if(error)reject(error);else resolve(value);
+      };
+      const onload=r=>finish(null,{
+        status:Number(r.status||0),
+        text:String(r.responseText??r.response??''),
+        etag:String(r.responseHeaders||'').match(/^etag:\s*(.+)$/im)?.[1]?.trim()||''
+      });
+      try{
+        const req=fn({
+          method,url:cloudUrl(),timeout:20000,responseType:'text',
+          headers:{
+            Authorization:basicAuth(),Accept:'application/json',
+            ...(body?{'Content-Type':'application/json; charset=UTF-8'}:{}),
+            ...(etag?{'If-Match':etag}:{}),
+            ...(createOnly?{'If-None-Match':'*'}:{})
+          },
+          ...(body?{data:body}:{}),
+          onload,
+          ontimeout:()=>finish(Error('pCloud通信がタイムアウトしました')),
+          onerror:()=>finish(Error('pCloudに接続できません（WebDAVの地域または通信設定を確認）'))
+        });
+        if(req&&typeof req.then==='function')req.then(onload).catch(e=>finish(Error(String(e?.message||e))));
+      }catch(e){finish(e);}
+    });
+  }
+  function errorFor(r){
+    if([401,403].includes(r.status))
+      return Error('認証エラー HTTP '+r.status+'。pCloudのWebDAVログインと2段階認証を確認してください');
+    if(r.status===412)return Error('他端末との更新競合。再取得して再試行してください');
+    return Error('pCloud通信エラー HTTP '+r.status);
+  }
+  async function readCloud(){
+    const r=await request('GET');
+    if(r.status===404)return {missing:true,etag:'',data:null};
+    if(r.status!==200)throw errorFor(r);
+    return {missing:false,etag:r.etag,data:validate(r.text)};
+  }
+  async function writeCloud(data,etag='',createOnly=false){
+    const json=JSON.stringify({schema:1,updatedAt:Date.now(),rows:data.rows,deleted:data.deleted});
+    const r=await request('PUT',json,etag,createOnly);
+    if(![200,201,204].includes(r.status))throw errorFor(r);
+  }
+  async function credentialGet(){
+    if(typeof GM!=='undefined'&&typeof GM.getValue==='function')return await GM.getValue(AUTH_KEY,null);
+    if(typeof GM_getValue==='function')return GM_getValue(AUTH_KEY,null);
+    return null;
+  }
+  async function credentialSet(value){
+    if(typeof GM!=='undefined'&&typeof GM.setValue==='function')return await GM.setValue(AUTH_KEY,value);
+    if(typeof GM_setValue==='function')return GM_setValue(AUTH_KEY,value);
+    throw Error('この端末はユーザースクリプト認証情報の永続保存に対応していません');
+  }
+  async function credentialDelete(){
+    if(typeof GM!=='undefined'&&typeof GM.deleteValue==='function')return await GM.deleteValue(AUTH_KEY);
+    if(typeof GM_deleteValue==='function')return GM_deleteValue(AUTH_KEY);
+  }
+  function message(value){status=value;drawStatus();}
+  function drawStatus(){
+    if(!head)return;
+    const label=head.querySelector('.pbsw-cloud-status');
+    if(label)label.textContent=status;
+    const state=head.querySelector('.pbsw-cloud-state');
+    const ready=localStorage.getItem(READY_KEY)==='yes';
+    if(state)state.textContent=!connected?'未接続':
+      ready?'自動同期ON（変更後・約90秒ごと）':
+      '接続済み。初回保存または初回取り込みを実行してください';
+    for(const button of head.querySelectorAll('[data-cloud-action]')){
+      const action=button.dataset.cloudAction;
+      button.disabled=running||(action!=='connect'&&action!=='disconnect'&&!connected)||
+        (action==='sync'&&!ready);
+    }
+  }
+  function apply(rows,deleted){
+    const next=JSON.stringify(clean(rows));
+    const previous=signature();
+    saveDeleted(deleted);
+    lastLocal=next;
+    if(next!==previous){
+      localStorage.setItem('pictbland-search-backup-'+Date.now(),
+        localStorage.getItem(KEY)||'[]');
+      localStorage.setItem(KEY,next);
+      try{window.__pictblandSavedSearchUi?.render?.();}catch{}
+    }
+  }
+  async function connect(){
+    const email=head.querySelector('.pbsw-cloud-email').value.trim()||auth?.email||'';
+    const password=head.querySelector('.pbsw-cloud-password').value||auth?.password||'';
+    const region=head.querySelector('.pbsw-cloud-region').value;
+    if(!email.includes('@')||!password){message('メールとパスワードを入力してください');return;}
+    const old=auth;
+    auth={email,password,region};running=true;message('pCloudへの接続を確認中…');
+    try{
+      await readCloud();
+      if(head.querySelector('.pbsw-cloud-remember').checked)await credentialSet(auth);
+      else await credentialDelete();
+      connected=true;
+      head.querySelector('.pbsw-cloud-password').value='';
+      message('接続完了。スマホで初回保存→PCで初回取り込みを行ってください。');
+      if(localStorage.getItem(READY_KEY)==='yes')setTimeout(()=>void syncNow(),500);
+    }catch(e){auth=old;connected=!!old;message('接続失敗：'+String(e?.message||e));}
+    finally{running=false;drawStatus();}
+  }
+  async function firstUpload(){
+    if(!confirm('この端末の保存検索をpCloudに初めて保存します。\nスマホの再登録済みデータを保存するときに使ってください。'))return;
+    running=true;message('初回保存中…');
+    try{
+      const remote=await readCloud();
+      if(!remote.missing)throw Error('pCloudに既存の同期ファイルがあります。誤上書きを防止するため中止しました');
+      const rows=clean(readLocal());
+      if(!rows.length)throw Error('保存検索が0件です');
+      await writeCloud({rows,deleted:getDeleted()},'',true);
+      localStorage.setItem(READY_KEY,'yes');
+      lastLocal=signature();lastRemoteAt=Date.now();
+      message('✅ pCloudへ'+rows.length+'件保存しました。PCでは「初回取り込み」を選んでください。');
+    }catch(e){message('初回保存失敗：'+String(e?.message||e));}
+    finally{running=false;drawStatus();}
+  }
+  async function firstDownload(){
+    if(!confirm('pCloudの保存検索をこの端末へ取り込みます。\n古い端末データをバックアップしてから置き換えます。'))return;
+    running=true;message('pCloudから取り込み中…');
+    try{
+      const remote=await readCloud();
+      if(remote.missing)throw Error('pCloudの同期ファイルがありません。スマホで初回保存してください');
+      apply(remote.data.rows,remote.data.deleted);
+      localStorage.setItem(READY_KEY,'yes');
+      lastRemoteAt=Date.now();
+      message('✅ pCloudから'+remote.data.rows.length+'件取り込みました。以後は自動同期します。');
+    }catch(e){message('取り込み失敗：'+String(e?.message||e));}
+    finally{running=false;drawStatus();}
+  }
+  async function syncNow(){
+    if(!connected||!auth||localStorage.getItem(READY_KEY)!=='yes')return;
+    if(running){again=true;return;}
+    running=true;drawStatus();
+    try{
+      let complete=false;
+      for(let i=0;i<3&&!complete;i++){
+        const remote=await readCloud();
+        if(remote.missing)throw Error('pCloudの同期ファイルが削除されています。自動上書きはしません');
+        const joined=merge(clean(readLocal()),remote.data.rows,getDeleted(),remote.data.deleted);
+        if(JSON.stringify(joined)!==JSON.stringify(remote.data)){
+          try{await writeCloud(joined,remote.etag);}
+          catch(e){if(i<2&&String(e?.message||'').includes('更新競合'))continue;throw e;}
+        }
+        apply(joined.rows,joined.deleted);
+        lastRemoteAt=Date.now();
+        message('✅ '+joined.rows.length+'件をpCloudと同期しました（'+new Date().toLocaleTimeString('ja-JP')+'）');
+        complete=true;
+      }
+    }catch(e){message('⚠️ 同期失敗：'+String(e?.message||e));}
+    finally{running=false;drawStatus();if(again){again=false;setTimeout(()=>void syncNow(),1200);}}
+  }
+  function queueSync(){
+    if(!connected||localStorage.getItem(READY_KEY)!=='yes')return;
+    clearTimeout(nextChangeTimer);
+    nextChangeTimer=setTimeout(()=>void syncNow(),1700);
+  }
+  function detectChanges(){
+    const rows=clean(readLocal()),now=JSON.stringify(rows);
+    if(now===lastLocal)return;
+    const old=JSON.parse(lastLocal||'[]'),remaining=new Set(rows.map(x=>key(x.word)));
+    const deleted=getDeleted();
+    for(const row of old){
+      const k=key(row.word);
+      if(!remaining.has(k))deleted[k]=Date.now();
+    }
+    for(const row of rows){
+      const k=key(row.word);
+      if(deleted[k]&&time(row)>deleted[k])delete deleted[k];
+    }
+    saveDeleted(deleted);lastLocal=now;queueSync();
+  }
+  async function disconnect(){
+    if(!confirm('この端末のpCloud連携を解除しますか？保存検索は残ります。'))return;
+    await credentialDelete();
+    auth=null;connected=false;localStorage.removeItem(READY_KEY);
+    message('連携解除しました。この端末の保存検索は残っています。');
+  }
+  function installUi(){
+    if(head||!document.body)return;
+    const target=document.querySelector('#pbsw-root .pbsw-manage-page .pbsw-head');
+    if(!target)return;
+    const details=document.createElement('details');
+    details.className='pbsw-cloud';
+    details.innerHTML=[
+      '<summary>☁️ pCloud 保存検索同期</summary>',
+      '<div class="pbsw-cloud-state"></div>',
+      '<div class="pbsw-cloud-inputs">',
+      '<label>地域 <select class="pbsw-cloud-region"><option value="US">US</option><option value="EU">EU</option></select></label>',
+      '<label>メール <input class="pbsw-cloud-email" type="email" autocomplete="username" placeholder="pCloudのメール"></label>',
+      '<label>パスワード <input class="pbsw-cloud-password" type="password" autocomplete="current-password" placeholder="端末内で入力"></label>',
+      '<label><input type="checkbox" class="pbsw-cloud-remember"> この端末で認証情報を記憶</label>',
+      '</div>',
+      '<p class="pbsw-cloud-note">pCloudの非公開WebDAVファイルに保存します。認証情報はGitHubやNiji Cloudに送信しません。「記憶」は端末のユーザースクリプト保存領域に平文相当で保持します。不要ならOFFにしてください。</p>',
+      '<div class="pbsw-cloud-actions">',
+      '<button type="button" data-cloud-action="connect">接続する</button>',
+      '<button type="button" data-cloud-action="upload">📱 pCloudへ初回保存</button>',
+      '<button type="button" data-cloud-action="download">💻 pCloudから初回取り込み</button>',
+      '<button type="button" data-cloud-action="sync">🔄 今すぐ同期</button>',
+      '<button type="button" data-cloud-action="disconnect">連携解除</button>',
+      '</div><div class="pbsw-cloud-status" role="status"></div>'
+    ].join('');
+    target.append(details);head=details;
+    const css=document.createElement('style');
+    css.textContent=[
+      '#pbsw-root .pbsw-cloud{flex:1 1 100%;border:1px solid #d5cde4;border-radius:10px;padding:9px 12px;background:#f9f7fc;color:#3d3057}',
+      '#pbsw-root .pbsw-cloud summary{cursor:pointer;font-size:13px;font-weight:700}',
+      '#pbsw-root .pbsw-cloud-state,#pbsw-root .pbsw-cloud-status{font-size:12px;line-height:1.7;overflow-wrap:anywhere}',
+      '#pbsw-root .pbsw-cloud-inputs,#pbsw-root .pbsw-cloud-actions{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:10px 0}',
+      '#pbsw-root .pbsw-cloud-inputs label{display:flex;gap:5px;align-items:center;font-size:12px}',
+      '#pbsw-root .pbsw-cloud-inputs input[type=email],#pbsw-root .pbsw-cloud-inputs input[type=password]{width:185px;min-width:0}',
+      '#pbsw-root .pbsw-cloud-inputs input[type=checkbox]{width:auto}',
+      '#pbsw-root .pbsw-cloud-note{font-size:11px;line-height:1.6;color:#746888}',
+      '#pbsw-root .pbsw-cloud-actions button{font-size:12px;padding:8px 10px}'
+    ].join('\n');
+    document.head.append(css);
+    const actions={connect,upload:firstUpload,download:firstDownload,sync:syncNow,disconnect};
+    for(const [action,fn]of Object.entries(actions))
+      head.querySelector('[data-cloud-action="'+action+'"]').addEventListener('click',()=>void fn());
+    if(auth){
+      head.querySelector('.pbsw-cloud-email').value=auth.email;
+      head.querySelector('.pbsw-cloud-region').value=auth.region;
+      head.querySelector('.pbsw-cloud-remember').checked=true;
+    }
+    drawStatus();
+  }
+  async function init(){
+    lastLocal=signature(); // Existing bookmarks are baseline, not deletions.
+    try{
+      const stored=await credentialGet();
+      if(stored?.email&&stored?.password&&['US','EU'].includes(stored.region)){
+        auth={email:stored.email,password:stored.password,region:stored.region};
+        connected=true;
+        message('pCloud接続情報を復元しました');
+      }
+    }catch(e){message('接続情報の読み込み失敗：'+String(e?.message||e));}
+    installUi();
+    setInterval(()=>{
+      if(document.visibilityState==='hidden')return;
+      installUi();detectChanges();
+      if(connected&&localStorage.getItem(READY_KEY)==='yes'&&!running &&
+        Date.now()-lastRemoteAt>REFRESH)queueSync();
+    },POLL);
+    document.addEventListener('visibilitychange',()=>{
+      if(document.visibilityState==='visible'){installUi();detectChanges();queueSync();}
+    });
+    if(connected&&localStorage.getItem(READY_KEY)==='yes')queueSync();
+  }
+  if(document.readyState==='loading')
+    document.addEventListener('DOMContentLoaded',()=>void init(),{once:true});
+  else void init();
 })();
