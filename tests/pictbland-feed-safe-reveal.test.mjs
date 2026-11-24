@@ -9,7 +9,7 @@ const w=(id,tags=[],loaded=false,verified=false,error='')=>({id,tags,detailLoade
 function setup(tags,works){
  return create(tags,new Map(works.map(x=>[x.id,x])),x=>x.tags.some(t=>tags.includes(t)),(a,b)=>b.id-a.id);
 }
-test('syntax/version',()=>{assert.doesNotThrow(()=>new Function(s));assert.match(s,/@version\s+0\.3\.48/);assert.match(meta,/@version\s+0\.3\.48/);});
+test('syntax/version',()=>{assert.doesNotThrow(()=>new Function(s));assert.match(s,/@version\s+0\.3\.49/);assert.match(meta,/@version\s+0\.3\.49/);});
 test('no exclusion means all results visible',()=>{assert.deepEqual(setup([],[w(3),w(2)]).sortedWorks().map(x=>x.id),[3,2]);});
 test('blocked/pending/failed/unverified stay hidden',()=>{
  const model=setup(['block'],[w(6,['safe']),w(5,['block']),w(4,['safe'],true,true),w(3,[],false,false,'failed'),w(2,['safe'],true,false),w(1,['safe'],true,true)]);
@@ -21,4 +21,19 @@ test('only detail-verified results reach card rendering',()=>{
  assert.match(s,/if\(feedNeedsTagVerification\(\) && !work\.detailTagsVerified\)/);
  assert.match(s,/observeFeedCards\(feedNeedsTagVerification\(\)\?candidates\.slice\(0,feedVisibleCount\):visible/);
  assert.match(s,/grid\.insertBefore\(existing\|\|createFeedCard\(work\),current\)/);
+});
+
+
+test('saved searches are processed strictly top-to-bottom and details start before all searches finish',()=>{
+ assert.match(s,/for \(const state of feedStates\) \{/);
+ assert.match(s,/state\.processing = true/);
+ assert.match(s,/enqueueDetailsForSearchPriority\(state\.priority,generation,target\)/);
+ assert.doesNotMatch(s,/await mapLimit\(targets, SEARCH_CONCURRENCY/);
+});
+
+test('detail queue prioritizes saved-search order and skips extra render wait when detail tags exist',()=>{
+ assert.match(s,/detailQueue\.sort\(\(a,b\) => compareSavedSearchPriority\(a\.work,b\.work\)\)/);
+ assert.match(s,/if\(!caption && !\(feedNeedsTagVerification\(\) && tags\.length\)\)/);
+ assert.match(s,/detailCaptionFromDoc\(doc,work\) \|\| tagsFrom\(doc\)\.length/);
+ assert.match(s,/rows\.map\(\(row,priority\) => \(\{/);
 });

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.48
+// @version      0.3.49
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1089,6 +1089,7 @@
       tags:[...(work.tags || [])],
       accessBadges:[...(work.accessBadges || [])],
       matches:new Set([state.row?.name || state.row?.word || '保存検索']),
+      searchPriority:Number.isFinite(Number(state.priority)) ? Number(state.priority) : Number(work.searchPriority || 0),
       detailLoaded:false,
       detailTagsVerified:false,
       detailLoading:false,
@@ -1906,6 +1907,7 @@
       sukiCount:null,
       bookmarkCount:null,
       matches:new Set([state.row.name || state.row.word]),
+      searchPriority:Number.isFinite(Number(state.priority)) ? Number(state.priority) : 0,
       detailLoaded:false,
       detailTagsVerified:false,
       detailQueued:false,
@@ -1938,6 +1940,7 @@
       sukiCount:metricFromText(text,['ステキ!?','ステキ','いいね']),
       bookmarkCount:metricFromText(text,['ブクマ','ブックマーク']),
       matches:new Set([state.row.name || state.row.word]),
+      searchPriority:Number.isFinite(Number(state.priority)) ? Number(state.priority) : 0,
       detailLoaded:false,
       detailTagsVerified:false,
       detailQueued:false,
@@ -2393,6 +2396,10 @@
         continue;
       }
       for (const name of work.matches) old.matches.add(name);
+      old.searchPriority = Math.min(
+        Number.isFinite(Number(old.searchPriority)) ? Number(old.searchPriority) : Number.MAX_SAFE_INTEGER,
+        Number.isFinite(Number(work.searchPriority)) ? Number(work.searchPriority) : Number.MAX_SAFE_INTEGER
+      );
       if (!old.thumb && work.thumb) old.thumb = work.thumb;
       if (!old.authorName && work.authorName) { old.authorName = work.authorName; old.authorHref = work.authorHref; }
       if (!old.caption && work.caption) old.caption = work.caption;
@@ -2418,6 +2425,13 @@
 
   function allSortedWorks() {
     return [...feedWorks.values()].sort(compareNewestWorks);
+  }
+
+  function compareSavedSearchPriority(a,b) {
+    const ap=Number.isFinite(Number(a?.searchPriority)) ? Number(a.searchPriority) : Number.MAX_SAFE_INTEGER;
+    const bp=Number.isFinite(Number(b?.searchPriority)) ? Number(b.searchPriority) : Number.MAX_SAFE_INTEGER;
+    if(ap!==bp)return ap-bp;
+    return compareNewestWorks(a,b);
   }
 
   // With blocked tags set, prevent even a momentary preview before detail checking.
@@ -2457,23 +2471,32 @@
   }
 
   async function ensureCoverage(target, generation) {
-    let rounds = 0;
-    while (generation === feedGeneration && !feedAbort?.signal.aborted && !coverageComplete(target)) {
-      const targets = feedStates.filter(state =>
-        !state.error && !state.done && state.nextHref && stateCoverage(state) < target
-      );
-      if (!targets.length) break;
+    // Saved-search order is intentional: finish the upper search before moving
+    // to the next one, so its tag verification can begin immediately.
+    for (const state of feedStates) {
+      if (generation !== feedGeneration || feedAbort?.signal.aborted) break;
+      if (state.error || state.done || !state.nextHref || stateCoverage(state) >= target) continue;
+      state.processing = true;
+      if (generation === feedGeneration) renderFeed();
 
-      let roundProgress = false;
-      await mapLimit(targets, SEARCH_CONCURRENCY, async state => {
+      let rounds = 0;
+      while (generation === feedGeneration && !feedAbort?.signal.aborted &&
+             !state.error && !state.done && state.nextHref && stateCoverage(state) < target) {
         const before = stateCoverage(state);
         await fetchSearchState(state,state.nextHref,generation);
-        if (stateCoverage(state) > before || state.done || state.error) roundProgress = true;
-        if (generation === feedGeneration) renderFeed();
-      });
+        if (generation !== feedGeneration) break;
 
-      // Hard stop against broken pagination loops.
-      if (!roundProgress || ++rounds >= 30) break;
+        // Do not wait for every saved search to finish. As soon as this search
+        // yields works, start the exclusion-tag detail checks for this priority.
+        if (feedNeedsTagVerification())
+          enqueueDetailsForSearchPriority(state.priority,generation,target);
+
+        renderFeed();
+        const progressed = stateCoverage(state) > before || state.done || state.error;
+        if (!progressed || ++rounds >= 30) break;
+      }
+      state.processing = false;
+      if (generation === feedGeneration) renderFeed();
     }
   }
 
@@ -2555,7 +2578,7 @@
               extra.push('<div data-pbsw-detail-shadow="1">'+(node.innerHTML||'')+'</div>');
             }
             latest={html:html+extra.join(''),url:frame.contentWindow.location.href};
-            if(detailCaptionFromDoc(doc,work)){
+            if(detailCaptionFromDoc(doc,work) || tagsFrom(doc).length){
               finish(true,latest);
               return;
             }
@@ -2575,15 +2598,19 @@
     }
     let doc=new DOMParser().parseFromString(response.html,'text/html');
     let caption=detailCaptionFromDoc(doc,work);
-    if(!caption){
+    let tags=tagsFrom(doc);
+    // For exclusion filtering, tags from the authenticated work detail HTML
+    // are already enough. Avoid a second iframe/render wait just to obtain a caption.
+    if(!caption && !(feedNeedsTagVerification() && tags.length)){
       try {
         await reserveNetworkSlot(signal);
         const rendered=await renderedDetailHtml(key,work,signal);
         if(rendered?.html) {
           const parsed=new DOMParser().parseFromString(rendered.html,'text/html');
           const found=detailCaptionFromDoc(parsed,work);
-          if(found){
-            doc=parsed;response=rendered;caption=found;
+          const renderedTags=tagsFrom(parsed);
+          if(found || renderedTags.length){
+            doc=parsed;response=rendered;caption=found;tags=renderedTags;
           }
         }
       } catch(error) {
@@ -2592,9 +2619,8 @@
     }
     // Cache only work-specific successful snapshots, not generic landing-page
     // SEO HTML that could contaminate many unrelated result cards.
-    if(caption)cachePut(detailHtmlCache,key,response,DETAIL_CACHE_MS);
+    if(caption || tags.length)cachePut(detailHtmlCache,key,response,DETAIL_CACHE_MS);
     const bodyText=compactText(doc.body?.textContent||'');
-    const tags=tagsFrom(doc);
     // A generic site shell is not proof that the work has no blocked tags.
     work.detailTagsVerified=!!(caption || tags.length);
     if(tags.length)work.tags=tags;
@@ -2644,10 +2670,20 @@
     pumpDetailQueue();
   }
 
+  function enqueueDetailsForSearchPriority(priority,generation,limit=FEED_STEP) {
+    const target=Number(priority);
+    const works=[...feedWorks.values()]
+      .filter(work => Number(work.searchPriority)===target && !excludedByTag(work) &&
+        !work.detailLoaded && !work.detailLoading && !work.detailQueued && !work.detailError)
+      .sort(compareSavedSearchPriority)
+      .slice(0,Math.max(1,Number(limit)||FEED_STEP));
+    for(const work of works)enqueueDetail(work,generation);
+  }
+
   function pumpDetailQueue() {
-    // The DOM observer previously enqueued cards in callback/scroll order.
-    // Always choose the newest outstanding work before starting another request.
-    detailQueue.sort((a,b) => compareNewestWorks(a.work,b.work));
+    // Exclusion checking follows the user's saved-search order. Within one
+    // saved search, newer works still go first.
+    detailQueue.sort((a,b) => compareSavedSearchPriority(a.work,b.work));
     while (detailActive < DETAIL_CONCURRENCY && detailQueue.length) {
       const job = detailQueue.shift();
       const work = job.work;
@@ -2694,9 +2730,11 @@
     const coverageText=total?' ／ 横断同期 '+covered+'/'+total+'条件（各最大'+target+'件）':'';
     const detailText=displayed.length?' ／ 新着順に詳細 '+displayed.filter(w=>w.detailLoaded).length+'/'+displayed.length:'';
     const tagText=feedNeedsTagVerification()?' ／ タグ確認待ち '+pending+'件'+(unknown?' ／ タグ確認不可 '+unknown+'件（非表示）':''):'';
-    return (feedLoading?'全保存検索を日付順に揃えています… 現在 ':'保存検索 '+ok+'/'+total+'件取得 ／ 表示 ')
+    const active=feedStates.find(x=>x.processing);
+    const activeText=active?' ／ 処理中 '+(Number(active.priority)+1)+'/'+total+'：'+(active.row?.name||active.row?.word||'保存検索'):'';
+    return (feedLoading?'保存検索を上から順に処理中… 現在 ':'保存検索 '+ok+'/'+total+'件取得 ／ 表示 ')
       +ready.length.toLocaleString('ja-JP')+'作品'+coverageText+detailText
-      +(excluded?' ／ 除外 '+excluded+'作品':'')+tagText+(bad?' ／ 失敗 '+bad+'件':'');
+      +(excluded?' ／ 除外 '+excluded+'作品':'')+tagText+activeText+(bad?' ／ 失敗 '+bad+'件':'');
   }
 
   function renderCoverageBreakdown() {
@@ -2707,7 +2745,7 @@
       const chip = document.createElement('span');
       const name = state.row?.name || state.row?.word || '保存検索';
       const count = stateCoverage(state);
-      chip.textContent = name + ' ' + count + '件' + (state.error ? ' ⚠️' : state.done ? ' ✓' : count >= feedVisibleCount ? ' ✓' : ' …');
+      chip.textContent = name + ' ' + count + '件' + (state.error ? ' ⚠️' : state.processing ? ' ▶' : state.done ? ' ✓' : count >= feedVisibleCount ? ' ✓' : ' …');
       if (state.error) chip.title = state.error;
       box.append(chip);
     }
@@ -2936,8 +2974,10 @@
     feedLoading = true;
     feedWorks = new Map();
     feedVisibleCount = FEED_STEP;
-    feedStates = rows.map(row => ({
+    feedStates = rows.map((row,priority) => ({
       row,
+      priority,
+      processing:false,
       nextHref:firstSearchHref(row),
       done:!isPrivateSearchHref(row.href,row.word),
       error:isPrivateSearchHref(row.href,row.word) ? '' : '旧形式の検索URLは使用できません。pictBLandの検索結果を開き「この検索結果を紐づけ」で新URLを登録してください。',
