@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.47
+// @version      0.3.48
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1090,6 +1090,7 @@
       accessBadges:[...(work.accessBadges || [])],
       matches:new Set([state.row?.name || state.row?.word || '保存検索']),
       detailLoaded:false,
+      detailTagsVerified:false,
       detailLoading:false,
       detailQueued:false,
       detailError:''
@@ -1906,6 +1907,7 @@
       bookmarkCount:null,
       matches:new Set([state.row.name || state.row.word]),
       detailLoaded:false,
+      detailTagsVerified:false,
       detailQueued:false,
       detailLoading:false,
       detailError:'',
@@ -1937,6 +1939,7 @@
       bookmarkCount:metricFromText(text,['ブクマ','ブックマーク']),
       matches:new Set([state.row.name || state.row.word]),
       detailLoaded:false,
+      detailTagsVerified:false,
       detailQueued:false,
       detailLoading:false,
       detailError:'',
@@ -2417,8 +2420,19 @@
     return [...feedWorks.values()].sort(compareNewestWorks);
   }
 
+  // With blocked tags set, prevent even a momentary preview before detail checking.
+  function feedNeedsTagVerification() { return feedExcludeTags.length > 0; }
+  function feedTagsAreVerified(work) {
+    return !feedNeedsTagVerification() || !!(work.detailLoaded && work.detailTagsVerified);
+  }
+  function feedReviewCandidates() {
+    return allSortedWorks().filter(work =>
+      !excludedByTag(work) && !work.detailError &&
+      (!feedNeedsTagVerification() || !work.detailLoaded || work.detailTagsVerified));
+  }
   function sortedWorks() {
-    return allSortedWorks().filter(work => !excludedByTag(work));
+    return allSortedWorks().filter(work =>
+      !excludedByTag(work) && feedTagsAreVerified(work));
   }
 
   async function mapLimit(items, limit, worker) {
@@ -2581,7 +2595,11 @@
     if(caption)cachePut(detailHtmlCache,key,response,DETAIL_CACHE_MS);
     const bodyText=compactText(doc.body?.textContent||'');
     const tags=tagsFrom(doc);
+    // A generic site shell is not proof that the work has no blocked tags.
+    work.detailTagsVerified=!!(caption || tags.length);
     if(tags.length)work.tags=tags;
+    if(feedNeedsTagVerification() && !work.detailTagsVerified)
+      throw new Error('作品固有のタグを確認できませんでした');
     const detailedBadges=accessBadgesFromCard(doc.body,work.title);
     if(detailedBadges.length)
       work.accessBadges=[...new Set([...(work.accessBadges||[]),...detailedBadges])];
@@ -2641,7 +2659,7 @@
         if (job.generation !== feedGeneration) return;
         work.detailLoaded = true;
         work.detailError = '';
-        if (excludedByTag(work)) renderFeed();
+        if (feedNeedsTagVerification() || excludedByTag(work)) renderFeed();
         else updateFeedCard(work);
       }).catch(e => {
         if (job.generation !== feedGeneration || e?.name === 'AbortError') return;
@@ -2653,7 +2671,8 @@
           for (const remaining of detailQueue) remaining.work.detailQueued = false;
           detailQueue = [];
         }
-        updateFeedCard(work);
+        if (feedNeedsTagVerification()) renderFeed();
+        else updateFeedCard(work);
       }).finally(() => {
         work.detailLoading = false;
         detailActive = Math.max(0,detailActive-1);
@@ -2666,27 +2685,18 @@
   }
 
   function feedStatusText() {
-    const total = feedStates.length;
-    const ok = feedStates.filter(s => !s.error).length;
-    const bad = feedStates.filter(s => s.error).length;
-    const visibleWorks = sortedWorks();
-    const visible = visibleWorks.length;
-    const excluded = Math.max(0,feedWorks.size-visible);
-    const displayed = visibleWorks.slice(0,feedVisibleCount);
-    const detailed = displayed.filter(w => w.detailLoaded).length;
-    const detailErrors = displayed.filter(w => !!w.detailError).length;
-    const noTitle = displayed.filter(w => !w.title || w.title==='作品 '+w.id).length;
-    const detailText = displayed.length
-      ? ' ／ 新着順に詳細 ' + detailed.toLocaleString('ja-JP') + '/' + displayed.length.toLocaleString('ja-JP')
-        + (detailErrors ? '（取得不可 ' + detailErrors.toLocaleString('ja-JP') + '件）' : '')
-        + (noTitle ? ' ／ タイトル未取得 ' + noTitle.toLocaleString('ja-JP') + '件' : '')
-      : '';
-    const target = feedVisibleCount;
-    const covered = feedStates.filter(s => s.error || s.done || stateCoverage(s) >= target).length;
-    const coverageText = total ? ' ／ 横断同期 ' + covered + '/' + total + '条件（各最大' + target + '件）' : '';
-    return feedLoading
-      ? '全保存検索を日付順に揃えています… 現在 ' + visible.toLocaleString('ja-JP') + '作品' + coverageText + detailText + (excluded ? '（除外 ' + excluded + '）' : '')
-      : '保存検索 ' + ok + '/' + total + '件取得 ／ 表示候補 ' + visible.toLocaleString('ja-JP') + '作品' + coverageText + detailText + (excluded ? ' ／ 除外 ' + excluded + '作品' : '') + (bad ? ' ／ 失敗 ' + bad + '件' : '');
+    const total=feedStates.length,ok=feedStates.filter(x=>!x.error).length,bad=feedStates.filter(x=>x.error).length;
+    const all=allSortedWorks(),ready=sortedWorks(),displayed=ready.slice(0,feedVisibleCount);
+    const excluded=all.filter(excludedByTag).length;
+    const pending=feedNeedsTagVerification()?all.filter(w=>!excludedByTag(w)&&!w.detailLoaded&&!w.detailError).length:0;
+    const unknown=feedNeedsTagVerification()?all.filter(w=>!excludedByTag(w)&&(w.detailError||(w.detailLoaded&&!w.detailTagsVerified))).length:0;
+    const target=feedVisibleCount,covered=feedStates.filter(x=>x.error||x.done||stateCoverage(x)>=target).length;
+    const coverageText=total?' ／ 横断同期 '+covered+'/'+total+'条件（各最大'+target+'件）':'';
+    const detailText=displayed.length?' ／ 新着順に詳細 '+displayed.filter(w=>w.detailLoaded).length+'/'+displayed.length:'';
+    const tagText=feedNeedsTagVerification()?' ／ タグ確認待ち '+pending+'件'+(unknown?' ／ タグ確認不可 '+unknown+'件（非表示）':''):'';
+    return (feedLoading?'全保存検索を日付順に揃えています… 現在 ':'保存検索 '+ok+'/'+total+'件取得 ／ 表示 ')
+      +ready.length.toLocaleString('ja-JP')+'作品'+coverageText+detailText
+      +(excluded?' ／ 除外 '+excluded+'作品':'')+tagText+(bad?' ／ 失敗 '+bad+'件':'');
   }
 
   function renderCoverageBreakdown() {
@@ -2873,31 +2883,47 @@
     const works = sortedWorks();
     const visible = works.slice(0,feedVisibleCount);
     const grid = root.querySelector('.pbsw-feed-grid');
-    grid.replaceChildren();
+    // Keep stable DOM/cards while verified results arrive one by one.
+    for(let i=0;i<visible.length;i++){
+      const work=visible[i],current=grid.children[i]||null;
+      if(current?.dataset?.workId===String(work.id))continue;
+      const existing=[...grid.querySelectorAll('.pbsw-feed-card')].find(
+        card=>card.dataset.workId===String(work.id));
+      grid.insertBefore(existing||createFeedCard(work),current);
+    }
+    while(grid.children.length>visible.length)grid.lastElementChild.remove();
 
-    if (!works.length && !feedLoading) {
-      const p = document.createElement('p');
-      p.className = 'pbsw-empty';
-      p.textContent = feedWorks.size && feedExcludeTags.length
-        ? '取得した作品はすべて除外タグに一致しました。'
-        : '該当する新着作品がありません。';
-      grid.append(p);
-    } else {
-      for (const work of visible) grid.append(createFeedCard(work));
+    if(!works.length&&!feedLoading){
+      const all=allSortedWorks();
+      const pending=feedNeedsTagVerification()&&all.some(w=>
+        !excludedByTag(w)&&!w.detailLoaded&&!w.detailError);
+      const failed=feedNeedsTagVerification()&&all.some(w=>
+        !excludedByTag(w)&&(w.detailError||(w.detailLoaded&&!w.detailTagsVerified)));
+      const p=document.createElement('p');
+      p.className='pbsw-empty';
+      p.textContent=pending?'タグを確認中です。未確認の作品は表示しません。'
+        :failed?'タグを確認できなかった作品は非表示です。必要なら「更新」で再取得してください。'
+        :all.length&&feedNeedsTagVerification()?'取得した作品はすべて除外タグに一致しました。'
+        :'該当する新着作品がありません。';
+      grid.replaceChildren(p);
     }
 
-    const showMore = root.querySelector('.pbsw-feed-show-more');
-    const older = root.querySelector('.pbsw-feed-load-older');
-    const refresh = root.querySelector('.pbsw-feed-refresh');
-    const hasHidden = works.length > feedVisibleCount;
-    const hasOlder = feedStates.some(s => !s.error && !s.done && s.nextHref);
-    showMore.hidden = !hasHidden;
-    older.hidden = hasHidden || !hasOlder || feedLoading;
-    refresh.disabled = feedLoading;
-    showMore.disabled = feedLoading;
-    older.disabled = feedLoading;
-
-    if (!feedLoading) observeFeedCards(visible,feedGeneration);
+    const showMore=root.querySelector('.pbsw-feed-show-more');
+    const older=root.querySelector('.pbsw-feed-load-older');
+    const refresh=root.querySelector('.pbsw-feed-refresh');
+    const hasHidden=works.length>feedVisibleCount;
+    const candidates=feedNeedsTagVerification()?feedReviewCandidates():visible;
+    const hasFurtherCandidates=feedNeedsTagVerification()&&candidates.length>feedVisibleCount;
+    const hasOlder=feedStates.some(s=>!s.error&&!s.done&&s.nextHref);
+    showMore.hidden=!(hasHidden||hasFurtherCandidates);
+    older.hidden=hasHidden||hasFurtherCandidates||!hasOlder||feedLoading;
+    refresh.disabled=feedLoading;
+    showMore.disabled=feedLoading;
+    older.disabled=feedLoading;
+    // Hidden candidates still need work-specific detail requests; otherwise
+    // no card is visible and the old observer strategy would deadlock.
+    if(!feedLoading&&feedOpen)
+      observeFeedCards(feedNeedsTagVerification()?candidates.slice(0,feedVisibleCount):visible,feedGeneration);
   }
 
   async function refreshFeed(force = false) {
