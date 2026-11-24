@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.49
+// @version      0.3.50
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1091,7 +1091,7 @@
       matches:new Set([state.row?.name || state.row?.word || '保存検索']),
       searchPriority:Number.isFinite(Number(state.priority)) ? Number(state.priority) : Number(work.searchPriority || 0),
       detailLoaded:false,
-      detailTagsVerified:false,
+      detailTagsVerified:!!(work.detailTagsVerified || (work.tags || []).length),
       detailLoading:false,
       detailQueued:false,
       detailError:''
@@ -1942,7 +1942,7 @@
       matches:new Set([state.row.name || state.row.word]),
       searchPriority:Number.isFinite(Number(state.priority)) ? Number(state.priority) : 0,
       detailLoaded:false,
-      detailTagsVerified:false,
+      detailTagsVerified:tags.length > 0,
       detailQueued:false,
       detailLoading:false,
       detailError:'',
@@ -2407,6 +2407,7 @@
       if (old.characterCount==null && work.characterCount!=null) old.characterCount=work.characterCount;
       if (old.imageCount==null && work.imageCount!=null) old.imageCount=work.imageCount;
       if (!old.tags.length && work.tags.length) old.tags = work.tags;
+      if (work.detailTagsVerified || old.tags.length) old.detailTagsVerified = true;
       old.accessBadges = [...new Set([...(old.accessBadges||[]),...(work.accessBadges||[])])];
       if (!old.dateTime && work.dateTime) { old.dateTime = work.dateTime; old.dateText = work.dateText; }
       if (old.sukiCount == null && work.sukiCount != null) old.sukiCount = work.sukiCount;
@@ -2437,12 +2438,12 @@
   // With blocked tags set, prevent even a momentary preview before detail checking.
   function feedNeedsTagVerification() { return feedExcludeTags.length > 0; }
   function feedTagsAreVerified(work) {
-    return !feedNeedsTagVerification() || !!(work.detailLoaded && work.detailTagsVerified);
+    return !feedNeedsTagVerification() || !!work.detailTagsVerified;
   }
   function feedReviewCandidates() {
     return allSortedWorks().filter(work =>
       !excludedByTag(work) && !work.detailError &&
-      (!feedNeedsTagVerification() || !work.detailLoaded || work.detailTagsVerified));
+      (!feedNeedsTagVerification() || !work.detailTagsVerified));
   }
   function sortedWorks() {
     return allSortedWorks().filter(work =>
@@ -2622,7 +2623,7 @@
     if(caption || tags.length)cachePut(detailHtmlCache,key,response,DETAIL_CACHE_MS);
     const bodyText=compactText(doc.body?.textContent||'');
     // A generic site shell is not proof that the work has no blocked tags.
-    work.detailTagsVerified=!!(caption || tags.length);
+    work.detailTagsVerified=tags.length > 0;
     if(tags.length)work.tags=tags;
     if(feedNeedsTagVerification() && !work.detailTagsVerified)
       throw new Error('作品固有のタグを確認できませんでした');
@@ -2674,7 +2675,7 @@
     const target=Number(priority);
     const works=[...feedWorks.values()]
       .filter(work => Number(work.searchPriority)===target && !excludedByTag(work) &&
-        !work.detailLoaded && !work.detailLoading && !work.detailQueued && !work.detailError)
+        !work.detailTagsVerified && !work.detailLoading && !work.detailQueued && !work.detailError)
       .sort(compareSavedSearchPriority)
       .slice(0,Math.max(1,Number(limit)||FEED_STEP));
     for(const work of works)enqueueDetail(work,generation);
@@ -2724,11 +2725,15 @@
     const total=feedStates.length,ok=feedStates.filter(x=>!x.error).length,bad=feedStates.filter(x=>x.error).length;
     const all=allSortedWorks(),ready=sortedWorks(),displayed=ready.slice(0,feedVisibleCount);
     const excluded=all.filter(excludedByTag).length;
-    const pending=feedNeedsTagVerification()?all.filter(w=>!excludedByTag(w)&&!w.detailLoaded&&!w.detailError).length:0;
-    const unknown=feedNeedsTagVerification()?all.filter(w=>!excludedByTag(w)&&(w.detailError||(w.detailLoaded&&!w.detailTagsVerified))).length:0;
+    const pending=feedNeedsTagVerification()?all.filter(w=>!excludedByTag(w)&&!w.detailTagsVerified&&!w.detailError).length:0;
+    const unknown=feedNeedsTagVerification()?all.filter(w=>!excludedByTag(w)&&!!w.detailError).length:0;
     const target=feedVisibleCount,covered=feedStates.filter(x=>x.error||x.done||stateCoverage(x)>=target).length;
     const coverageText=total?' ／ 横断同期 '+covered+'/'+total+'条件（各最大'+target+'件）':'';
-    const detailText=displayed.length?' ／ 新着順に詳細 '+displayed.filter(w=>w.detailLoaded).length+'/'+displayed.length:'';
+    const detailText=displayed.length
+      ? (feedNeedsTagVerification()
+          ? ' ／ 除外確認 '+displayed.filter(w=>w.detailTagsVerified).length+'/'+displayed.length
+          : ' ／ 新着順に詳細 '+displayed.filter(w=>w.detailLoaded).length+'/'+displayed.length)
+      : '';
     const tagText=feedNeedsTagVerification()?' ／ タグ確認待ち '+pending+'件'+(unknown?' ／ タグ確認不可 '+unknown+'件（非表示）':''):'';
     const active=feedStates.find(x=>x.processing);
     const activeText=active?' ／ 処理中 '+(Number(active.priority)+1)+'/'+total+'：'+(active.row?.name||active.row?.word||'保存検索'):'';
@@ -2934,9 +2939,9 @@
     if(!works.length&&!feedLoading){
       const all=allSortedWorks();
       const pending=feedNeedsTagVerification()&&all.some(w=>
-        !excludedByTag(w)&&!w.detailLoaded&&!w.detailError);
+        !excludedByTag(w)&&!w.detailTagsVerified&&!w.detailError);
       const failed=feedNeedsTagVerification()&&all.some(w=>
-        !excludedByTag(w)&&(w.detailError||(w.detailLoaded&&!w.detailTagsVerified)));
+        !excludedByTag(w)&&!!w.detailError);
       const p=document.createElement('p');
       p.className='pbsw-empty';
       p.textContent=pending?'タグを確認中です。未確認の作品は表示しません。'

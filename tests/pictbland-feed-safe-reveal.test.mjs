@@ -9,7 +9,7 @@ const w=(id,tags=[],loaded=false,verified=false,error='')=>({id,tags,detailLoade
 function setup(tags,works){
  return create(tags,new Map(works.map(x=>[x.id,x])),x=>x.tags.some(t=>tags.includes(t)),(a,b)=>b.id-a.id);
 }
-test('syntax/version',()=>{assert.doesNotThrow(()=>new Function(s));assert.match(s,/@version\s+0\.3\.49/);assert.match(meta,/@version\s+0\.3\.49/);});
+test('syntax/version',()=>{assert.doesNotThrow(()=>new Function(s));assert.match(s,/@version\s+0\.3\.50/);assert.match(meta,/@version\s+0\.3\.50/);});
 test('no exclusion means all results visible',()=>{assert.deepEqual(setup([],[w(3),w(2)]).sortedWorks().map(x=>x.id),[3,2]);});
 test('blocked/pending/failed/unverified stay hidden',()=>{
  const model=setup(['block'],[w(6,['safe']),w(5,['block']),w(4,['safe'],true,true),w(3,[],false,false,'failed'),w(2,['safe'],true,false),w(1,['safe'],true,true)]);
@@ -36,4 +36,13 @@ test('detail queue prioritizes saved-search order and skips extra render wait wh
  assert.match(s,/if\(!caption && !\(feedNeedsTagVerification\(\) && tags\.length\)\)/);
  assert.match(s,/detailCaptionFromDoc\(doc,work\) \|\| tagsFrom\(doc\)\.length/);
  assert.match(s,/rows\.map\(\(row,priority\) => \(\{/);
+});
+
+
+test('search-result tag links finish exclusion verification without detail access',()=>{
+ assert.match(s,/detailTagsVerified:tags\.length > 0/);
+ assert.match(s,/return !feedNeedsTagVerification\(\) \|\| !!work\.detailTagsVerified/);
+ assert.match(s,/!work\.detailTagsVerified && !work\.detailLoading/);
+ assert.match(s,/work\.detailTagsVerified=tags\.length > 0/);
+ assert.doesNotMatch(s,/work\.detailTagsVerified=!!\(caption \|\| tags\.length\)/);
 });
