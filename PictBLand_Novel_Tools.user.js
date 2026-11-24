@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.50
+// @version      0.3.51
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1007,6 +1007,7 @@
   const BUTTON_ID = 'pbsw-button';
   const ROOT_ID = 'pbsw-root';
   const MAX_SAVED = 200;
+  const PER_SEARCH_LIMIT = 15;
   const FEED_STEP = 50;
   const SEARCH_CONCURRENCY = 1;
   const DETAIL_CONCURRENCY = 2;
@@ -2363,16 +2364,23 @@
         cachePut(searchPageCache,pageUrl,copyCachedSearchPage(parsed,state),SEARCH_CACHE_MS);
       }
 
+      const acceptedWorks=[];
+      const remaining=Math.max(0,PER_SEARCH_LIMIT-state.loadedIds.size);
       for (const work of parsed.works) {
-        if (work?.id) state.loadedIds.add(String(work.id));
+        const id=work?.id ? String(work.id) : '';
+        if(!id || state.loadedIds.has(id))continue;
+        if(acceptedWorks.length>=remaining)break;
+        state.loadedIds.add(id);
+        acceptedWorks.push(work);
       }
       state.pagesFetched = Number(state.pagesFetched || 0) + 1;
 
       const next = parsed.nextHref ? absolutePageUrl(parsed.nextHref) : '';
       state.nextHref = next && !state.seenPages.has(next) ? next : '';
-      state.done = !state.nextHref;
+      state.done = state.loadedIds.size >= PER_SEARCH_LIMIT || !state.nextHref;
+      if(state.done)state.nextHref='';
       state.error = '';
-      mergeWorks(parsed.works);
+      mergeWorks(acceptedWorks);
 
       // If a page yielded no new IDs, following pagination further is unsafe:
       // it is usually a repeated/looping page rather than genuinely new data.
@@ -2465,36 +2473,30 @@
     return Number(state?.loadedIds?.size || 0);
   }
 
-  function coverageComplete(target) {
+  function coverageComplete() {
     return feedStates.every(state =>
-      !!state.error || !!state.done || stateCoverage(state) >= target
+      !!state.error || !!state.done || stateCoverage(state) >= PER_SEARCH_LIMIT
     );
   }
 
-  async function ensureCoverage(target, generation) {
-    // Saved-search order is intentional: finish the upper search before moving
-    // to the next one, so its tag verification can begin immediately.
+  async function ensureCoverage(_target, generation) {
+    // This feed is intentionally shallow: take only the newest 15 works from
+    // each saved condition, then merge all conditions and process globally by date.
     for (const state of feedStates) {
       if (generation !== feedGeneration || feedAbort?.signal.aborted) break;
-      if (state.error || state.done || !state.nextHref || stateCoverage(state) >= target) continue;
+      if (state.error || state.done || !state.nextHref || stateCoverage(state) >= PER_SEARCH_LIMIT) continue;
       state.processing = true;
       if (generation === feedGeneration) renderFeed();
 
       let rounds = 0;
       while (generation === feedGeneration && !feedAbort?.signal.aborted &&
-             !state.error && !state.done && state.nextHref && stateCoverage(state) < target) {
+             !state.error && !state.done && state.nextHref && stateCoverage(state) < PER_SEARCH_LIMIT) {
         const before = stateCoverage(state);
         await fetchSearchState(state,state.nextHref,generation);
         if (generation !== feedGeneration) break;
-
-        // Do not wait for every saved search to finish. As soon as this search
-        // yields works, start the exclusion-tag detail checks for this priority.
-        if (feedNeedsTagVerification())
-          enqueueDetailsForSearchPriority(state.priority,generation,target);
-
         renderFeed();
         const progressed = stateCoverage(state) > before || state.done || state.error;
-        if (!progressed || ++rounds >= 30) break;
+        if (!progressed || ++rounds >= 8) break;
       }
       state.processing = false;
       if (generation === feedGeneration) renderFeed();
@@ -2503,16 +2505,7 @@
 
   async function expandFeed() {
     if (feedLoading || !feedOpen) return;
-    const generation = feedGeneration;
-    const target = feedVisibleCount + FEED_STEP;
-    feedLoading = true;
-    renderFeed();
-
-    await ensureCoverage(target,generation);
-    if (generation !== feedGeneration) return;
-
-    feedVisibleCount = target;
-    feedLoading = false;
+    feedVisibleCount += FEED_STEP;
     renderFeed();
   }
 
@@ -2682,9 +2675,9 @@
   }
 
   function pumpDetailQueue() {
-    // Exclusion checking follows the user's saved-search order. Within one
-    // saved search, newer works still go first.
-    detailQueue.sort((a,b) => compareSavedSearchPriority(a.work,b.work));
+    // After every saved condition contributes at most 15 works, exclusion
+    // checks follow the merged feed's global newest-first order.
+    detailQueue.sort((a,b) => compareNewestWorks(a.work,b.work));
     while (detailActive < DETAIL_CONCURRENCY && detailQueue.length) {
       const job = detailQueue.shift();
       const work = job.work;
@@ -2727,8 +2720,8 @@
     const excluded=all.filter(excludedByTag).length;
     const pending=feedNeedsTagVerification()?all.filter(w=>!excludedByTag(w)&&!w.detailTagsVerified&&!w.detailError).length:0;
     const unknown=feedNeedsTagVerification()?all.filter(w=>!excludedByTag(w)&&!!w.detailError).length:0;
-    const target=feedVisibleCount,covered=feedStates.filter(x=>x.error||x.done||stateCoverage(x)>=target).length;
-    const coverageText=total?' ／ 横断同期 '+covered+'/'+total+'条件（各最大'+target+'件）':'';
+    const target=PER_SEARCH_LIMIT,covered=feedStates.filter(x=>x.error||x.done||stateCoverage(x)>=target).length;
+    const coverageText=total?' ／ 横断同期 '+covered+'/'+total+'条件（各最大'+PER_SEARCH_LIMIT+'件）':'';
     const detailText=displayed.length
       ? (feedNeedsTagVerification()
           ? ' ／ 除外確認 '+displayed.filter(w=>w.detailTagsVerified).length+'/'+displayed.length
@@ -2750,7 +2743,7 @@
       const chip = document.createElement('span');
       const name = state.row?.name || state.row?.word || '保存検索';
       const count = stateCoverage(state);
-      chip.textContent = name + ' ' + count + '件' + (state.error ? ' ⚠️' : state.processing ? ' ▶' : state.done ? ' ✓' : count >= feedVisibleCount ? ' ✓' : ' …');
+      chip.textContent = name + ' ' + count + '件' + (state.error ? ' ⚠️' : state.processing ? ' ▶' : state.done ? ' ✓' : count >= PER_SEARCH_LIMIT ? ' ✓' : ' …');
       if (state.error) chip.title = state.error;
       box.append(chip);
     }
@@ -2957,9 +2950,8 @@
     const hasHidden=works.length>feedVisibleCount;
     const candidates=feedNeedsTagVerification()?feedReviewCandidates():visible;
     const hasFurtherCandidates=feedNeedsTagVerification()&&candidates.length>feedVisibleCount;
-    const hasOlder=feedStates.some(s=>!s.error&&!s.done&&s.nextHref);
     showMore.hidden=!(hasHidden||hasFurtherCandidates);
-    older.hidden=hasHidden||hasFurtherCandidates||!hasOlder||feedLoading;
+    older.hidden=true;
     refresh.disabled=feedLoading;
     showMore.disabled=feedLoading;
     older.disabled=feedLoading;
@@ -2994,11 +2986,9 @@
     resetDetailQueue();
     renderFeed();
 
-    // To guarantee the first N global results, each individual saved search
-    // must contribute up to N newest works (or reach its end). Otherwise an
-    // unseen page from one condition can contain works newer than visible rows
-    // from another condition.
-    await ensureCoverage(feedVisibleCount,generation);
+    // Fetch only the newest 15 from each saved condition. Once all conditions
+    // contribute, the merged set is ordered globally by work date.
+    await ensureCoverage(PER_SEARCH_LIMIT,generation);
 
     if (generation !== feedGeneration) return;
     feedLoading = false;

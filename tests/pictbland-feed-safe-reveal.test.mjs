@@ -9,7 +9,7 @@ const w=(id,tags=[],loaded=false,verified=false,error='')=>({id,tags,detailLoade
 function setup(tags,works){
  return create(tags,new Map(works.map(x=>[x.id,x])),x=>x.tags.some(t=>tags.includes(t)),(a,b)=>b.id-a.id);
 }
-test('syntax/version',()=>{assert.doesNotThrow(()=>new Function(s));assert.match(s,/@version\s+0\.3\.50/);assert.match(meta,/@version\s+0\.3\.50/);});
+test('syntax/version',()=>{assert.doesNotThrow(()=>new Function(s));assert.match(s,/@version\s+0\.3\.51/);assert.match(meta,/@version\s+0\.3\.51/);});
 test('no exclusion means all results visible',()=>{assert.deepEqual(setup([],[w(3),w(2)]).sortedWorks().map(x=>x.id),[3,2]);});
 test('blocked/pending/failed/unverified stay hidden',()=>{
  const model=setup(['block'],[w(6,['safe']),w(5,['block']),w(4,['safe'],true,true),w(3,[],false,false,'failed'),w(2,['safe'],true,false),w(1,['safe'],true,true)]);
@@ -45,4 +45,13 @@ test('search-result tag links finish exclusion verification without detail acces
  assert.match(s,/!work\.detailTagsVerified && !work\.detailLoading/);
  assert.match(s,/work\.detailTagsVerified=tags\.length > 0/);
  assert.doesNotMatch(s,/work\.detailTagsVerified=!!\(caption \|\| tags\.length\)/);
+});
+
+
+test('each saved search is hard-capped at 15 and detail work is globally newest-first',()=>{
+ assert.match(s,/const PER_SEARCH_LIMIT = 15;/);
+ assert.match(s,/const remaining=Math\.max\(0,PER_SEARCH_LIMIT-state\.loadedIds\.size\)/);
+ assert.match(s,/state\.done = state\.loadedIds\.size >= PER_SEARCH_LIMIT \|\| !state\.nextHref/);
+ assert.match(s,/detailQueue\.sort\(\(a,b\) => compareNewestWorks\(a\.work,b\.work\)\)/);
+ assert.match(s,/older\.hidden=true/);
 });
