@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.51
+// @version      0.3.52
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -132,6 +132,25 @@
       .replace(/\n{5,}/g, '\n\n\n\n');
   }
 
+
+  function isNovelPaginationUiLine(value) {
+    const compact = String(value || '').normalize('NFKC')
+      .replace(/\u00a0/g,' ')
+      .replace(/[ \t　]+/g,' ')
+      .trim();
+    if (!compact) return false;
+    const normalized = compact.replace(/\s+/g,'');
+    if (/^本文\d+\/\d+(?:頁|ページ)?$/i.test(normalized)) return true;
+    if (/^頁指定/.test(normalized)) {
+      const rest = normalized.replace(/^頁指定[:：]?/,'');
+      const counters = rest.match(/\d+\/\d+(?:頁|ページ)?/g) || [];
+      if (counters.length >= 1 && counters.join('') === rest) return true;
+    }
+    const counters = normalized.match(/\d+\/\d+(?:頁|ページ)?/g) || [];
+    if (counters.length >= 2 && counters.join('') === normalized) return true;
+    return false;
+  }
+
   function parseMarker(line) {
     const compact = String(line || '').normalize('NFKC').replace(/\u00a0/g, ' ').trim();
     if (!compact || compact.length > 100) return null;
@@ -158,7 +177,7 @@
     for (const line of lines) {
       const cleaned = String(line || '').replace(/[ \t]+$/g, '');
       const trimmed = cleaned.trim();
-      if (navOnly.test(trimmed)) continue;
+      if (navOnly.test(trimmed) || isNovelPaginationUiLine(trimmed)) continue;
       if (hasBody && footer.test(trimmed)) break;
       out.push(cleaned);
       if (trimmed.length > 1) hasBody = true;
@@ -317,7 +336,7 @@
         const line = String(lines[i]||'').replace(/[ \t]+$/g,'');
         const t = short(line);
         if (endAt.test(t) && started) break;
-        if (dropLine.test(t)) continue;
+        if (dropLine.test(t) || isNovelPaginationUiLine(t)) continue;
         if (isUiDisplaySetting(t, !started)) continue;
         if (/^(?:ホーム|通知|検索|マイページ|フォロー|ブックマーク管理)$/.test(t) && !started) continue;
         if (/^本文\s*[0-9０-９]+\s*[\/／]\s*[0-9０-９]+\s*(?:頁|ページ)?$/.test(t)) break;
@@ -518,11 +537,14 @@
     let out = normalizeNewlines(text);
     out = out.replace(/\[\[rb:([\s\S]*?)\s*>\s*([^\]]*?)\]\]/g, (_, base) => base.trim());
 
-    // ページ送りなどのUI文字列は本文として保存しない。
+    // ページ送り・ページ指定UIは先頭／途中／末尾のどこにあってもTXTへ入れない。
     const navOnly = /^(?:前のページ|次のページ|前頁|次頁|前へ|次へ|作品に戻る)(?:\s*[>＞›»〈<])?$/;
     out = out
       .split('\n')
-      .filter(line => !navOnly.test(line.trim()))
+      .filter(line => {
+        const trimmed=line.trim();
+        return !navOnly.test(trimmed) && !isNovelPaginationUiLine(trimmed);
+      })
       .join('\n');
 
     return normalizeNovelEllipses(cleanupPlainText(out, 3));
@@ -893,7 +915,7 @@
     bar.className = 'pbnt-bar';
 
     const title = document.createElement('strong');
-    title.textContent = '📖 pictBLand 小説TXT v0.3.46';
+    title.textContent = '📖 pictBLand 小説TXT v0.3.52';
 
     const restore = document.createElement('button');
     restore.type = 'button';
