@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.46
+// @version      0.3.47
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -1003,6 +1003,7 @@
 
   const STORAGE_KEY = 'pictbland-saved-search-words-v1';
   const FEED_EXCLUDE_TAGS_KEY = 'pictbland-saved-search-feed-exclude-tags-v1';
+  const FEED_EXCLUDE_TAGS_UPDATED_KEY = 'pictbland-saved-search-feed-exclude-tags-updated-at-v1';
   const BUTTON_ID = 'pbsw-button';
   const ROOT_ID = 'pbsw-root';
   const MAX_SAVED = 200;
@@ -1207,9 +1208,30 @@
   }
 
   function saveExcludeTags(tags) {
-    feedExcludeTags = parseExcludeTags((tags || []).join('\n'));
-    try { localStorage.setItem(FEED_EXCLUDE_TAGS_KEY, JSON.stringify(feedExcludeTags)); } catch {}
+    const next = parseExcludeTags((tags || []).join('\n'));
+    const changed = JSON.stringify(feedExcludeTags) !== JSON.stringify(next);
+    feedExcludeTags = next;
+    try {
+      localStorage.setItem(FEED_EXCLUDE_TAGS_KEY, JSON.stringify(feedExcludeTags));
+      if (changed) localStorage.setItem(FEED_EXCLUDE_TAGS_UPDATED_KEY, String(Date.now()));
+    } catch {}
+    if (changed) {
+      // Notify the separate Niji Cloud script without sharing credentials.
+      try { window.dispatchEvent(new Event('pictbland-feed-exclude-tags-changed')); } catch {}
+    }
   }
+
+  function receiveSyncedExcludeTags() {
+    const incoming = readExcludeTags();
+    if (JSON.stringify(incoming) === JSON.stringify(feedExcludeTags)) return;
+    feedExcludeTags = incoming;
+    syncExcludeUi();
+    if (feedOpen) renderFeed();
+  }
+  window.addEventListener('pictbland-feed-exclude-tags-cloud-applied', receiveSyncedExcludeTags);
+  window.addEventListener('storage', event => {
+    if (event.key === FEED_EXCLUDE_TAGS_KEY) receiveSyncedExcludeTags();
+  });
 
   function excludedTagSet() {
     return new Set(feedExcludeTags.map(normalizeExcludeTag).filter(Boolean));
