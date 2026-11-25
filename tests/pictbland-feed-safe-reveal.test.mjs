@@ -26,8 +26,8 @@ function setup(tags,works){
 
 test('syntax/version',()=>{
   assert.doesNotThrow(()=>new Function(s));
-  assert.match(s,/@version\s+0\.3\.58/);
-  assert.match(meta,/@version\s+0\.3\.58/);
+  assert.match(s,/@version\s+0\.3\.59/);
+  assert.match(meta,/@version\s+0\.3\.59/);
 });
 
 test('no exclusion means results can appear immediately',()=>{
@@ -122,6 +122,14 @@ test('access-card diagnostics include badge and image DOM metadata',()=>{
  assert.match(s,/function badgeDiagnosticNodes\(card\)/);
  assert.match(s,/function imageDiagnosticNodes\(card\)/);
  assert.match(s,/detectedAccessBadges:\[\.\.\.\(work\.accessBadges\|\|\[\]\)\]/);
- assert.match(s,/diagnosticVersion:'0\.3\.58-access-card'/);
- assert.match(s,/JSON\.stringify\(\{version:'0\.3\.58',cards:records\}/);
+ assert.match(s,/diagnosticVersion:'0\.3\.59-access-card'/);
+ assert.match(s,/JSON\.stringify\(\{version:'0\.3\.59',cards:records\}/);
+});
+
+
+test('saved searches prefer rendered same-origin Safari session',()=>{
+ assert.match(s,/response = await renderedSearchHtml\(pageUrl,feedAbort\.signal\)/);
+ assert.match(s,/if \(missingCards && !renderedPrimary\)/);
+ assert.match(s,/data-pbsw-render-hidden/);
+ assert.match(s,/getAttribute\?\.\('data-pbsw-render-hidden'\)==='1'/);
 });

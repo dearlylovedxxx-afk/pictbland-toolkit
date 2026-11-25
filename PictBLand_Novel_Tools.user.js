@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.58
+// @version      0.3.59
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -915,7 +915,7 @@
     bar.className = 'pbnt-bar';
 
     const title = document.createElement('strong');
-    title.textContent = '📖 pictBLand 小説TXT v0.3.58';
+    title.textContent = '📖 pictBLand 小説TXT v0.3.59';
 
     const restore = document.createElement('button');
     restore.type = 'button';
@@ -1605,7 +1605,9 @@
   }
 
   function imageUrlFrom(card) {
-    const img = card?.querySelector?.('img');
+    const imgs=[...(card?.querySelectorAll?.('img')||[])]
+      .filter(img=>img.getAttribute?.('data-pbsw-render-hidden')!=='1');
+    const img=imgs[0]||null;
     if (!img) return '';
     const candidates = [
       img.getAttribute('src'),
@@ -1902,6 +1904,7 @@
 
   function accessBadgeNodeInactive(node,card) {
     if(!node)return true;
+    if(node.getAttribute?.('data-pbsw-render-hidden')==='1')return true;
     let cur=node;
     while(cur && cur!==card?.parentElement){
       if(cur.nodeType===1){
@@ -2192,7 +2195,7 @@
       badgeNodes:badgeDiagnosticNodes(card),
       imageNodes:imageDiagnosticNodes(card),
       textNodes:nodes.map(n=>({t:n.text.slice(0,130),role:n.role,tag:n.tag,cls:n.className})),
-      diagnosticVersion:'0.3.58-access-card'
+      diagnosticVersion:'0.3.59-session-card'
     });
   }
 
@@ -2202,7 +2205,7 @@
       alert('診断データがありません。「更新」を押して作品を再取得してから試してください。');
       return;
     }
-    const text=JSON.stringify({version:'0.3.58',cards:records},null,2);
+    const text=JSON.stringify({version:'0.3.59',cards:records},null,2);
     const fallback=()=>{
       const box=document.createElement('textarea');
       box.value=text;
@@ -2331,6 +2334,24 @@
       timer=setTimeout(()=>{
         try{
           const doc=iframe.contentDocument;
+          try{
+            for(const node of doc?.querySelectorAll?.(
+              '[class*="badge" i],[class*="chip" i],[class*="status" i],'+
+              '[class*="rating" i],[class*="visibility" i],[class*="access" i],'+
+              '[class*="restrict" i],[class*="locked" i],[class*="limited" i],'+
+              '[class*="permission" i],[data-visibility],[data-access],'+
+              '[data-restriction],[data-rating],img'
+            )||[]){
+              try{
+                const cs=iframe.contentWindow?.getComputedStyle?.(node);
+                if(node.hidden || node.getAttribute('aria-hidden')==='true' ||
+                   cs?.display==='none' || cs?.visibility==='hidden' ||
+                   Number(cs?.opacity)===0 ||
+                   (typeof node.getClientRects==='function' && node.getClientRects().length===0))
+                  node.setAttribute('data-pbsw-render-hidden','1');
+              }catch{}
+            }
+          }catch{}
           let html=doc?.documentElement?.outerHTML||'';
           try{
             const shadowParts=[];
@@ -2386,6 +2407,26 @@
                   && (named>0||waited>=6500))
                ||(isEmpty&&stableTicks>=2)){
               try{iframe.contentWindow?.scrollTo?.(0,0);}catch{}
+              // Preserve actual rendered visibility before serializing. A
+              // detached DOMParser cannot reproduce stylesheet/layout state.
+              try{
+                for(const node of doc.querySelectorAll(
+                  '[class*="badge" i],[class*="chip" i],[class*="status" i],'+
+                  '[class*="rating" i],[class*="visibility" i],[class*="access" i],'+
+                  '[class*="restrict" i],[class*="locked" i],[class*="limited" i],'+
+                  '[class*="permission" i],[data-visibility],[data-access],'+
+                  '[data-restriction],[data-rating],img'
+                )){
+                  try{
+                    const cs=iframe.contentWindow?.getComputedStyle?.(node);
+                    if(node.hidden || node.getAttribute('aria-hidden')==='true' ||
+                       cs?.display==='none' || cs?.visibility==='hidden' ||
+                       Number(cs?.opacity)===0 ||
+                       (typeof node.getClientRects==='function' && node.getClientRects().length===0))
+                      node.setAttribute('data-pbsw-render-hidden','1');
+                  }catch{}
+                }
+              }catch{}
               let html=doc.documentElement.outerHTML;
               try {
                 const shadowParts=[];
@@ -2442,33 +2483,43 @@
         parsed = copyCachedSearchPage(cached,state);
       } else {
         let response;
+        let renderedPrimary=false;
         try {
-          // Same-site fetch should use the signed-in Safari session.
-          response = await requestBrowserSearchHtml(pageUrl, feedAbort.signal);
+          // Use an actual same-origin Safari page as the primary source. On
+          // iOS userscript environments, fetch/GM HTML can be authenticated
+          // differently from the visible browser and pictBLand then returns
+          // follower/lock/R18 placeholder cards for the wrong viewer state.
+          await reserveNetworkSlot(feedAbort.signal);
+          response = await renderedSearchHtml(pageUrl,feedAbort.signal);
+          renderedPrimary=true;
         } catch (error) {
           if (error?.name === 'AbortError' || error?.rateLimited) throw error;
-          response = await requestHtml(pageUrl, feedAbort.signal);
+          try {
+            response = await requestBrowserSearchHtml(pageUrl,feedAbort.signal);
+          } catch (browserError) {
+            if (browserError?.name === 'AbortError' || browserError?.rateLimited) throw browserError;
+            response = await requestHtml(pageUrl,feedAbort.signal);
+          }
         }
         if (generation !== feedGeneration) return false;
         parsed = parseSearchPage(response.html,response.url,state);
         let sawGuestPage = !!parsed.loginPage;
-        // GM requests on Safari/Macaque may omit the logged-in browser session.
-        // Retry only a guest response with cookie-bearing first-party fetch,
-        // then the canonical word URL when a saved legacy URL is malformed.
-        if (parsed.loginPage) {
-          const urls = [pageUrl];
-          const canonical = state.pagesFetched === 0
-            ? absolutePageUrl(searchHrefForWord(state.row?.word || '')) : '';
-          if (canonical && !urls.includes(canonical)) urls.push(canonical);
-          for (const candidateUrl of urls) {
+
+        // If the rendered private URL unexpectedly lands on a guest page, try
+        // the canonical search URL in the same real Safari iframe before any
+        // lower-authority fetch transport.
+        if (parsed.loginPage && state.pagesFetched === 0) {
+          const canonical = absolutePageUrl(searchHrefForWord(state.row?.word || ''));
+          if (canonical && canonical!==pageUrl) {
             try {
-              const browserResponse = await requestBrowserSearchHtml(candidateUrl,feedAbort.signal);
+              await reserveNetworkSlot(feedAbort.signal);
+              const canonicalRendered=await renderedSearchHtml(canonical,feedAbort.signal);
               if (generation !== feedGeneration) return false;
-              const browserParsed = parseSearchPage(browserResponse.html,browserResponse.url,state);
+              const browserParsed=parseSearchPage(canonicalRendered.html,canonicalRendered.url,state);
               sawGuestPage ||= !!browserParsed.loginPage;
-              if (!browserParsed.loginPage) {
+              if(!browserParsed.loginPage){
                 parsed=browserParsed;
-                break;
+                renderedPrimary=true;
               }
             } catch (error) {
               if (error?.name === 'AbortError' || error?.rateLimited) throw error;
@@ -2479,7 +2530,7 @@
         const initialQuality=parsedSearchQuality(parsed);
         const missingCards=!parsed.empty && (initialQuality.count===0
           || initialQuality.meaningful < Math.max(1,Math.floor(initialQuality.count*0.45)));
-        if (missingCards) {
+        if (missingCards && !renderedPrimary) {
           // Work-ID references in HTML/JSON are not enough to claim that
           // details were obtained. Give the logged-in rendered UI a chance.
           try {
