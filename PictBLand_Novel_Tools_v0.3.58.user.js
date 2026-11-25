@@ -1,0 +1,4666 @@
+// ==UserScript==
+// @name         pictBLand 小説TXTツール
+// @namespace    local.pictbland.novel-text-tools
+// @version      0.3.58
+// @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
+// @match        https://pictbland.net/*
+// @run-at       document-idle
+// @noframes
+// @grant        GM.download
+// @grant        GM.xmlHttpRequest
+// @grant        GM_xmlhttpRequest
+// @connect      pictbland.net
+// @connect      *.pictbland.net
+// @updateURL    https://raw.githubusercontent.com/dearlylovedxxx-afk/pictbland-toolkit/main/PictBLand_Novel_Tools.meta.js
+// @downloadURL  https://raw.githubusercontent.com/dearlylovedxxx-afk/pictbland-toolkit/main/PictBLand_Novel_Tools.user.js
+// ==/UserScript==
+
+(() => {
+  'use strict';
+  if (window.__pictblandNovelTextToolsV010) return;
+  window.__pictblandNovelTextToolsV010 = true;
+
+  const ROOT_ID = 'pbnt-root';
+  const BUTTON_ID = 'pbnt-button';
+  const STYLE_ID = 'pbnt-style';
+
+  let overlay = null;
+  let pagesHost = null;
+  let statusNode = null;
+  let metaToggle = null;
+  let indentModeSelect = null;
+  let dialogueSpacingToggle = null;
+  let titleInput = null;
+  let original = null;
+  let shareInProgress = false;
+
+  function normalizeNewlines(text) {
+    return String(text ?? '')
+      .replace(/\r\n?/g, '\n')
+      .replace(/[\u0085\u2028\u2029]/g, '\n');
+  }
+
+  function normalizeTxtPunctuation(text) {
+    return String(text ?? '')
+      .replace(/\u203C\uFE0F?/g, '！！')
+      .replace(/\u2049\uFE0F?/g, '！？')
+      .replace(/\u2047\uFE0F?/g, '？？')
+      .replace(/\u2048\uFE0F?/g, '？！')
+      .replace(/\u2757\uFE0F?/g, '！')
+      .replace(/\u2753\uFE0F?/g, '？')
+      .replace(/!/g, '！')
+      .replace(/\?/g, '？');
+  }
+
+  function normalizeNovelEllipses(text) {
+    // The reader can render ellipses as ASCII/fullwidth periods or middle dots.
+    // Treat every three dots as one ellipsis; a final partial group rounds up.
+    // Match at least two dots, optionally separated by horizontal whitespace.
+    // Never alter a single period, Japanese full stop, or existing "…".
+    return String(text ?? '').replace(
+      /(?:[.．・･·․‧][ \t\u00a0　]*){1,}[.．・･·․‧]/g,
+      match => {
+        const dotCount = (match.match(/[.．・･·․‧]/g) || []).length;
+        return '…'.repeat(Math.ceil(dotCount / 3));
+      }
+    );
+  }
+
+  function cleanupPlainText(text, maxBreaks = 3) {
+    const re = new RegExp('\\n{' + (maxBreaks + 1) + ',}', 'g');
+    return normalizeNewlines(text)
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n[ \t]+/g, '\n')
+      .replace(re, '\n'.repeat(maxBreaks))
+      .replace(/^\n+|\n+$/g, '');
+  }
+
+  function renderedDocumentText(rootNode = document.body) {
+    const clone = rootNode.cloneNode(true);
+    clone.querySelectorAll(
+      'script,style,noscript,svg,canvas,iframe,#' + ROOT_ID + ',#' + BUTTON_ID +       ',#pbi-root,#pbsw-root,#pictbland-tools-unified-bar,#pictbland-tools-unified-launch,#pictbland-tools-unified-placeholder'
+    ).forEach(node => node.remove());
+
+    clone.querySelectorAll('ruby').forEach(ruby => {
+      const reading = [...ruby.querySelectorAll('rt')]
+        .map(rt => rt.textContent || '')
+        .join('')
+        .trim();
+      const copy = ruby.cloneNode(true);
+      copy.querySelectorAll('rt,rp').forEach(n => n.remove());
+      const base = (copy.textContent || '').trim();
+      ruby.replaceWith(document.createTextNode(base));
+    });
+
+    const blockTags = new Set([
+      'ADDRESS','ARTICLE','ASIDE','BLOCKQUOTE','DIV','DL','DT','DD','FIELDSET','FIGCAPTION',
+      'FIGURE','FOOTER','FORM','H1','H2','H3','H4','H5','H6','HEADER','HR','LI','MAIN',
+      'NAV','OL','P','PRE','SECTION','TABLE','TBODY','THEAD','TFOOT','TR','UL','BUTTON'
+    ]);
+    const ignoredTags = new Set(['IMG','PICTURE','SOURCE','VIDEO','AUDIO']);
+
+    const out = [];
+    const pushBreak = () => {
+      if (!out.length || out[out.length - 1] !== '\n') out.push('\n');
+    };
+
+    function walk(node) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        out.push(node.nodeValue || '');
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+      const tag = node.tagName;
+      if (ignoredTags.has(tag)) return;
+      if (tag === 'BR' || tag === 'HR') {
+        pushBreak();
+        return;
+      }
+
+      const block = blockTags.has(tag);
+      if (block) pushBreak();
+      for (const child of node.childNodes) walk(child);
+      if (block) pushBreak();
+    }
+
+    walk(clone);
+    return normalizeNewlines(out.join(''))
+      .replace(/\u00a0/g, ' ')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n[ \t]+/g, '\n')
+      .replace(/\n{5,}/g, '\n\n\n\n');
+  }
+
+
+  function isNovelPaginationUiLine(value) {
+    const compact = String(value || '').normalize('NFKC')
+      .replace(/\u00a0/g,' ')
+      .replace(/[ \t　]+/g,' ')
+      .trim();
+    if (!compact) return false;
+    const normalized = compact.replace(/\s+/g,'');
+    if (/^本文\d+\/\d+(?:頁|ページ)?$/i.test(normalized)) return true;
+    if (/^頁指定/.test(normalized)) {
+      const rest = normalized.replace(/^頁指定[:：]?/,'');
+      const counters = rest.match(/\d+\/\d+(?:頁|ページ)?/g) || [];
+      if (counters.length >= 1 && counters.join('') === rest) return true;
+    }
+    const counters = normalized.match(/\d+\/\d+(?:頁|ページ)?/g) || [];
+    if (counters.length >= 2 && counters.join('') === normalized) return true;
+    return false;
+  }
+
+  function parseMarker(line) {
+    const compact = String(line || '').normalize('NFKC').replace(/\u00a0/g, ' ').trim();
+    if (!compact || compact.length > 100) return null;
+
+    const match = compact.match(/^(?:本文\s*)?(\d+)\s*\/\s*(\d+)\s*(?:頁|ページ|p(?:age)?)?$/i);
+    if (!match) return null;
+
+    const page = Number(match[1]);
+    const total = Number(match[2]);
+    if (!Number.isInteger(page) || !Number.isInteger(total) || page < 1 || total < 1 || page > total || total > 500) {
+      return null;
+    }
+
+    return { page, total };
+  }
+
+  function cleanExtractedSegment(lines) {
+    const navOnly = /^(?:前のページ|次のページ|前頁|次頁|次ページ|前へ|次へ|作品に戻る|縦狭|縦普|縦広|横極|横狭|横普|無|ゴ|明)(?:\s*[>＞›»〈<])?$/;
+    // The 2026 viewer may mount only the current page. Do not take the
+    // site footer, action bar or recommendation cards as novel text.
+    const footer = /^(?:ステキ[!！]?|非公開ステキ|コメント(?:を投稿)?|作品を通報|表紙を表示|小説のみ表示|ブックマーク(?:に追加)?|シェアする|共有する|pictBLandツール)$/;
+    const out = [];
+    let hasBody = false;
+    for (const line of lines) {
+      const cleaned = String(line || '').replace(/[ \t]+$/g, '');
+      const trimmed = cleaned.trim();
+      if (navOnly.test(trimmed) || isNovelPaginationUiLine(trimmed)) continue;
+      if (hasBody && footer.test(trimmed)) break;
+      out.push(cleaned);
+      if (trimmed.length > 1) hasBody = true;
+    }
+    return cleanupPlainText(out.join('\n'), 3);
+  }
+
+  // The 2026 page counter is split across DOM nodes on some mobile layouts:
+  // 本文 + 1 / 2 + 頁. Rejoin only the counter, leaving the actual novel
+  // paragraphs and their original line breaks untouched.
+  function normalizeNovelMarkerLines(value) {
+    return normalizeNewlines(value).replace(
+      /本文\s*[0-9０-９]+\s*[\/／]\s*[0-9０-９]+\s*(?:頁|ページ)?/g,
+      match => '\n' + match.replace(/\s+/g, ' ').trim() + '\n'
+    );
+  }
+
+  // Recover exact page breaks from page containers when the 2026 reader
+  // displays every page within one continuous DOM. Never split at an
+  // arbitrary character count: only page-specific elements or markers.
+  function extractStructuredNovelPages() {
+    const selectors = [
+      '[data-novel-page]', '[data-novel-page-index]',
+      '.novel-page-content', '.novel_page_content',
+      '.novel-body-page', '.novel_body_page',
+      '#novel-body [data-page-index]',
+      '[class*="novel-page-"]', '[id^="novel-page-"]'
+    ];
+    let best=null;
+    for(const selector of selectors){
+      let nodes;
+      try{nodes=[...document.querySelectorAll(selector)];}catch{continue;}
+      nodes=nodes.filter(node=>{
+        if(node.closest('nav,header,footer,[role="navigation"]'))return false;
+        return !nodes.some(other=>other!==node&&node.contains(other));
+      });
+      if(nodes.length<2||nodes.length>500)continue;
+      const pages=nodes.map(node=>cleanupPlainText(renderedDocumentText(node),3));
+      const chars=pages.map(p=>p.replace(/\s/g,'').length);
+      if(chars.some(n=>n<50)||new Set(pages).size!==pages.length)continue;
+      const combined=pages.reduce((sum,page)=>sum+page.length,0);
+      if(combined>1000000)continue;
+      // Prefer the group with the most reliably separated prose.
+      const score=pages.length*1000000+combined;
+      if(!best||score>best.score)best={pages,score};
+    }
+    if(!best)return null;
+    return {
+      pages:best.pages,markerTotal:best.pages.length,markerCount:best.pages.length,
+      availablePages:best.pages.length,missingPages:[],
+      extractionMode:'structured-pages'
+    };
+  }
+
+  function splitAtExplicitNovelBreaks(value) {
+    // These literal editing tags may be retained in new reader markup.
+    // Match entire lines only, so a mention inside prose is not cut.
+    const marker=/^[ \t　]*(?:(?:\[\[?newpage\]?\])|(?:\[\[?pagebreak\]?\])|(?:\[\[?page\]?\])|(?:<!--\s*(?:pagebreak|newpage)\s*-->)|(?:〔改ページ〕)|(?:［改ページ］)|(?:---\s*改ページ\s*---))[ \t　]*$/i;
+    const parts=[],current=[];
+    let found=false;
+    for(const line of normalizeNewlines(value).split('\n')){
+      if(marker.test(line)){
+        const currentText=cleanupPlainText(current.join('\n'),3);
+        if(currentText)parts.push(currentText);
+        current.length=0;
+        found=true;
+      }else current.push(line);
+    }
+    const last=cleanupPlainText(current.join('\n'),3);
+    if(last)parts.push(last);
+    return found&&parts.length>1?parts:null;
+  }
+
+  function extractPagesFromDocument() {
+    // Keep the existing paginated reader first, but the current pictBLand
+    // reader also supports continuous novels with NO "本文 1 / n" at all.
+    const structured = extractStructuredNovelPages();
+    if(structured) return structured;
+    const sources = [renderedDocumentText()];
+    const visual = document.body?.innerText || '';
+    if (visual && visual !== sources[0]) sources.push(visual);
+    let bestPaged = null;
+    let bestPlain = null;
+    let lastError = null;
+    for (const source of sources) {
+      try {
+        const result = extractPagesFromSnapshot(source);
+        const score = result.availablePages * 1000000 +
+          result.pages.reduce((sum,page)=>sum+page.length,0);
+        if (!bestPaged || score > bestPaged.score) bestPaged = {result,score};
+      } catch (error) {
+        lastError = error;
+      }
+      try {
+        const result = extractUnpaginatedNovelFromSnapshot(source);
+        const score = result.pages[0].replace(/\s/g,'').length;
+        if (!bestPlain || score > bestPlain.score) bestPlain = {result,score};
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (bestPaged) return bestPaged.result;
+    if (bestPlain) {
+      const parts=splitAtExplicitNovelBreaks(bestPlain.result.pages[0]);
+      if(parts)return {
+        pages:parts,markerTotal:parts.length,markerCount:parts.length-1,
+        availablePages:parts.length,missingPages:[],
+        extractionMode:'explicit-pagebreaks'
+      };
+      return bestPlain.result;
+    }
+    throw lastError || new Error('小説の本文を見つけられませんでした');
+  }
+
+  // Fallback for the 2026 single-scroll reader (no page counter).
+  // On the actual novel page, "表示設定" is the reader's last toolbar.
+  // Extract from immediately after that toolbar; do not take title, tags,
+  // novel description or toolbar labels as the author's story.
+  function extractUnpaginatedNovelFromSnapshot(snapshot) {
+    const lines = normalizeNewlines(snapshot).split('\n');
+    const short = value => String(value||'').replace(/\u00a0/g,' ').replace(/[ \t　]+/g,' ').trim();
+    const starts = [];
+    for(let i=0;i<lines.length;i++){
+      const line = short(lines[i]);
+      if (/^表示設定$/.test(line) ||
+          (line.startsWith('表示設定') && line.length<=14 && !line.includes('設定を変更')))
+        starts.push(i);
+    }
+    if(!starts.length)
+      throw new Error('本文の表示設定が見つからないため、自動抽出できませんでした');
+    const dropLine = /^(?:ステキ[!！]?|非公開ステキ|コメント|コメントする|コメントを投稿|表紙を表示|小説のみ表示|表示設定|文字サイズ|行間|縦書き|横書き|閉じる|作品を通報|いいね|ブックマーク|シェア|ツール|pictBLandツール|小説TXT|画像保存|保存検索|Niji Cloud|メニュー|︙|…|次頁|前頁|次ページ|前ページ)$/;
+    const endAt = /^(?:コメント一覧|感想一覧|作品へのコメント|関連作品|おすすめ作品|この作者の作品|他の作品|タグ一覧|作品情報|ページの先頭へ|プライバシーポリシー|利用規約)$/;
+    // pictBLand's 2026 reader mounts the display-options popover in the
+    // document even when the panel is collapsed. Some text nodes are combined:
+    // "フォント：標準フォント：ゴシックフォント：明朝".
+    // Current UI may concatenate labels and options without punctuation:
+    // "書体標準ゴシック明朝", "行間狭い標準広い", followed by theme colors.
+    // Match the COMPLETE UI line, not prose mentioning a font or line spacing.
+    const uiGroup = /^(?:(?:文字(?:サイズ)?|テキストサイズ)(?::)?(?:極小|小|中|大|特大|極大|標準)+|(?:フォント|書体)(?::)?(?:標準フォント|ゴシックフォント|明朝フォント|標準|ゴシック|明朝)+|行間(?::)?(?:狭い|標準|広い)+|(?:テーマ|背景(?:色)?|文字色)(?::)?(?:標準|白|生成り|ミント|グレー|黒|ライト|ダーク|セピア)+)+$/;
+    const optionOnly = /^(?:文字(?:サイズ)?|テキストサイズ|フォント|書体|行間|テーマ|背景(?:色)?|文字色|極小|小|中|大|特大|極大|標準|標準フォント|ゴシック|ゴシックフォント|明朝|明朝フォント|狭い|広い|白|生成り|ミント|グレー|黒|ライト|ダーク|セピア)$/;
+    const isUiDisplaySetting = (line, beforeBody) => {
+      const normalized = String(line||'').normalize('NFKC')
+        .replace(/[\s\u00a0　]/g,'')
+        .replace(/：/g,':');
+      if (uiGroup.test(normalized)) return true;
+      // Standalone short options should only be dropped before the story;
+      // the same words may occur as legitimate prose later in the novel.
+      return beforeBody && optionOnly.test(normalized);
+    };
+    let best = null;
+    for (const start of starts) {
+      let body = [];
+      let proseChars = 0;
+      let started = false;
+      for (let i=start+1;i<lines.length;i++) {
+        const line = String(lines[i]||'').replace(/[ \t]+$/g,'');
+        const t = short(line);
+        if (endAt.test(t) && started) break;
+        if (dropLine.test(t) || isNovelPaginationUiLine(t)) continue;
+        if (isUiDisplaySetting(t, !started)) continue;
+        if (/^(?:ホーム|通知|検索|マイページ|フォロー|ブックマーク管理)$/.test(t) && !started) continue;
+        if (/^本文\s*[0-9０-９]+\s*[\/／]\s*[0-9０-９]+\s*(?:頁|ページ)?$/.test(t)) break;
+        if (t && (t.length >= 3 || /[。！？!?「」]/.test(t))) {
+          started = true;
+          proseChars += t.replace(/\s/g,'').length;
+        }
+        body.push(line);
+      }
+      // Don't treat a blank/locked novel or a UI-only fragment as saved text.
+      const text = cleanupPlainText(body.join('\n'),3);
+      if (proseChars < 50 || text.replace(/\s/g,'').length < 50) continue;
+      const result = {
+        pages:[text],
+        markerTotal:0,
+        markerCount:0,
+        availablePages:1,
+        missingPages:[],
+        extractionMode:'continuous-unpaginated'
+      };
+      const score = text.length;
+      if (!best || score > best.score) best = {result,score};
+    }
+    if(best) return best.result;
+    throw new Error('ページ番号がない本文の開始・終了を特定できませんでした');
+  }
+
+  function extractPagesFromSnapshot(snapshot) {
+    const lines = normalizeNovelMarkerLines(snapshot).split('\n');
+    const markers = [];
+
+    for (let i = 0; i < lines.length; i++) {
+      const info = parseMarker(lines[i]);
+      if (info) markers.push({ index: i, ...info });
+    }
+
+    if (!markers.length) {
+      throw new Error('本文ページ番号を検出できませんでした（v0.3.33）。本文の表示部分が読み込まれているか確認してください。');
+    }
+
+    const byTotal = new Map();
+    for (const marker of markers) {
+      if (!byTotal.has(marker.total)) byTotal.set(marker.total, []);
+      byTotal.get(marker.total).push(marker);
+    }
+
+    const rankedTotals = [...byTotal.entries()]
+      .map(([total, list]) => ({
+        total,
+        list,
+        distinct: new Set(list.map(m => m.page)).size
+      }))
+      .filter(g => g.list.some(m => m.page === 1))
+      .sort((a, b) => (b.distinct * 1000 + b.list.length) - (a.distinct * 1000 + a.list.length));
+
+    if (!rankedTotals.length) throw new Error('小説ページの区切りを判定できませんでした。');
+
+    const chosen = rankedTotals[0];
+    const chosenMarkers = chosen.list;
+    const markerIndexes = new Set(chosenMarkers.map(m => m.index));
+    const pages = [];
+
+    for (let page = 1; page <= chosen.total; page++) {
+      const occurrences = chosenMarkers.filter(m => m.page === page).map(m => m.index).sort((a, b) => a - b);
+      const candidates = [];
+
+      for (let j = 0; j < occurrences.length - 1; j++) {
+        const start = occurrences[j] + 1;
+        const end = occurrences[j + 1];
+        let hasOtherMarker = false;
+        for (let k = start; k < end; k++) {
+          if (markerIndexes.has(k)) {
+            hasOtherMarker = true;
+            break;
+          }
+        }
+        if (hasOtherMarker) continue;
+
+        const text = cleanExtractedSegment(lines.slice(start, end));
+        const score = text.replace(/\s/g, '').length;
+        if (score >= 1) candidates.push({ text, score });
+      }
+
+      if (!candidates.length && occurrences.length) {
+        const start = occurrences[0] + 1;
+        const nextMarker = chosenMarkers
+          .map(m => m.index)
+          .filter(i => i > occurrences[0])
+          .sort((a, b) => a - b)[0] ?? lines.length;
+        const text = cleanExtractedSegment(lines.slice(start, nextMarker));
+        const score = text.replace(/\s/g, '').length;
+        if (score >= 1) candidates.push({ text, score });
+      }
+
+      candidates.sort((a, b) => b.score - a.score);
+      pages.push(candidates[0]?.text || '');
+    }
+
+    const nonEmpty = pages.filter(Boolean);
+    if (!nonEmpty.length) throw new Error('本文を抽出できませんでした。');
+
+    return {
+      pages,
+      markerTotal: chosen.total,
+      markerCount: chosenMarkers.length,
+      availablePages: pages.filter(Boolean).length,
+      missingPages: pages.map((value,index)=>value?'':index+1).filter(Boolean)
+    };
+  }
+
+  function extractTitle() {
+    const generic = /(?:pictbland\.net|pictBLand|同人\s*[・･]?\s*BL|小説投稿SNS|イラスト\s*[・･]?\s*小説投稿SNS)/i;
+    const reject = /^(?:R18|R-18|鍵付|編集|表紙を表示|小|中|大|ステキ！?|ブクマ|非公開|前へ|次へ|前頁|次頁|コメント|プロフィールタグ)$/;
+
+    // まず作品本文の「1 / n」より上にある、見た目が見出しらしい要素を探す。
+    const all = [...document.querySelectorAll('body *')];
+    const marker = all.find(el => /^(?:本文\s*)?1\s*[\/／]\s*\d+\s*(?:頁|ページ)?$/.test((el.textContent || '').trim().replace(/\s+/g, ' ')));
+    const markerY = marker ? marker.getBoundingClientRect().top + window.scrollY : Infinity;
+
+    const candidates = [];
+    const seen = new Set();
+
+    for (const el of all) {
+      if (!(el instanceof HTMLElement)) continue;
+      const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!text || text.length < 2 || text.length > 180 || seen.has(text)) continue;
+      if (generic.test(text) || reject.test(text) || /\b\d+\s*\/\s*\d+\b/.test(text)) continue;
+      if (/^(?:投稿日|文字数|ステキ数|フォロー|タグ|プロフィール|メッセージ)/.test(text)) continue;
+      if (text.includes('pictBLandへようこそ')) continue;
+
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 20 || rect.height < 10) continue;
+      const y = rect.top + window.scrollY;
+      if (y >= markerY || y < 80) continue;
+
+      const style = getComputedStyle(el);
+      const size = parseFloat(style.fontSize) || 0;
+      const weight = parseInt(style.fontWeight, 10) || (style.fontWeight === 'bold' ? 700 : 400);
+      const tag = el.tagName;
+      const cls = String(el.className || '');
+
+      let score = 0;
+      if (/^H[1-6]$/.test(tag)) score += 120;
+      if (/title|subject|headline|item[_-]?name/i.test(cls)) score += 100;
+      if (size >= 24) score += 90;
+      else if (size >= 20) score += 65;
+      else if (size >= 17) score += 25;
+      if (weight >= 700) score += 45;
+      else if (weight >= 600) score += 25;
+      if (el.children.length === 0) score += 20;
+      if (text.length <= 80) score += 15;
+
+      if (score >= 60) {
+        candidates.push({ text, score, y });
+        seen.add(text);
+      }
+    }
+
+    candidates.sort((a, b) => b.score - a.score || a.y - b.y);
+    if (candidates[0]?.text) return candidates[0].text;
+
+    // セマンティック見出しを次点として使う。
+    const heading = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6')]
+      .map(el => (el.textContent || '').replace(/\s+/g, ' ').trim())
+      .find(text => text && text.length <= 180 && !generic.test(text) && !reject.test(text));
+    if (heading) return heading;
+
+    // サイト共通タイトルは採用しない。
+    const meta = document.querySelector('meta[property="og:title"]')?.content?.trim();
+    if (meta && !generic.test(meta)) return meta;
+
+    const docTitle = (document.title || '').trim();
+    if (docTitle && !generic.test(docTitle)) return docTitle;
+
+    return 'pictBLand小説';
+  }
+
+  function extractAuthor() {
+    const metaAuthor = document.querySelector('meta[name="author"]')?.content?.trim();
+    if (metaAuthor) return metaAuthor;
+
+    const links = [...document.querySelectorAll('a[href]')];
+    const candidate = links.find(a => {
+      try {
+        const u = new URL(a.href, location.href);
+        return /^\/users\/[^/]+\/?$/.test(u.pathname) && (a.textContent || '').trim();
+      } catch {
+        return false;
+      }
+    });
+    return (candidate?.textContent || '').trim();
+  }
+
+  // 画像保存側でも、小説TXTとまったく同じ作品タイトル判定を使う。
+  window.__pictblandNovelExtractTitle = extractTitle;
+
+  function normalizePictMarkup(text) {
+    let out = normalizeNewlines(text);
+    out = out.replace(/\[\[rb:([\s\S]*?)\s*>\s*([^\]]*?)\]\]/g, (_, base) => base.trim());
+
+    // ページ送り・ページ指定UIは先頭／途中／末尾のどこにあってもTXTへ入れない。
+    const navOnly = /^(?:前のページ|次のページ|前頁|次頁|前へ|次へ|作品に戻る)(?:\s*[>＞›»〈<])?$/;
+    out = out
+      .split('\n')
+      .filter(line => {
+        const trimmed=line.trim();
+        return !navOnly.test(trimmed) && !isNovelPaginationUiLine(trimmed);
+      })
+      .join('\n');
+
+    return normalizeNovelEllipses(cleanupPlainText(out, 3));
+  }
+
+  function safeFileName(name) {
+    const cleaned = String(name || 'pictBLand小説')
+      .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '＿')
+      .replace(/[. ]+$/g, '')
+      .trim();
+    return (cleaned || 'pictBLand小説').slice(0, 140) + '.txt';
+  }
+
+  function isNovelHeading(line) {
+    const s = line.trim();
+    if (!s || Array.from(s).length > 40) return false;
+    return /^(?:第.{1,18}[章話節幕部編]|序章|終章|序幕|終幕|幕間|間章|前書き|まえがき|後書き|あとがき|プロローグ|エピローグ|Prologue|Epilogue|Chapter\s*[0-9０-９]+|CHAPTER\s*[0-9０-９]+|[0-9０-９]+[.．、]\s*\S+)/i.test(s);
+  }
+
+  function isDialogueLike(line) {
+    return /^[「『（【〔［〈《“‘〝〟…‥―—─・※＊*#◇◆○●◎△▲▽▼□■☆★♪♩♬]/.test(line.trimStart());
+  }
+
+  function formatNovelText(text, addDialogueSpacing, indentMode) {
+    const rawLines = normalizeNewlines(text).split('\n').map(line => line.replace(/[ \t　]+$/g, ''));
+    const prepared = [];
+
+    for (let i = 0; i < rawLines.length; i++) {
+      const raw = rawLines[i];
+      if (!raw.trim()) {
+        prepared.push('');
+        continue;
+      }
+
+      const hadIndent = /^[ \t\u00a0　]+/.test(raw);
+      const visible = raw.replace(/^[ \t\u00a0　]+/g, '');
+      const heading = isNovelHeading(visible);
+      const special = isDialogueLike(visible);
+
+      let shouldIndent = false;
+      if (!heading && !special) {
+        if (indentMode === 'blank') {
+          shouldIndent = i === 0 || !rawLines[i - 1]?.trim() || hadIndent;
+        } else {
+          shouldIndent = true;
+        }
+      }
+      prepared.push(shouldIndent ? '　' + visible : visible);
+    }
+
+    const spaced = [];
+    for (const line of prepared) {
+      if (!line) {
+        if (spaced.length && spaced[spaced.length - 1] !== '') spaced.push('');
+        continue;
+      }
+
+      const heading = isNovelHeading(line);
+      if (heading && spaced.length && spaced[spaced.length - 1] !== '') spaced.push('');
+
+      if (addDialogueSpacing && spaced.length) {
+        let j = spaced.length - 1;
+        while (j >= 0 && spaced[j] === '') j--;
+        if (j >= 0 && spaced[spaced.length - 1] !== '') {
+          const prev = spaced[j];
+          if (!isNovelHeading(prev) && !heading && isDialogueLike(prev) !== isDialogueLike(line)) {
+            spaced.push('');
+          }
+        }
+      }
+
+      spaced.push(line);
+      if (heading) spaced.push('');
+    }
+
+    return normalizeNewlines(spaced.join('\n'))
+      .replace(/\n{4,}/g, '\n\n\n')
+      .replace(/^\n+|\n+$/g, '');
+  }
+
+  function buildOutput() {
+    if (!original || !pagesHost) return '';
+    const pages = [...pagesHost.querySelectorAll('.pbnt-page')]
+      .filter(card => card.querySelector('.pbnt-include')?.checked)
+      .map(card => normalizeNovelEllipses(cleanupPlainText(card.querySelector('textarea')?.value || '', 3)))
+      .filter(Boolean);
+
+    const parts = [];
+    if (metaToggle?.checked) {
+      parts.push(titleInput?.value.trim() || original.title || '無題');
+      if (original.author) parts.push(`作者：${original.author}`);
+      parts.push('');
+    }
+
+    parts.push(pages.join('\n\n\n\n\n\n'));
+    return normalizeTxtPunctuation(
+      normalizeNewlines(parts.join('\n'))
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/^\n+|\n+$/g, '')
+    ) + '\n';
+  }
+
+  function capturePageCards() {
+    return [...pagesHost.querySelectorAll('.pbnt-page')].map(card=>({
+      text:card.querySelector('textarea')?.value||'',
+      checked:card.querySelector('.pbnt-include')?.checked!==false
+    }));
+  }
+
+  function drawPages(pages) {
+    pagesHost.replaceChildren();
+    pages.forEach((value,index)=>{
+      const input=typeof value==='string'?{text:normalizePictMarkup(value),checked:true}:value;
+      const text=String(input?.text||'');
+      const card=document.createElement('section');
+      card.className='pbnt-page';
+      if(input.checked===false)card.classList.add('pbnt-excluded');
+      const head=document.createElement('div');
+      head.className='pbnt-page-head';
+      const label=document.createElement('label');
+      const include=document.createElement('input');
+      include.type='checkbox';
+      include.checked=input.checked!==false;
+      include.className='pbnt-include';
+      label.append(include,document.createTextNode(' ページ '+(index+1)+' を保存'));
+      const chars=document.createElement('span');
+      chars.textContent=Array.from(text).length.toLocaleString('ja-JP')+'字';
+      const textarea=document.createElement('textarea');
+      textarea.value=text;
+      textarea.spellcheck=false;
+      textarea.setAttribute('aria-label','ページ'+(index+1)+' 本文');
+      textarea.addEventListener('input',()=>{
+        chars.textContent=Array.from(textarea.value).length.toLocaleString('ja-JP')+'字';
+      });
+      include.addEventListener('change',()=>{
+        card.classList.toggle('pbnt-excluded',!include.checked);
+      });
+      const actions=document.createElement('div');
+      actions.className='pbnt-page-actions';
+      const split=document.createElement('button');
+      split.type='button';
+      split.textContent='✂️ カーソル位置でページを分割';
+      split.title='本文の分割したい位置にカーソルを置いてから押すと、続きが次ページになります';
+      split.addEventListener('click',()=>{
+        const pos=textarea.selectionStart;
+        const before=textarea.value.slice(0,pos);
+        const after=textarea.value.slice(pos);
+        if(!before.trim()||!after.trim()){
+          statusNode.textContent='ページを分けたい位置（本文の途中）にカーソルを置いてから「分割」を押してください。';
+          textarea.focus();
+          return;
+        }
+        const entries=capturePageCards();
+        entries.splice(index,1,
+          {text:before,checked:include.checked},
+          {text:after,checked:include.checked});
+        drawPages(entries);
+        const next=pagesHost.querySelectorAll('.pbnt-page')[index+1];
+        next?.scrollIntoView?.({block:'nearest'});
+        statusNode.textContent='ページ '+(index+1)+' を分割し、全'+entries.length+'ページにしました。各ページの保存チェックを個別に変更できます。';
+      });
+      actions.append(split);
+      head.append(label,chars);
+      card.append(head,textarea,actions);
+      pagesHost.append(card);
+    });
+  }
+
+  function restorePages() {
+    if (!original) return;
+    drawPages(original.pages);
+    statusNode.textContent = '抽出時の本文に戻しました。';
+  }
+
+  function formatAllPages() {
+    if (!pagesHost) return;
+    const cards = [...pagesHost.querySelectorAll('.pbnt-page')];
+
+    for (const card of cards) {
+      const textarea = card.querySelector('textarea');
+      if (!textarea) continue;
+      textarea.value = formatNovelText(
+        textarea.value,
+        !!dialogueSpacingToggle?.checked,
+        indentModeSelect?.value || 'blank'
+      );
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    const indentLabel = indentModeSelect?.value === 'blank' ? '空行の後だけ字下げ' : '改行ごとに字下げ';
+    statusNode.textContent = dialogueSpacingToggle?.checked
+      ? `小説向けに整形しました（${indentLabel}／会話と地の文の切り替わりに空行あり）。`
+      : `小説向けに整形しました（${indentLabel}）。`;
+  }
+
+  async function copyText() {
+    const text = buildOutput();
+    if (!text.trim()) return;
+
+    try {
+      await navigator.clipboard.writeText(text);
+      statusNode.textContent = '編集後の本文をコピーしました。';
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.append(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      statusNode.textContent = ok ? '編集後の本文をコピーしました。' : 'コピーできませんでした。';
+    }
+  }
+
+  function downloadText() {
+    if (!original) return;
+    const text = buildOutput();
+    if (!text.trim()) {
+      statusNode.textContent = '保存する本文がありません。';
+      return;
+    }
+
+    const file = new File([text], safeFileName(titleInput?.value.trim() || original.title), { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(file);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = file.name;
+    a.rel = 'noopener';
+    a.style.display = 'none';
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    statusNode.textContent = original.incompletePages?.length
+      ? '⚠️ 取得済み部分のみTXTに保存しました。未取得ページ：' + original.incompletePages.join('、') + '頁'
+      : 'TXTをダウンロードしました。';
+  }
+
+  async function shareText() {
+    if (!original || shareInProgress) return;
+    const text = buildOutput();
+    if (!text.trim()) {
+      statusNode.textContent = '共有する本文がありません。';
+      return;
+    }
+
+    // iOS "Save to Files" can treat a Web Share title/text as a second item.
+    // Send only ONE named TXT file; do not supply title, text, or URL fields.
+    const file = new File([text], safeFileName(titleInput?.value.trim() || original.title), { type: 'text/plain' });
+    const shareData = { files: [file] };
+    if (typeof navigator.share !== 'function' || !navigator.canShare?.(shareData)) {
+      statusNode.textContent = 'このブラウザではファイル共有に対応していません。ダウンロードをお使いください。';
+      return;
+    }
+
+    shareInProgress = true;
+    statusNode.textContent = '作品名付きTXTファイル1件を共有シートに送信中…';
+    try {
+      await navigator.share(shareData);
+      statusNode.textContent = '共有シートを閉じました。ファイルアプリで保存できたか確認してください。';
+    } catch (err) {
+      statusNode.textContent = err?.name === 'AbortError'
+        ? '共有をキャンセルしました。'
+        : `共有できませんでした：${err?.message || err}`;
+    } finally {
+      shareInProgress = false;
+    }
+  }
+
+  function openEditor() {
+    overlay.classList.add('pbnt-open');
+    pagesHost.replaceChildren();
+    statusNode.textContent = 'ページ内から小説本文を抽出中…';
+
+    try {
+      const extracted = extractPagesFromDocument();
+      const title = extractTitle();
+      const author = extractAuthor();
+
+      original = {
+        title,
+        author,
+        pages: extracted.pages.map(normalizePictMarkup),
+        incompletePages: extracted.missingPages,
+        url: location.href
+      };
+
+      if (titleInput) titleInput.value = title;
+      drawPages(original.pages);
+      const totalChars = original.pages.reduce((sum, page) => sum + Array.from(page).length, 0);
+      statusNode.textContent = extracted.extractionMode === 'continuous-unpaginated'
+        ? `本文を直接抽出：${totalChars.toLocaleString('ja-JP')}字（元のページ区切りは未検出）。本文の途中にカーソルを置き「✂️ カーソル位置でページを分割」でページごとに分けられます。`
+        : extracted.missingPages.length
+          ? `⚠️ 本文${extracted.markerTotal}頁のうち${extracted.availablePages}頁のみ取得（未取得：${extracted.missingPages.join('、')}頁）。TXTは取得済み部分だけです。次頁を開いて再取得してください。取得済み${totalChars.toLocaleString('ja-JP')}字`
+          : `取得成功：${extracted.availablePages}ページ／${totalChars.toLocaleString('ja-JP')}字` +
+            `（ページ区切り ${extracted.markerCount}個検出）`;
+    } catch (err) {
+      original = null;
+      statusNode.textContent = `取得失敗：${err?.message || err}`;
+      const help = document.createElement('div');
+      help.className = 'pbnt-error';
+      help.textContent = 'この表示と作品ページのスクリーンショットを教えてください。pictBLand側の構造に合わせて修正します。';
+      pagesHost.append(help);
+    }
+  }
+
+  function injectCss() {
+    if (document.getElementById(STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = STYLE_ID;
+    style.textContent = `
+      #${BUTTON_ID}{position:fixed;right:14px;bottom:max(76px,env(safe-area-inset-bottom));z-index:2147483000;border:0;border-radius:999px;padding:11px 15px;background:#7356a8;color:#fff;font:700 14px/1.2 -apple-system,BlinkMacSystemFont,'Noto Sans JP',sans-serif;box-shadow:0 4px 16px #0003}
+      #${ROOT_ID}{display:none;position:fixed;inset:0;z-index:2147483646;background:#f4f6f8;color:#202124;font-family:-apple-system,BlinkMacSystemFont,'Noto Sans JP',sans-serif;overflow:auto;-webkit-overflow-scrolling:touch}
+      #${ROOT_ID}.pbnt-open{display:block}
+      #${ROOT_ID} *{box-sizing:border-box}
+      .pbnt-header{position:sticky;top:0;z-index:3;background:#fff;border-bottom:1px solid #dfe3e8;padding:10px 12px;box-shadow:0 2px 8px #0000000d}
+      .pbnt-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;max-width:980px;margin:auto}
+      .pbnt-bar strong{font-size:16px;margin-right:auto}
+      .pbnt-bar button{border:1px solid #ccd2d9;background:#fff;color:#202124;border-radius:8px;padding:8px 10px;font:inherit;font-weight:600}
+      .pbnt-bar .pbnt-primary{background:#7356a8;color:#fff;border-color:#7356a8}
+      .pbnt-meta{max-width:980px;margin:8px auto 0;display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:12px;color:#59636e}
+      .pbnt-meta select,.pbnt-meta input[type=text]{font:inherit;border:1px solid #ccd2d9;border-radius:7px;padding:5px;background:#fff;color:#202124}
+      .pbnt-status{max-width:980px;margin:7px auto 0;font-size:12px;color:#59636e;overflow-wrap:anywhere}
+      .pbnt-pages{max-width:980px;margin:0 auto;padding:12px 10px 80px}
+      .pbnt-page{background:#fff;border:1px solid #dfe3e8;border-radius:10px;margin:0 0 12px;padding:10px;transition:opacity .15s}
+      .pbnt-page.pbnt-excluded{opacity:.46}
+      .pbnt-page-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:7px;font-size:13px;font-weight:700}
+      .pbnt-page-head span{font-size:11px;color:#727d88;font-weight:400}
+      .pbnt-page textarea{display:block;width:100%;min-height:46vh;resize:vertical;border:1px solid #ccd2d9;border-radius:8px;padding:12px;background:#fff;color:#202124;font:15px/1.8 ui-monospace,SFMono-Regular,Menlo,'Noto Sans JP',monospace;white-space:pre-wrap}
+      .pbnt-page-actions{display:flex;gap:8px;margin:8px 0 2px}
+      .pbnt-page-actions button{border:1px solid #ccd2d9;border-radius:7px;background:#f8f9fb;color:#343942;padding:7px 10px;font-size:12px;font-weight:600}
+      .pbnt-error{background:#fff3f3;color:#b42318;border:1px solid #f3c3c3;border-radius:8px;padding:12px}
+      @media(max-width:600px){
+        #${BUTTON_ID}{right:12px;bottom:max(76px,env(safe-area-inset-bottom));padding:10px 13px}
+        .pbnt-header{padding:8px}
+        .pbnt-bar{gap:6px}
+        .pbnt-bar button{padding:7px 8px;font-size:12px}
+        .pbnt-bar strong{width:100%;font-size:15px}
+        .pbnt-meta{font-size:11px}
+        .pbnt-pages{padding:10px 7px 70px}
+        .pbnt-page{padding:8px}
+        .pbnt-page textarea{min-height:52vh;font-size:14px;line-height:1.75}
+      }
+    `;
+    document.head.append(style);
+  }
+
+  function buildUi() {
+    if (document.getElementById(ROOT_ID)) return;
+    injectCss();
+
+    const button = document.createElement('button');
+    button.id = BUTTON_ID;
+    button.type = 'button';
+    button.textContent = '📖 小説TXT';
+    button.addEventListener('click', openEditor);
+
+    overlay = document.createElement('div');
+    overlay.id = ROOT_ID;
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+
+    const header = document.createElement('header');
+    header.className = 'pbnt-header';
+
+    const bar = document.createElement('div');
+    bar.className = 'pbnt-bar';
+
+    const title = document.createElement('strong');
+    title.textContent = '📖 pictBLand 小説TXT v0.3.58';
+
+    const restore = document.createElement('button');
+    restore.type = 'button';
+    restore.textContent = '↩ 原文に戻す';
+    restore.addEventListener('click', restorePages);
+
+    const format = document.createElement('button');
+    format.type = 'button';
+    format.textContent = '📖 小説向け整形';
+    format.addEventListener('click', formatAllPages);
+
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.textContent = 'コピー';
+    copy.addEventListener('click', copyText);
+
+    const download = document.createElement('button');
+    download.type = 'button';
+    download.className = 'pbnt-primary';
+    download.textContent = '⬇️ ダウンロード';
+    download.addEventListener('click', downloadText);
+
+    const share = document.createElement('button');
+    share.type = 'button';
+    share.textContent = '📤 共有して保存';
+    share.addEventListener('click', shareText);
+
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.textContent = '閉じる';
+    close.addEventListener('click', () => overlay.classList.remove('pbnt-open'));
+
+    bar.append(title, restore, format, copy, download, share, close);
+
+    const meta = document.createElement('div');
+    meta.className = 'pbnt-meta';
+
+    const titleLabel = document.createElement('label');
+    titleLabel.append(document.createTextNode('ファイル名：'));
+    titleInput = document.createElement('input');
+    titleInput.type = 'text';
+    titleInput.placeholder = '作品タイトル';
+    titleInput.setAttribute('aria-label', 'TXTファイル名');
+    titleInput.style.minWidth = '220px';
+    titleInput.style.maxWidth = '100%';
+    titleLabel.append(titleInput);
+
+    const metaLabel = document.createElement('label');
+    metaToggle = document.createElement('input');
+    metaToggle.type = 'checkbox';
+    metaToggle.checked = false;
+    metaLabel.append(metaToggle, document.createTextNode(' タイトル・作者名をTXT先頭に入れる'));
+
+    const indentLabel = document.createElement('label');
+    indentLabel.append(document.createTextNode('字下げ：'));
+    indentModeSelect = document.createElement('select');
+    indentModeSelect.append(
+      new Option('空行の後だけ', 'blank'),
+      new Option('改行ごと', 'line')
+    );
+    indentModeSelect.value = 'blank';
+    indentLabel.append(indentModeSelect);
+
+    const dialogueLabel = document.createElement('label');
+    dialogueSpacingToggle = document.createElement('input');
+    dialogueSpacingToggle.type = 'checkbox';
+    dialogueSpacingToggle.checked = false;
+    dialogueLabel.append(dialogueSpacingToggle, document.createTextNode(' 整形時、会話と地の文の間を1行空ける'));
+
+    const hint = document.createElement('span');
+    hint.textContent = '不要なページはチェックOFF／一部分だけ消す場合は本文を直接編集';
+
+    meta.append(titleLabel, metaLabel, indentLabel, dialogueLabel, hint);
+
+    statusNode = document.createElement('div');
+    statusNode.className = 'pbnt-status';
+    statusNode.textContent = 'まだ抽出していません。';
+
+    pagesHost = document.createElement('main');
+    pagesHost.className = 'pbnt-pages';
+
+    header.append(bar, meta, statusNode);
+    overlay.append(header, pagesHost);
+    document.body.append(button, overlay);
+  }
+
+  function init() {
+    if (!document.body) {
+      requestAnimationFrame(init);
+      return;
+    }
+
+    // 検索ページでも同じuserscriptを動かすため、小説TXT UIは作品詳細ページだけに出す。
+    if (/^\/items\/detail\//.test(location.pathname)) buildUi();
+  }
+
+  init();
+})();
+
+
+
+// ---- Saved pictBLand searches + cross-search newest feed (v0.2.0) ----
+(() => {
+  'use strict';
+  if (window.__pictblandSavedSearchWordsV020) return;
+  window.__pictblandSavedSearchWordsV020 = true;
+
+  const STORAGE_KEY = 'pictbland-saved-search-words-v1';
+  const FEED_EXCLUDE_TAGS_KEY = 'pictbland-saved-search-feed-exclude-tags-v1';
+  const FEED_EXCLUDE_TAGS_UPDATED_KEY = 'pictbland-saved-search-feed-exclude-tags-updated-at-v1';
+  const BUTTON_ID = 'pbsw-button';
+  const ROOT_ID = 'pbsw-root';
+  const MAX_SAVED = 200;
+  const PER_SEARCH_LIMIT = 15;
+  const FEED_STEP = 50;
+  const SEARCH_CONCURRENCY = 1;
+  const DETAIL_CONCURRENCY = 2;
+  const REQUEST_INTERVAL_MS = 2200;
+  const SEARCH_CACHE_MS = 120000;
+  const DETAIL_CACHE_MS = 300000;
+  const RATE_LIMIT_COOLDOWN_MS = 600000;
+
+  let root = null;
+  let quickInput = null;
+
+  let feedOpen = false;
+  let feedLoading = false;
+  let feedGeneration = 0;
+  let feedAbort = null;
+  let feedStates = [];
+  let feedWorks = new Map();
+  let feedVisibleCount = FEED_STEP;
+  let feedObserver = null;
+  let detailQueue = [];
+  let detailActive = 0;
+  let feedAutoExpandTimer = null;
+  let feedExcludeTags = readExcludeTags();
+  // The saved-search feed shares a paced request gate across search pages,
+  // visible work details and iframe fallbacks.
+  let networkGate = Promise.resolve();
+  let nextNetworkAt = 0;
+  let blockedUntil = 0;
+  const searchPageCache = new Map();
+  const detailHtmlCache = new Map();
+
+  function abortError() {
+    const error = new Error('取得を中止しました');
+    error.name = 'AbortError';
+    return error;
+  }
+  function rateLimitError() {
+    const error = new Error('429：pictBLandのアクセス制限です。10分間は自動通信を停止します。');
+    error.rateLimited = true;
+    return error;
+  }
+  function cacheGet(cache, key) {
+    const row = cache.get(key);
+    if (!row) return null;
+    if (row.expires <= Date.now()) { cache.delete(key); return null; }
+    return row.value;
+  }
+  function cachePut(cache, key, value, duration) {
+    cache.delete(key);
+    cache.set(key, {value, expires:Date.now() + duration});
+    while (cache.size > 240) cache.delete(cache.keys().next().value);
+  }
+  function sleepAbortable(ms, signal) {
+    if (signal?.aborted) return Promise.reject(abortError());
+    return new Promise((resolve, reject) => {
+      let timer;
+      const onAbort = () => { clearTimeout(timer); signal?.removeEventListener('abort',onAbort); reject(abortError()); };
+      timer = setTimeout(() => { signal?.removeEventListener('abort',onAbort); resolve(); },ms);
+      signal?.addEventListener('abort',onAbort,{once:true});
+    });
+  }
+  async function reserveNetworkSlot(signal) {
+    let release;
+    const preceding = networkGate;
+    networkGate = new Promise(resolve => { release = resolve; });
+    try {
+      await preceding;
+      if (signal?.aborted) throw abortError();
+      if (Date.now() < blockedUntil) throw rateLimitError();
+      const delay = Math.max(0, nextNetworkAt - Date.now());
+      if (delay) await sleepAbortable(delay,signal);
+      if (signal?.aborted) throw abortError();
+      if (Date.now() < blockedUntil) throw rateLimitError();
+      nextNetworkAt = Date.now() + REQUEST_INTERVAL_MS;
+    } finally { release(); }
+  }
+  function copyCachedSearchPage(parsed, state) {
+    return {...parsed, works:(parsed.works || []).map(work => ({
+      ...work,
+      tags:[...(work.tags || [])],
+      accessBadges:[...(work.accessBadges || [])],
+      matches:new Set([state.row?.name || state.row?.word || '保存検索']),
+      searchPriority:Number.isFinite(Number(state.priority)) ? Number(state.priority) : Number(work.searchPriority || 0),
+      detailLoaded:false,
+      detailTagsVerified:!!(work.detailTagsVerified || (work.tags || []).length),
+      detailLoading:false,
+      detailQueued:false,
+      detailError:''
+    }))};
+  }
+
+  const PENDING_REBIND_KEY = 'pictbland-saved-search-rebind-id-v1';
+
+  function isPrivateSearchHref(href, word = '') {
+    if (!href) return false;
+    try {
+      const url = new URL(href, location.origin);
+      if (url.origin !== location.origin) return false;
+      const m = url.pathname.match(/^\/tags\/index\/([^/]+)\/?$/);
+      if (!m) return false;
+      const slug = decodeURIComponent(m[1]);
+      // Old keyword URLs (+word+ and plain /word) no longer work.
+      if (!/^[a-zA-Z0-9_-]{6,}$/.test(slug) || slug.includes('+')) return false;
+      if (word && slug.toLocaleLowerCase('ja-JP') === String(word).trim().toLocaleLowerCase('ja-JP')) return false;
+      return true;
+    } catch { return false; }
+  }
+
+  function currentSearch() {
+    const href = location.pathname + location.search;
+    if (!isPrivateSearchHref(href)) return null;
+    // The private identifier contains no search word; never invent one.
+    const matched = readSaved().find(row =>
+      isPrivateSearchHref(row.href, row.word) && row.href === href
+    );
+    return matched ? {word:matched.word,href} : null;
+  }
+
+  // The site now issues owner-specific search URLs itself. A word is no
+  // longer sufficient to construct a valid URL; do not guess the token.
+  function searchHrefForWord() { return ''; }
+
+  function bindCurrentSearch() {
+    const href = location.pathname + location.search;
+    if (!isPrivateSearchHref(href)) {
+      alert('pictBLandの標準検索で作品一覧を開いてから、もう一度お試しください。旧形式のURLは登録できません。');
+      return;
+    }
+    const rows = readSaved();
+    if (!rows.length) {
+      alert('紐づける保存検索がありません。先に保存検索へ検索語を登録してください。');
+      return;
+    }
+    let id = '';
+    try { id = localStorage.getItem(PENDING_REBIND_KEY) || ''; } catch {}
+    let selected = rows.find(row => row.id === id);
+    if (!selected) {
+      const message = 'この検索結果を紐づける保存検索の番号を入力してください。\n'
+        + rows.map((row,i) => (i+1) + '. ' + (row.name || row.word)).join('\n');
+      const choice = prompt(message,'1');
+      if (choice == null) return;
+      const index = Number(choice) - 1;
+      if (!Number.isInteger(index) || !rows[index]) {
+        alert('保存検索の番号が正しくありません。');
+        return;
+      }
+      selected = rows[index];
+    }
+    selected.href = href;
+    selected.updatedAt = Date.now();
+    writeSaved(rows);
+    try { localStorage.removeItem(PENDING_REBIND_KEY); } catch {}
+    alert('「' + (selected.name || selected.word) + '」に、本人専用の新しい検索結果URLを登録しました。');
+  }
+
+  function beginRebind(id) {
+    const row = readSaved().find(item => item.id === id);
+    if (!row) return;
+    try { localStorage.setItem(PENDING_REBIND_KEY,id); } catch {}
+    closePanel();
+    alert('「' + row.word + '」をpictBLand本来の検索欄から検索してください。\n作品一覧が開いたら「🔖 保存検索」→「この検索結果を紐づけ」を押してください。\n既存の検索名・除外設定は保持します。');
+  }
+
+  function readSaved() {
+    try {
+      const value = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+      if (!Array.isArray(value)) return [];
+      return value.filter(x => x && typeof x.word === 'string' && x.word.trim());
+    } catch {
+      return [];
+    }
+  }
+
+  function writeSaved(rows) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(rows.slice(0, MAX_SAVED)));
+    render();
+  }
+
+  function normalizeExcludeTag(value) {
+    return String(value || '').trim().replace(/^#+/, '').normalize('NFKC').toLocaleLowerCase('ja-JP');
+  }
+
+  function parseExcludeTags(value) {
+    const parts = String(value || '').split(/[\n,、]+/).map(x => x.trim()).filter(Boolean);
+    const unique = new Map();
+    for (const raw of parts) {
+      const key = normalizeExcludeTag(raw);
+      if (!key || unique.has(key)) continue;
+      unique.set(key, raw.replace(/^#+/, '').trim());
+    }
+    return [...unique.values()];
+  }
+
+  function readExcludeTags() {
+    try {
+      const value = JSON.parse(localStorage.getItem(FEED_EXCLUDE_TAGS_KEY) || '[]');
+      return Array.isArray(value) ? parseExcludeTags(value.join('\n')) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveExcludeTags(tags) {
+    const next = parseExcludeTags((tags || []).join('\n'));
+    const changed = JSON.stringify(feedExcludeTags) !== JSON.stringify(next);
+    feedExcludeTags = next;
+    try {
+      localStorage.setItem(FEED_EXCLUDE_TAGS_KEY, JSON.stringify(feedExcludeTags));
+      if (changed) localStorage.setItem(FEED_EXCLUDE_TAGS_UPDATED_KEY, String(Date.now()));
+    } catch {}
+    if (changed) {
+      // Notify the separate Niji Cloud script without sharing credentials.
+      try { window.dispatchEvent(new Event('pictbland-feed-exclude-tags-changed')); } catch {}
+    }
+  }
+
+  function receiveSyncedExcludeTags() {
+    const incoming = readExcludeTags();
+    if (JSON.stringify(incoming) === JSON.stringify(feedExcludeTags)) return;
+    feedExcludeTags = incoming;
+    syncExcludeUi();
+    if (feedOpen) renderFeed();
+  }
+  window.addEventListener('pictbland-feed-exclude-tags-cloud-applied', receiveSyncedExcludeTags);
+  window.addEventListener('storage', event => {
+    if (event.key === FEED_EXCLUDE_TAGS_KEY) receiveSyncedExcludeTags();
+  });
+
+  function excludedTagSet() {
+    return new Set(feedExcludeTags.map(normalizeExcludeTag).filter(Boolean));
+  }
+
+  function excludedByTag(work) {
+    if (!feedExcludeTags.length || !Array.isArray(work?.tags) || !work.tags.length) return false;
+    const blocked = excludedTagSet();
+    return work.tags.some(tag => blocked.has(normalizeExcludeTag(tag)));
+  }
+
+  function syncExcludeUi() {
+    if (!root) return;
+    const input = root.querySelector('.pbsw-feed-exclude-input');
+    const summary = root.querySelector('.pbsw-feed-exclude-summary');
+    if (input && document.activeElement !== input) input.value = feedExcludeTags.join(', ');
+    if (summary) summary.textContent = feedExcludeTags.length
+      ? '🚫 除外タグ ' + feedExcludeTags.length + '件'
+      : '🚫 除外タグなし';
+  }
+
+  function applyExcludeInput() {
+    const input = root?.querySelector('.pbsw-feed-exclude-input');
+    if (!input) return;
+    saveExcludeTags(parseExcludeTags(input.value));
+    feedVisibleCount = FEED_STEP;
+    syncExcludeUi();
+    renderFeed();
+  }
+
+  function saveWord(word, href='') {
+    const clean = String(word || '').trim();
+    if (!clean) return;
+    const rows = readSaved();
+    const existing = rows.find(x => x.word === clean);
+    const name = prompt(existing ? 'この検索語は保存済みです。表示名を変更しますか？' : '保存名を入力してください。', existing?.name || clean);
+    if (name === null || !name.trim()) return;
+    const now = Date.now();
+    const resolvedHref = href || existing?.href || '';
+    if (existing) {
+      existing.name = name.trim();
+      existing.href = resolvedHref;
+      existing.updatedAt = now;
+    } else {
+      rows.unshift({id: crypto.randomUUID(), name: name.trim(), word: clean, href: resolvedHref, createdAt: now, updatedAt: now});
+    }
+    writeSaved(rows);
+  }
+
+  function saveCurrent() {
+    const current = currentSearch();
+    if (!current) return;
+    saveWord(current.word, current.href);
+  }
+
+  function runSearch(word, href='') {
+    if (isPrivateSearchHref(href,word)) {
+      if (root) root.classList.remove('open');
+      location.assign(new URL(href,location.origin).href);
+      return;
+    }
+    const row = readSaved().find(item => item.word === word);
+    if (row) beginRebind(row.id);
+    else {
+      closePanel();
+      alert('検索語「' + word + '」をpictBLand本来の検索欄から検索し、結果画面で保存検索に登録してください。');
+    }
+  }
+
+  function runQuickSearch() {
+    const word = quickInput?.value?.trim() || '';
+    if (!word) return;
+    runSearch(word);
+  }
+
+  function saveQuickSearch() {
+    const word = quickInput?.value?.trim() || '';
+    if (!word) return;
+    saveWord(word, '');
+    const row = readSaved().find(item => item.word === word);
+    if (row) beginRebind(row.id);
+  }
+
+  function rename(id) {
+    const rows = readSaved(), row = rows.find(x => x.id === id);
+    if (!row) return;
+    const name = prompt('保存名を変更', row.name || row.word);
+    if (name === null || !name.trim()) return;
+    row.name = name.trim();
+    row.updatedAt = Date.now();
+    writeSaved(rows);
+  }
+
+  function remove(id) {
+    const rows = readSaved(), row = rows.find(x => x.id === id);
+    if (!row || !confirm('「' + (row.name || row.word) + '」を削除しますか？')) return;
+    writeSaved(rows.filter(x => x.id !== id));
+  }
+
+  function move(id, delta) {
+    const rows = readSaved();
+    const i = rows.findIndex(x => x.id === id), j = i + delta;
+    if (i < 0 || j < 0 || j >= rows.length) return;
+    [rows[i], rows[j]] = [rows[j], rows[i]];
+    writeSaved(rows);
+  }
+
+  function firstSearchHref(row) {
+    // Only use the private result URL actually issued to this user.
+    if (!isPrivateSearchHref(row?.href,row?.word)) return '';
+    const u = new URL(row.href, location.origin);
+    for (const key of ['ctop','page','p','offset']) u.searchParams.delete(key);
+    return u.pathname + (u.searchParams.toString() ? '?' + u.searchParams.toString() : '');
+  }
+
+  async function requestHtml(url, signal) {
+    const abs = new URL(url, location.origin).href;
+    await reserveNetworkSlot(signal);
+    const gm = globalThis.GM?.xmlhttpRequest || globalThis.GM?.xmlHttpRequest;
+
+    if (typeof gm !== 'function') {
+      return fetch(abs, {
+        method:'GET',
+        credentials:'include',
+        redirect:'follow',
+        signal,
+        headers:{Accept:'text/html,application/xhtml+xml'}
+      }).then(async response => {
+        if (response.status === 429) { blockedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS; throw rateLimitError(); }
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        return {html:await response.text(), url:response.url || abs};
+      });
+    }
+
+    return new Promise((resolve,reject) => {
+      let settled=false;
+      let handle=null;
+
+      const finish=(ok,value)=>{
+        if(settled)return;
+        settled=true;
+        signal?.removeEventListener?.('abort',onAbort);
+        ok?resolve(value):reject(value instanceof Error?value:new Error(String(value||'取得失敗')));
+      };
+
+      const onAbort=()=>{
+        try{handle?.abort?.();}catch{}
+        const err=new Error('取得を中止しました');
+        err.name='AbortError';
+        finish(false,err);
+      };
+
+      if(signal?.aborted){
+        onAbort();
+        return;
+      }
+      signal?.addEventListener?.('abort',onAbort,{once:true});
+
+      try{
+        handle=gm({
+          method:'GET',
+          url:abs,
+          responseType:'text',
+          anonymous:false,
+          nocache:true,
+          timeout:30000,
+          headers:{
+            Accept:'text/html,application/xhtml+xml',
+            Referer:location.href
+          },
+          onload:res=>{
+            const status=Number(res?.status||0);
+            if(status===429){blockedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;finish(false,rateLimitError());return;}
+            if(status<200||status>=400){finish(false,new Error('HTTP '+status));return;}
+            const html=String(res?.responseText ?? res?.response ?? '');
+            if(!html.trim()){finish(false,new Error('HTMLが空でした'));return;}
+            finish(true,{html,url:res?.finalUrl||res?.responseURL||abs});
+          },
+          onerror:err=>finish(false,new Error('GM通信エラー：'+String(err?.error||err?.message||'取得失敗'))),
+          ontimeout:()=>finish(false,new Error('取得がタイムアウトしました')),
+          onabort:()=>onAbort()
+        });
+
+        if(handle&&typeof handle.then==='function'){
+          handle.then(res=>{
+            if(settled)return;
+            const status=Number(res?.status||0);
+            if(status===429){blockedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;finish(false,rateLimitError());return;}
+            if(status<200||status>=400){finish(false,new Error('HTTP '+status));return;}
+            const html=String(res?.responseText ?? res?.response ?? '');
+            if(!html.trim()){finish(false,new Error('HTMLが空でした'));return;}
+            finish(true,{html,url:res?.finalUrl||res?.responseURL||abs});
+          }).catch(err=>{
+            if(err?.name==='AbortError')finish(false,err);
+            else finish(false,new Error('GM通信エラー：'+String(err?.message||err)));
+          });
+        }
+      }catch(err){
+        finish(false,err);
+      }
+    });
+  }
+
+  function compactText(value) {
+    return String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+
+  function itemIdFromHref(href) {
+    try {
+      const u = new URL(href, location.origin);
+      return u.origin === location.origin ? (u.pathname.match(/^\/items\/(?:detail|index|view)\/(\d+)/)?.[1] || '') : '';
+    } catch {
+      return '';
+    }
+  }
+
+  function itemIdFromAny(value) {
+    const s = String(value || '');
+    let m = s.match(/(?:https?:\/\/pictbland\.net)?\/items\/(?:detail|index|view)\/(\d+)/i);
+    if (m) return m[1];
+    m = s.match(/["']?(?:item[_-]?id|itemId)["']?\s*[:=]\s*["']?(\d{2,})/i);
+    return m ? m[1] : '';
+  }
+
+  function deepRoots(doc) {
+    const roots = [doc];
+    const queue = [doc];
+    const seen = new Set(queue);
+    while (queue.length) {
+      const rootNode = queue.shift();
+      let elements = [];
+      try { elements = [...rootNode.querySelectorAll('*')]; } catch {}
+      for (const el of elements) {
+        const shadow = el.shadowRoot;
+        if (shadow && !seen.has(shadow)) {
+          seen.add(shadow);
+          roots.push(shadow);
+          queue.push(shadow);
+        }
+      }
+    }
+    return roots;
+  }
+
+  function collectItemCandidates(doc) {
+    const found = new Map();
+    const add = (id, el, source='') => {
+      if (!/^\d+$/.test(String(id || ''))) return;
+      const key = String(id);
+      if (!found.has(key)) found.set(key, {id:key, elements:[], sources:[]});
+      const row = found.get(key);
+      if (el && !row.elements.includes(el)) row.elements.push(el);
+      if (source && !row.sources.includes(source)) row.sources.push(source);
+    };
+
+    for (const rootNode of deepRoots(doc)) {
+      let elements = [];
+      try { elements = [...rootNode.querySelectorAll('*')]; } catch {}
+      for (const el of elements) {
+        const values = [];
+        const attrs = [
+          'href','data-href','data-url','data-link','data-path','onclick',
+          'data-item-id','data-item_id','data-itemid','data-id','id'
+        ];
+        for (const name of attrs) {
+          const v = el.getAttribute?.(name);
+          if (v) values.push(name + '=' + v);
+        }
+        for (const attr of [...(el.attributes || [])]) {
+          if (!/^data-/i.test(attr.name)) continue;
+          if (!values.some(x => x.startsWith(attr.name + '='))) values.push(attr.name + '=' + attr.value);
+        }
+        for (const value of values) {
+          const id = itemIdFromAny(value);
+          if (id) add(id, el, value.slice(0,160));
+        }
+      }
+
+      let html = '';
+      try { html = rootNode instanceof Document ? rootNode.documentElement?.outerHTML || '' : rootNode.innerHTML || ''; } catch {}
+      const re = /(?:https?:\/\/pictbland\.net)?\/items\/(?:detail|index|view)\/(\d+)/gi;
+      let m;
+      while ((m = re.exec(html))) add(m[1], null, 'html-regex');
+      const re2 = /["']?(?:item[_-]?id|itemId)["']?\s*[:=]\s*["']?(\d{2,})/gi;
+      while ((m = re2.exec(html))) add(m[1], null, 'item-id-regex');
+    }
+
+    return [...found.values()];
+  }
+
+  function itemHref(id) {
+    return '/items/detail/' + encodeURIComponent(id);
+  }
+
+  function itemIdsInside(el) {
+    const ids = new Set();
+    if (!el) return ids;
+
+    const inspect = node => {
+      if (!node?.getAttribute) return;
+      for (const attr of [...(node.attributes || [])]) {
+        const id = itemIdFromAny(attr.value);
+        if (id) ids.add(id);
+        if (ids.size > 2) return;
+      }
+    };
+
+    inspect(el);
+    if (ids.size > 2) return ids;
+
+    let nodes = [];
+    try { nodes = [...(el.querySelectorAll?.('*') || [])]; } catch {}
+    for (const node of nodes) {
+      inspect(node);
+      if (ids.size > 2) break;
+    }
+    return ids;
+  }
+
+  function workCardFor(anchor,id) {
+    if(!anchor)return null;
+    let best=null,bestScore=-Infinity,node=anchor;
+    // A thumbnail's clickable element is not necessarily the whole work card.
+    for(let depth=0;node&&depth<12;depth++,node=node.parentElement){
+      if(node.nodeType!==1)continue;
+      const ids=itemIdsInside(node);
+      if(ids.size>1)break;
+      if(ids.size!==1||!ids.has(String(id)))continue;
+      const t=compactText(node.textContent||'');
+      if(!t||t.length>2400)continue;
+      const cls=String(node.className||'');
+      let score=0;
+      if(/^(ARTICLE|LI)$/i.test(node.tagName))score+=12;
+      if(/card|item|work|post|entry|result/i.test(cls))score+=6;
+      if(/(?:小説|アルバム|イラスト|漫画)\s*[：:]/.test(t.slice(0,220)))score+=28;
+      if(/20\d{2}[\/.-]\d{1,2}[\/.-]\d{1,2}/.test(t))score+=8;
+      if(node.querySelector('h1,h2,h3,h4,[class*="title" i]'))score+=14;
+      if(node.querySelector('a[href*="/tags/index/"]'))score+=7;
+      if(node.querySelector('a[href*="/users/"]'))score+=5;
+      if(t.length>=50)score+=8;
+      if(t.length>=100)score+=3;
+      if(t.length>1200)score-=12;
+      if(score>bestScore){best=node;bestScore=score;}
+    }
+    return best;
+  }
+
+  function imageUrlFrom(card) {
+    const img = card?.querySelector?.('img');
+    if (!img) return '';
+    const candidates = [
+      img.getAttribute('src'),
+      img.getAttribute('data-src'),
+      img.getAttribute('data-original'),
+      img.getAttribute('data-lazy-src'),
+      img.getAttribute('data-url')
+    ];
+    const srcset = String(img.getAttribute('srcset') || '').split(',').map(x => x.trim().split(/\s+/)[0]).filter(Boolean);
+    for (const raw of [...candidates, ...srcset]) {
+      if (!raw || /^data:|^blob:/i.test(raw)) continue;
+      try { return new URL(raw, location.origin).href; } catch {}
+    }
+    return '';
+  }
+
+  function tagsFrom(rootNode) {
+    const out = [];
+    const seen = new Set();
+    for (const a of rootNode?.querySelectorAll?.('a[href*="/tags/index/"]') || []) {
+      let tag = compactText(a.textContent).replace(/^#/, '');
+      if (!tag) {
+        try {
+          const u = new URL(a.getAttribute('href') || '', location.origin);
+          const raw = u.pathname.match(/^\/tags\/index\/(.*)$/)?.[1] || '';
+          tag = decodeURIComponent(raw).replace(/^\++|\++$/g, '').trim();
+        } catch {}
+      }
+      const key = normalizeExcludeTag(tag);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push(tag);
+    }
+    return out;
+  }
+
+  function parseDateFromText(text) {
+    const s = compactText(text);
+    let m = s.match(/(20\d{2})[\/.-](\d{1,2})[\/.-](\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?/);
+    if (!m) m = s.match(/(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日(?:\s*(\d{1,2}):(\d{2}))?/);
+    if (!m) return {text:'', time:0};
+    const y=Number(m[1]), mo=Number(m[2])-1, d=Number(m[3]), h=Number(m[4]||0), mi=Number(m[5]||0);
+    const time = +new Date(y,mo,d,h,mi,0,0);
+    return {text:m[0], time:Number.isFinite(time)?time:0};
+  }
+
+  function dateFrom(rootNode) {
+    const timeEl = rootNode?.querySelector?.('time[datetime]');
+    if (timeEl) {
+      const raw = timeEl.getAttribute('datetime') || '';
+      const time = Date.parse(raw);
+      if (Number.isFinite(time)) return {text:compactText(timeEl.textContent) || new Date(time).toLocaleString('ja-JP'), time};
+    }
+    return parseDateFromText(rootNode?.textContent || '');
+  }
+
+  function metricFromText(text, names) {
+    const source = compactText(text);
+    for (const name of names) {
+      let m = source.match(new RegExp(name + '[^0-9０-９]{0,10}([0-9０-９,，]+)', 'i'));
+      if (!m) m = source.match(new RegExp('([0-9０-９,，]+)[^0-9０-９]{0,6}' + name, 'i'));
+      if (!m) continue;
+      const n = Number(m[1].replace(/[０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0)-0xFEE0)).replace(/[，,]/g,''));
+      if (Number.isFinite(n)) return n;
+    }
+    return null;
+  }
+
+  function titleFrom(card,anchors,id) {
+    const fallback='作品 '+id;
+    if(!card)return fallback;
+    const candidates=[];
+    const add=(raw,priority)=>{
+      const t=compactText(raw);
+      if(!t||t.length>180||/^作品\s*\d+$/.test(t))return;
+      if(/^(?:詳細|続きを読む|作品を見る|画像|小説|漫画|アルバム|イラスト|ステキ!?|ブクマ|ブックマーク|一般会員|プレミアム会員|フォロワー限定公開作品|Locked Works|フォロ限|鍵付|相互のみ|相互限)$/i.test(t))return;
+      if(/^(?:小説|アルバム|イラスト|漫画)\s*[：:]|^20\d{2}[\/.-]\d|^#/.test(t))return;
+      if(/検索避け設定|pictBLandは/i.test(t))return;
+      candidates.push({title:t,priority});
+    };
+    for(const el of card.querySelectorAll('a[href],h1,h2,h3,h4,[class*="title" i],[class*="subject" i]')){
+      const link=el.matches('a[href]');
+      const actualId=link?itemIdFromHref(el.getAttribute('href')||''):'';
+      const named=/^H[1-4]$/i.test(el.tagName)||/title|subject/i.test(String(el.className||''));
+      if(link&&actualId!==String(id)&&!named)continue;
+      add(el.textContent,actualId===String(id)?100:named?85:60);
+    }
+    for(const el of [card,...anchors])for(const key of ['data-title','data-item-title','title','aria-label'])
+      add(el?.getAttribute?.(key),30);
+    candidates.sort((a,b)=>b.priority-a.priority||a.title.length-b.title.length);
+    return candidates[0]?.title||fallback;
+  }
+
+  function authorFrom(rootNode) {
+    // Native 2026 search result cards use <a class="item-card__author">.
+    // Their author URLs are not guaranteed to use the old /users/... form.
+    const nativeAuthor=rootNode?.querySelector?.('a.item-card__author,[class*="item-card__author"] a[href]');
+    if(nativeAuthor) {
+      const name=compactText(nativeAuthor.textContent);
+      const invalid=/^(?:一般会員|プレミアム会員|会員|ユーザー|プロフィール|ホーム|マイページ|ログイン|新着|設定)$/;
+      if(name && !invalid.test(name)){
+        let href='';
+        try {
+          const url=new URL(nativeAuthor.getAttribute('href')||'',location.origin);
+          if(url.origin===location.origin && !['/','/home','/login'].includes(url.pathname))
+            href=url.pathname+url.search;
+        }catch{}
+        return {name,href};
+      }
+    }
+    for (const a of rootNode?.querySelectorAll?.('a[href]') || []) {
+      try {
+        const u = new URL(a.getAttribute('href') || '', location.origin);
+        if (!/^\/users\/[^/]+\/?$/.test(u.pathname)) continue;
+        const name = compactText(a.textContent);
+        if (name && !/^(?:一般会員|プレミアム会員|会員|ユーザー|プロフィール|ホーム|マイページ|ログイン|新着|設定)$/.test(name)
+          && !a.closest('nav,header,footer,aside,[class*="navigation" i],[class*="menu" i]'))
+          return {name, href:u.pathname};
+      } catch {}
+    }
+    return {name:'', href:''};
+  }
+
+  function isBoilerplateCaption(value) {
+    const t=compactText(value);
+    // pictBLand's site-wide SEO metadata and welcome copy are never
+    // authored descriptions, even if they appear in a search card or item page.
+    return /検索避け設定|投稿された作品やコンテンツは|GoogleやYahoo|画像検索からも除外|pictBLandへようこそ|会員登録必須の完全クローズドサービス|BL特化型投稿サイト|地雷避け機能|鍵付き投稿：|さぁ、いますぐ始めましょう|pictBLandは同人・BLが好きな人のため|pictBLandはイラスト・小説の投稿や閲覧|pictBLandはBLに特化した投稿SNS|イラスト・小説コミュニケーションサービスです|他の人の作品を見てみたい！|検索避けや鍵付き・除外タグなどの閲覧機能が充実した/i.test(t);
+  }
+  function validCaption(value,title,author,tags) {
+    const t=compactText(value);
+    if(!t||t===compactText(title)||t===compactText(author)||(tags||[]).some(tag=>t===compactText(tag)))return '';
+    if(t.length<2||t.length>2400||isBoilerplateCaption(t)||/^(投稿日|更新日|ステキ|ブクマ|ブックマーク|タグ|閲覧|コメントを投稿|プロフィール表示|プレミアムサービス)/.test(t))return '';
+    return t;
+  }
+
+  // Read individual text nodes in title-to-tag order. The 2026 result
+  // cards often place their description inside nested spans without
+  // a caption/description class.
+  function captionFromOrderedNodes(nodes,title,author,tags){
+    const normalizedTitle=compactText(title);
+    if(!normalizedTitle||/^作品\s*\d+$/.test(normalizedTitle))return '';
+    const start=nodes.findIndex(row=>row.text===normalizedTitle
+      || (row.text.includes(normalizedTitle) && row.text.length<normalizedTitle.length+35));
+    if(start<0)return '';
+    const pieces=[];
+    let visited=0;
+    for(let i=start+1;i<nodes.length&&visited<40;i++,visited++){
+      const row=nodes[i],t=compactText(row.text);
+      if(!t)continue;
+      if(row.role==='tag'||row.role==='author'||row.role==='next-work'){
+        if(pieces.length)break;
+        continue;
+      }
+      if(row.role==='action')continue;
+      if(/^(?:ホーム|一般会員|プレミアム会員|フォロ限|鍵付|相互のみ|相互限|R[-‐]?18(?:G)?|作品を見る|ブクマ|ステキ!?|コメント|通報|投稿者|もっと見る|続きを見る|新着|人気順)$/.test(t))continue;
+      if(/^20\d{2}[\/.-]\d{1,2}[\/.-]\d{1,2}|^(?:小説|イラスト|アルバム|漫画)\s*[：:]/.test(t))continue;
+      if(/^#\S+(?:\s+#\S+)*$/.test(t)) {if(pieces.length)break;continue;}
+      const valid=validCaption(t,title,author,tags);
+      if(!valid || valid.length<4 || valid.length>800)continue;
+      if(valid===normalizedTitle||normalizedTitle.includes(valid))continue;
+      if(pieces.length && pieces.includes(valid))continue;
+      pieces.push(valid);
+      if(pieces.join(' ').length>=500||pieces.length>=6)break;
+    }
+    return validCaption(pieces.join(' '),title,author,tags);
+  }
+
+  function captionTextNodes(card){
+    if(!card)return [];
+    const doc=card.ownerDocument||document;
+    const walker=doc.createTreeWalker(card,NodeFilter.SHOW_TEXT);
+    const nodes=[];
+    let n;
+    for(let steps=0;(n=walker.nextNode())&&steps<450;steps++){
+      const el=n.parentElement;
+      if(!el||el.closest('script,style,template,svg,nav,header,footer,aside,form,[hidden]'))continue;
+      const text=compactText(n.nodeValue);
+      if(!text)continue;
+      const role=el.closest('a[href*="/tags/"]')?'tag'
+        :el.closest('a[href*="/users/"]')?'author'
+        :el.closest('a[href*="/items/"]')?'item-link'
+        :el.closest('button,[role="button"]')?'action':'text';
+      nodes.push({text,role,tag:el.tagName||'',className:String(el.className||'').slice(0,75)});
+    }
+    return nodes;
+  }
+
+  function captionFromSearchCard(card,title,author,tags){
+    // The real article.history-work-card.item-card puts the visible
+    // description in a plain <p> immediately after a.item-card__link.
+    // Only trust paragraphs inside a single native work card.
+    if(card?.matches?.('article.history-work-card.item-card,article.item-card')
+      || card?.querySelector?.('a.item-card__link')){
+      const paragraphs=card.querySelectorAll('p');
+      for(const p of paragraphs){
+        if(p.closest('nav,header,footer,aside,form,[class*="profile" i]'))continue;
+        const text=validCaption(p.textContent,title,author,tags);
+        if(text && text.length>=4 && text.length<=1200
+          && text!==compactText(title) && !/^(?:小説|アルバム|イラスト|漫画)[：:]/.test(text))
+          return text;
+      }
+    }
+    return captionFromOrderedNodes(captionTextNodes(card),title,author,tags);
+  }
+
+  function captionFrom(root,title,author,tags,detailPage=false) {
+    // Search cards can contain the authored description directly, without
+    // the .caption or .description class; avoid metadata from the site shell.
+    const exact=[
+      '[itemprop="description"]','[data-role="caption"]','[data-testid*="caption" i]',
+      '[data-testid*="description" i]','[class*="item-caption" i]',
+      '[class*="item_description" i]','[class*="item-description" i]',
+      '[class*="work-caption" i]','[class*="work-description" i]',
+      '[class*="post-caption" i]','[class*="post-description" i]',
+      '[class*="item-comment" i]','[id*="item-caption" i]',
+      '[id*="item-description" i]','[class*="caption" i]','[id*="caption" i]'
+    ];
+    const ignore='header,footer,nav,aside,form,[class*="profile" i],[class*="recommend" i],[class*="welcome" i],[class*="sidebar" i]';
+    for(const selector of exact)for(const el of root?.querySelectorAll?.(selector)||[]){
+      if(el.closest?.(ignore))continue;
+      const text=validCaption(el.textContent,title,author,tags);
+      if(text)return text;
+    }
+    const scope=detailPage
+      ?root?.querySelector?.('main article,main [class*="item-detail" i],main [class*="work-detail" i],article[class*="item" i]')
+      :root;
+    if(!scope)return '';
+    const candidates=[];
+    for(const el of scope.querySelectorAll(detailPage?'p,[class*="description" i],[class*="summary" i]':'p,div,span')){
+      if(el.closest?.(ignore)||el.children.length>2)continue;
+      if(el.querySelector('a[href*="/tags/"],a[href*="/users/"],a[href*="/items/"]'))continue;
+      const text=validCaption(el.textContent,title,author,tags);
+      if(!text||text.length<8||text.length>800||text.startsWith(compactText(title)))continue;
+      if(/(?:小説|アルバム|イラスト|漫画)\s*[：:]\s*[0-9０-９,，]+/.test(text))continue;
+      if(/^(?:20\d{2}[\/.-]\d|フォロ限|鍵付|相互のみ|相互限|R18|一般会員|プレミアムサービス)/.test(text))continue;
+      candidates.push(text);
+    }
+    return candidates.sort((a,b)=>b.length-a.length)[0]||'';
+  }
+
+  function workFormatFromCard(card) {
+    const prefix=compactText(card?.textContent||'').slice(0,250);
+    const match=prefix.match(/(小説|アルバム|イラスト|漫画)\s*[：:]\s*([0-9０-９,，]+)\s*(文字|枚)/);
+    const count=match?Number(match[2].replace(/[０-９]/g,ch=>String.fromCharCode(ch.charCodeAt(0)-0xFEE0)).replace(/[,，]/g,'')):0;
+    const kind=match?.[1]||(prefix.match(/(?:^|\s)(小説|アルバム|イラスト|漫画)(?=\s|[：:])/u)?.[1]||'');
+    return {workType:kind,characterCount:kind==='小説'&&count>0?count:null,
+      imageCount:kind==='イラスト'&&!count?1:kind!=='小説'&&count>0?count:null};
+  }
+
+  function formatWorkLabel(work) {
+    if(!work?.workType)return '';
+    const count=work.workType==='小説'?work.characterCount:work.imageCount;
+    return work.workType+(count==null?'':'・'+Number(count).toLocaleString('ja-JP')+(work.workType==='小説'?'文字':'枚'));
+  }
+
+
+  // Visibility/rating labels must come from an actual short badge element.
+  // Never infer them from the card prefix, body text, captions, neighbouring cards
+  // or generic site copy: those can contain words such as "フォロワー限定".
+  function accessBadgeLabelsFromText(value) {
+    const text=compactText(value).normalize('NFKC');
+    if(!text || text.length>70)return [];
+    let rest=text;
+    const names=[];
+    const rules=[
+      ['R18G',/R[-‐‑－]?18G/ig],
+      ['R18',/R[-‐‑－]?18/ig],
+      ['鍵付',/(?:鍵付|鍵付き|パスワード限定)/g],
+      // Current pictBLand search cards use "フォロワーのみ公開" /
+      // "相互フォローのみ公開". Match the mutual label first so the
+      // follower substring cannot consume it.
+      ['相互のみ',/(?:相互のみ|相互限|相互フォローのみ公開|相互フォロワーのみ公開|相互フォロー限定|相互フォロワー限定)/g],
+      ['フォロ限',/(?:フォロ限|フォロワーのみ公開|フォローのみ公開|フォロワー限定公開作品|フォロワー限定|フォロー限定)/g],
+      ['リスト限',/(?:リスト限|リスト限定)/g],
+      ['マイ限',/(?:マイピク限定|マイ限)/g],
+      ['期間限定',/(?:期間限定公開|期間限定)/g],
+      ['全体公開',/全体公開/g],
+    ];
+    for(const [label,re] of rules){
+      re.lastIndex=0;
+      if(!re.test(rest))continue;
+      names.push(label);
+      re.lastIndex=0;
+      rest=rest.replace(re,' ');
+    }
+    // Accept combinations made only from known badge labels and separators.
+    // Any prose left over means this was not a badge.
+    rest=rest.replace(/[\s・･|｜/／,，:：;；()[\]{}【】「」『』<>＜＞]+/g,'');
+    if(rest)return [];
+    // R18G already contains R18 semantically; never show both.
+    return [...new Set(names.filter(label=>label!=='R18'||!names.includes('R18G')))];
+  }
+
+  function accessBadgeNodeInactive(node,card) {
+    if(!node)return true;
+    let cur=node;
+    while(cur && cur!==card?.parentElement){
+      if(cur.nodeType===1){
+        if(cur.hidden || cur.hasAttribute?.('inert') ||
+           cur.getAttribute?.('aria-hidden')==='true')return true;
+        const style=String(cur.getAttribute?.('style')||'').replace(/\s+/g,'').toLowerCase();
+        if(/display:none|visibility:hidden|opacity:0(?:[;}]|$)/.test(style))return true;
+        const cls=String(cur.className||'');
+        if(/(?:^|[\s_-])(?:hidden|is-hidden|d-none|u-hidden|visually-hidden|template|prototype)(?:$|[\s_-])/i.test(cls))
+          return true;
+        if(cur.tagName==='TEMPLATE')return true;
+      }
+      if(cur===card)break;
+      cur=cur.parentElement;
+    }
+    // Only use layout visibility for nodes that belong to the CURRENT page.
+    // Search-result HTML is often parsed in a detached DOMParser document:
+    // getClientRects() is empty there even for real visible badges, which used
+    // to erase both follower-only and R18 labels.
+    const onCurrentPage=node.ownerDocument===document && document.documentElement?.contains(node);
+    if(onCurrentPage && typeof getComputedStyle==='function'){
+      try{
+        const cs=getComputedStyle(node);
+        if(cs.display==='none'||cs.visibility==='hidden'||Number(cs.opacity)===0)return true;
+        if(typeof node.getClientRects==='function' && node.getClientRects().length===0)return true;
+      }catch{}
+    }
+    return false;
+  }
+
+  function accessBadgesFromCard(card) {
+    if (!card) return [];
+    const names=[];
+    const seen=new Set();
+    const add=(node,value)=>{
+      if(accessBadgeNodeInactive(node,card))return;
+      for(const label of accessBadgeLabelsFromText(value)){
+        if(!seen.has(label)){seen.add(label);names.push(label);}
+      }
+    };
+    const selector=[
+      '[class*="rating" i]','[data-rating]',
+      '[class*="badge" i]','[class*="chip" i]','[class*="status" i]',
+      '[class*="visibility" i]','[class*="access" i]','[class*="restrict" i]',
+      '[class*="locked" i]','[class*="limited" i]','[class*="permission" i]',
+      '[class*="publish-scope" i]','[class*="publish_scope" i]',
+      '[class*="view-scope" i]','[class*="view_scope" i]',
+      '[data-visibility]','[data-access]','[data-restriction]'
+    ].join(',');
+    for(const node of card.querySelectorAll?.(selector)||[]){
+      if(node.closest?.('a[href*="/tags/index/"]') ||
+         node.querySelector?.('a[href*="/tags/index/"]'))continue;
+      add(node,node.textContent||'');
+      add(node,node.getAttribute?.('aria-label')||'');
+      add(node,node.getAttribute?.('title')||'');
+      add(node,node.getAttribute?.('data-visibility')||'');
+      add(node,node.getAttribute?.('data-access')||'');
+      add(node,node.getAttribute?.('data-restriction')||'');
+      add(node,node.getAttribute?.('data-rating')||'');
+    }
+    return names;
+  }
+
+  function accessBadgesFromDetailDocument(doc) {
+    if(!doc)return [];
+    const scope=doc.querySelector?.(
+      'main article,main [class*="item-detail" i],main [class*="work-detail" i],'+
+      'article[class*="item" i],main'
+    );
+    return scope ? accessBadgesFromCard(scope) : [];
+  }
+
+  function updateFeedAccessBadges(holder, work) {
+    if (!holder) return;
+    holder.replaceChildren();
+    const labels = Array.isArray(work.accessBadges) ? work.accessBadges : [];
+    holder.hidden = !labels.length;
+    for (const label of labels) {
+      const chip = document.createElement('span');
+      chip.textContent = label;
+      if (/^R18/.test(label)) chip.className = 'age';
+      else if (label === '鍵付') chip.className = 'locked';
+      else chip.className = 'visibility';
+      holder.append(chip);
+    }
+  }
+
+  function minimalSearchWork(id, state, orderIndex) {
+    return {
+      id:String(id),
+      href:itemHref(id),
+      title:'作品 ' + id,
+      thumb:'',
+      authorName:'',
+      authorHref:'',
+      dateText:'',
+      dateTime:0,
+      caption:'',
+      workType:'',
+      characterCount:null,
+      imageCount:null,
+      tags:[],
+      accessBadges:[],
+      sukiCount:null,
+      bookmarkCount:null,
+      matches:new Set([state.row.name || state.row.word]),
+      searchPriority:Number.isFinite(Number(state.priority)) ? Number(state.priority) : 0,
+      detailLoaded:false,
+      detailTagsVerified:false,
+      detailQueued:false,
+      detailLoading:false,
+      detailError:'',
+      searchOrder:orderIndex
+    };
+  }
+
+  function normalizeSearchWork(card, anchors, id, state, orderIndex) {
+    const tags = tagsFrom(card);
+    const title = titleFrom(card, anchors, id);
+    const author = authorFrom(card);
+    const date = dateFrom(card);
+    const text = compactText(card?.textContent || '');
+    const format = workFormatFromCard(card);
+    return {
+      id,
+      href:itemHref(id),
+      title,
+      thumb:imageUrlFrom(card),
+      authorName:author.name,
+      authorHref:author.href,
+      dateText:date.text,
+      dateTime:date.time,
+      caption:captionFromSearchCard(card,title,author.name,tags) || captionFrom(card,title,author.name,tags),
+      ...format,
+      tags,
+      accessBadges:accessBadgesFromCard(card),
+      sukiCount:metricFromText(text,['ステキ!?','ステキ','いいね']),
+      bookmarkCount:metricFromText(text,['ブクマ','ブックマーク']),
+      matches:new Set([state.row.name || state.row.word]),
+      searchPriority:Number.isFinite(Number(state.priority)) ? Number(state.priority) : 0,
+      detailLoaded:false,
+      detailTagsVerified:tags.length > 0,
+      detailQueued:false,
+      detailLoading:false,
+      detailError:'',
+      searchOrder:orderIndex
+    };
+  }
+
+  function findNextHref(doc, currentUrl) {
+    const direct = doc.querySelector('link[rel="next"][href],a[rel="next"][href]');
+    if (direct?.getAttribute('href')) {
+      try {
+        const u = new URL(direct.getAttribute('href'), currentUrl);
+        if (u.origin === location.origin) return u.href;
+      } catch {}
+    }
+
+    const candidates = [];
+    for (const a of doc.querySelectorAll('a[href]')) {
+      const text = compactText(a.textContent);
+      if (!/(?:^|\s)(?:次|次へ|次のページ|NEXT|Next)(?:\s|$|[>＞»›])/i.test(text)) continue;
+      try {
+        const u = new URL(a.getAttribute('href'), currentUrl);
+        if (u.origin !== location.origin || !/^\/tags\/index\//.test(u.pathname)) continue;
+        candidates.push(u.href);
+      } catch {}
+    }
+    return candidates[0] || '';
+  }
+
+  // A userscript manager may receive an anonymous welcome page even when
+  // the user is logged in inside Safari. Never treat that page as a valid empty feed.
+  function isGuestSearchPage(doc, responseUrl = '') {
+    let path = '';
+    try { path = new URL(responseUrl, location.origin).pathname; } catch {}
+    if (/^\/users\/(?:login(?:2|_edit)?|signin|welcome2?)(?:\/|$)/i.test(path)) return true;
+    const works = doc?.querySelector?.('a[href*="/items/detail/"],article.item-card,[data-item-id]');
+    if (works) return false;
+    const guestPanel = doc?.querySelector?.(
+      '.wel_loginitems,[class*="wel_loginitems"],form[action*="/users/login"]'
+    );
+    if (guestPanel) return true;
+    const txt = compactText(doc?.body?.textContent || '');
+    return /pictBLandへようこそ|BLを愛する人のための創作コミュニティ/.test(txt)
+      && /ログイン|新規会員登録|無料ではじめる/.test(txt);
+  }
+
+  // Same-origin browser requests carry Safari's own cookies, unlike some
+  // iOS userscript-manager GM requests. This is only a recovery path.
+  async function requestBrowserSearchHtml(url, signal) {
+    const abs = new URL(url, location.origin);
+    if (abs.origin !== location.origin) throw new Error('検索URLのドメインが一致しません');
+    await reserveNetworkSlot(signal);
+    const response = await fetch(abs.href, {
+      method:'GET', credentials:'include', redirect:'follow',
+      cache:'no-store', signal, headers:{Accept:'text/html,application/xhtml+xml'}
+    });
+    if (response.status === 429) {
+      blockedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+      throw rateLimitError();
+    }
+    if (!response.ok) throw new Error('ブラウザ通信 HTTP ' + response.status);
+    if (new URL(response.url || abs.href).origin !== location.origin)
+      throw new Error('検索先が異なるドメインへ移動しました');
+    return {html:await response.text(),url:response.url || abs.href};
+  }
+
+  function parsedSearchQuality(parsed) {
+    // A bare item ID (often from JSON/scripts) is not a hydrated work card.
+    // Prefer rendered DOM if most candidates have no actual work title.
+    const works=parsed?.works||[];
+    let meaningful=0;
+    for (const work of works) {
+      if (work?.title && work.title!=='作品 '+work.id
+        && !/^(?:一般会員|プレミアム会員|フォロワー限定公開作品|Locked Works)$/.test(work.title))meaningful++;
+    }
+    return {count:works.length,meaningful};
+  }
+
+
+  // Optional on-demand diagnostic. Never include cookies, auth tokens,
+  // request headers or full page HTML. We keep only short DOM metadata around
+  // the first few search-result cards so false access badges can be identified.
+  const captionDiagnostics = new Map();
+
+  function diagnosticAttrs(node){
+    if(!node?.getAttribute)return {};
+    const names=['class','role','aria-label','aria-hidden','title','style','hidden',
+      'data-visibility','data-access','data-restriction','data-rating','src','alt'];
+    const out={};
+    for(const name of names){
+      const value=node.getAttribute(name);
+      if(value!==null && value!=='')out[name]=String(value).slice(0,260);
+    }
+    return out;
+  }
+
+  function badgeDiagnosticNodes(card){
+    const selector=[
+      '[class*="badge" i]','[class*="chip" i]','[class*="status" i]',
+      '[class*="rating" i]','[class*="visibility" i]','[class*="access" i]',
+      '[class*="restrict" i]','[class*="locked" i]','[class*="limited" i]',
+      '[class*="permission" i]','[data-visibility]','[data-access]',
+      '[data-restriction]','[data-rating]'
+    ].join(',');
+    const rows=[];
+    for(const node of card?.querySelectorAll?.(selector)||[]){
+      const text=compactText(node.textContent||'');
+      if(!text && !node.getAttribute?.('aria-label') && !node.getAttribute?.('title'))continue;
+      rows.push({
+        tag:node.tagName,
+        text:text.slice(0,180),
+        attrs:diagnosticAttrs(node),
+        parent:{tag:node.parentElement?.tagName||'',attrs:diagnosticAttrs(node.parentElement)},
+        inactive:accessBadgeNodeInactive(node,card)
+      });
+      if(rows.length>=35)break;
+    }
+    return rows;
+  }
+
+  function imageDiagnosticNodes(card){
+    const rows=[];
+    for(const node of card?.querySelectorAll?.('img')||[]){
+      rows.push({
+        attrs:diagnosticAttrs(node),
+        parent:{tag:node.parentElement?.tagName||'',attrs:diagnosticAttrs(node.parentElement)},
+        grandparent:{tag:node.parentElement?.parentElement?.tagName||'',attrs:diagnosticAttrs(node.parentElement?.parentElement)}
+      });
+      if(rows.length>=12)break;
+    }
+    return rows;
+  }
+
+  function rememberCaptionDiagnostic(card,work){
+    if(!card||!work||captionDiagnostics.size>=8)return;
+    const nodes=captionTextNodes(card).slice(0,45);
+    captionDiagnostics.set(String(work.id),{
+      id:String(work.id),
+      title:String(work.title||''),
+      author:String(work.authorName||''),
+      kind:formatWorkLabel(work),
+      detectedAccessBadges:[...(work.accessBadges||[])],
+      thumb:String(work.thumb||'').slice(0,300),
+      cardTag:card.tagName,
+      cardAttrs:diagnosticAttrs(card),
+      badgeNodes:badgeDiagnosticNodes(card),
+      imageNodes:imageDiagnosticNodes(card),
+      textNodes:nodes.map(n=>({t:n.text.slice(0,130),role:n.role,tag:n.tag,cls:n.className})),
+      diagnosticVersion:'0.3.58-access-card'
+    });
+  }
+
+  function copyCaptionDiagnostics(){
+    const records=[...captionDiagnostics.values()];
+    if(!records.length){
+      alert('診断データがありません。「更新」を押して作品を再取得してから試してください。');
+      return;
+    }
+    const text=JSON.stringify({version:'0.3.58',cards:records},null,2);
+    const fallback=()=>{
+      const box=document.createElement('textarea');
+      box.value=text;
+      box.readOnly=true;
+      box.style.cssText='position:fixed;inset:12%;width:76%;height:70%;z-index:2147483647;background:white;color:#222;padding:14px';
+      document.body.append(box);box.focus();box.select();
+      alert('診断データを選択しました。コピーして、このチャットに貼り付けてください。貼り付け前に作品の内容を確認できます。');
+      box.addEventListener('blur',()=>setTimeout(()=>box.remove(),2000),{once:true});
+    };
+    if(navigator.clipboard?.writeText){
+      navigator.clipboard.writeText(text).then(()=>alert('診断データをコピーしました。必要な内容だけチャットに貼り付けてください。')).catch(fallback);
+    }else fallback();
+  }
+
+  function parseSearchPage(html, pageUrl, state) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const loginPage = isGuestSearchPage(doc, pageUrl);
+    const candidates = loginPage ? [] : collectItemCandidates(doc);
+    const works = [];
+    let orderIndex = 0;
+    for (const candidate of candidates) {
+      const id = candidate.id;
+      const els = candidate.elements || [];
+      const anchor = els.find(el => el?.matches?.('a[href]')) || els[0] || null;
+
+      let card = anchor ? workCardFor(anchor,id) : null;
+      if (!card && anchor) card = anchor.parentElement || anchor;
+
+      // If the ID only appeared inside serialized JS/HTML, locate a nearby
+      // DOM node carrying that same ID/path and use it as the card seed.
+      if (!card) {
+        for (const rootNode of deepRoots(doc)) {
+          let hit = null;
+          try {
+            hit = [...rootNode.querySelectorAll('*')].find(el => {
+              for (const attr of [...(el.attributes || [])]) {
+                if (itemIdFromAny(attr.value) === id) return true;
+              }
+              return false;
+            });
+          } catch {}
+          if (hit) { card = workCardFor(hit,id) || hit.parentElement || hit; break; }
+        }
+      }
+
+      const anchors = [];
+      try {
+        if (card) for (const a of card.querySelectorAll('a[href]')) if (itemIdFromAny(a.getAttribute('href')||'') === id) anchors.push(a);
+      } catch {}
+      if (anchor?.matches?.('a[href]') && !anchors.includes(anchor)) anchors.unshift(anchor);
+
+      if (card || anchor) {
+        const work=normalizeSearchWork(card || anchor,anchors,id,state,orderIndex++);
+        works.push(work);
+        rememberCaptionDiagnostic(card||anchor,work);
+      } else works.push(minimalSearchWork(id,state,orderIndex++));
+    }
+
+    const pageText = compactText(doc.body?.textContent || '');
+    const title = compactText(doc.title || '');
+    const empty = /(?:該当|検索).{0,20}(?:ありません|0件|見つかりません)|作品.{0,12}0件/i.test(pageText);
+    const hrefSamples = [];
+    for (const rootNode of deepRoots(doc)) {
+      let elements=[];
+      try { elements=[...rootNode.querySelectorAll('*')]; } catch {}
+      for (const el of elements) {
+        for (const attr of [...(el.attributes||[])]) {
+          const value=String(attr.value||'');
+          if (!/(?:item|tag|search|detail|view)/i.test(value)) continue;
+          const sample=attr.name+'='+value.slice(0,180);
+          if (!hrefSamples.includes(sample)) hrefSamples.push(sample);
+          if (hrefSamples.length>=16) break;
+        }
+        if (hrefSamples.length>=16) break;
+      }
+      if (hrefSamples.length>=16) break;
+    }
+
+    return {
+      works,
+      nextHref:findNextHref(doc,pageUrl),
+      pageText,
+      title,
+      empty:empty && !loginPage,
+      loginPage,
+      hrefSamples
+    };
+  }
+
+  function renderedSearchHtml(url, signal) {
+    const abs = new URL(url, location.origin).href;
+    return new Promise((resolve,reject) => {
+      const iframe = document.createElement('iframe');
+      let settled=false;
+      let timer=null;
+      let poll=null;
+
+      iframe.setAttribute('aria-hidden','true');
+      iframe.tabIndex=-1;
+      // Keep the iframe inside the visual viewport so pictBLand's lazy/render
+      // observers treat the search page as visible. It stays fully transparent,
+      // non-interactive, and below our tool overlay.
+      iframe.style.cssText='position:fixed!important;inset:0!important;width:100vw!important;height:100dvh!important;border:0!important;opacity:.001!important;pointer-events:none!important;z-index:2147480000!important;background:#fff!important;';
+
+      const cleanup=()=>{
+        clearTimeout(timer);
+        clearInterval(poll);
+        signal?.removeEventListener?.('abort',onAbort);
+        try{iframe.remove();}catch{}
+      };
+      const finish=(ok,value)=>{
+        if(settled)return;
+        settled=true;
+        cleanup();
+        ok?resolve(value):reject(value instanceof Error?value:new Error(String(value||'描画取得失敗')));
+      };
+      const onAbort=()=>{
+        const err=new Error('取得を中止しました');
+        err.name='AbortError';
+        finish(false,err);
+      };
+
+      if(signal?.aborted){onAbort();return;}
+      signal?.addEventListener?.('abort',onAbort,{once:true});
+
+      timer=setTimeout(()=>{
+        try{
+          const doc=iframe.contentDocument;
+          let html=doc?.documentElement?.outerHTML||'';
+          try{
+            const shadowParts=[];
+            for(const rootNode of deepRoots(doc)){
+              if(rootNode===doc)continue;
+              shadowParts.push('<div data-pbsw-shadow-root="1">'+String(rootNode.innerHTML||'')+'</div>');
+            }
+            if(shadowParts.length)html+=shadowParts.join('');
+          }catch{}
+          const finalUrl=iframe.contentWindow?.location?.href||abs;
+          if(html.trim()) finish(true,{html,url:finalUrl,timedOut:true});
+          else finish(false,new Error('検索ページの描画がタイムアウトしました'));
+        }catch{
+          finish(false,new Error('検索ページの描画がタイムアウトしました'));
+        }
+      },12000);
+
+      iframe.addEventListener('load',()=>{
+        const loadedAt=Date.now();
+        let stableTicks=0;
+        let lastCount=-1;
+        poll=setInterval(()=>{
+          try{
+            const doc=iframe.contentDocument;
+            if(!doc?.documentElement)return;
+            const count=collectItemCandidates(doc).length;
+            const text=compactText(doc.body?.textContent||'');
+            const isEmpty=/(?:該当|検索).{0,20}(?:ありません|0件|見つかりません)|作品.{0,12}0件/i.test(text);
+
+            if(count===lastCount)stableTicks++;
+            else stableTicks=0;
+            lastCount=count;
+
+            // Nudge the inner page a little while waiting. Some pictBLand lists
+            // are rendered/lazy-loaded only after viewport/scroll observers run.
+            if(!count){
+              try{
+                const win=iframe.contentWindow;
+                const max=Math.max(0,(doc.documentElement?.scrollHeight||doc.body?.scrollHeight||0)-(win?.innerHeight||800));
+                const y=Math.min(max,Math.max(0,(win?.scrollY||0)+220));
+                win?.scrollTo?.(0,y);
+              }catch{}
+            }
+
+            // Wait a little after dynamic rendering settles. An actually empty
+            // result page can finish without any item links.
+            // Prevent resolving on IDs in an early SPA shell before the
+            // actual work-card text and metadata have rendered.
+            const waited=Date.now()-loadedAt;
+            const named=[...doc.querySelectorAll('a[href*="/items/detail/"]')]
+              .filter(a=>compactText(a.textContent||'').length>=4).length;
+            if((count>0&&stableTicks>=3&&waited>=2200
+                  && (named>0||waited>=6500))
+               ||(isEmpty&&stableTicks>=2)){
+              try{iframe.contentWindow?.scrollTo?.(0,0);}catch{}
+              let html=doc.documentElement.outerHTML;
+              try {
+                const shadowParts=[];
+                for(const rootNode of deepRoots(doc)){
+                  if(rootNode===doc)continue;
+                  shadowParts.push('<div data-pbsw-shadow-root="1">'+String(rootNode.innerHTML||'')+'</div>');
+                }
+                if(shadowParts.length) html += shadowParts.join('');
+              }catch{}
+              const finalUrl=iframe.contentWindow?.location?.href||abs;
+              finish(true,{html,url:finalUrl,timedOut:false});
+            }
+          }catch(err){
+            finish(false,new Error('検索ページDOMを読めませんでした：'+String(err?.message||err)));
+          }
+        },350);
+      },{once:true});
+
+      try{
+        (document.body||document.documentElement).append(iframe);
+        iframe.src=abs;
+      }catch(err){
+        finish(false,err);
+      }
+    });
+  }
+
+  function absolutePageUrl(url) {
+    try { return new URL(url, location.origin).href; } catch { return String(url || ''); }
+  }
+
+  async function fetchSearchState(state, url, generation) {
+    if (!url || generation !== feedGeneration || feedAbort?.signal.aborted) return false;
+
+    const pageUrl = absolutePageUrl(url);
+    state.seenPages ||= new Set();
+    state.loadedIds ||= new Set();
+
+    if (!pageUrl || state.seenPages.has(pageUrl)) {
+      state.done = true;
+      state.nextHref = '';
+      return false;
+    }
+    state.seenPages.add(pageUrl);
+
+    const before = state.loadedIds.size;
+    try {
+      // First try a normal same-site request. pictBLand may return only the
+      // application shell here, so if no work cards exist, fall back to an
+      // on-screen transparent same-origin iframe and read the rendered DOM.
+      let parsed;
+      const cached = cacheGet(searchPageCache,pageUrl);
+      if (cached) {
+        parsed = copyCachedSearchPage(cached,state);
+      } else {
+        let response;
+        try {
+          // Same-site fetch should use the signed-in Safari session.
+          response = await requestBrowserSearchHtml(pageUrl, feedAbort.signal);
+        } catch (error) {
+          if (error?.name === 'AbortError' || error?.rateLimited) throw error;
+          response = await requestHtml(pageUrl, feedAbort.signal);
+        }
+        if (generation !== feedGeneration) return false;
+        parsed = parseSearchPage(response.html,response.url,state);
+        let sawGuestPage = !!parsed.loginPage;
+        // GM requests on Safari/Macaque may omit the logged-in browser session.
+        // Retry only a guest response with cookie-bearing first-party fetch,
+        // then the canonical word URL when a saved legacy URL is malformed.
+        if (parsed.loginPage) {
+          const urls = [pageUrl];
+          const canonical = state.pagesFetched === 0
+            ? absolutePageUrl(searchHrefForWord(state.row?.word || '')) : '';
+          if (canonical && !urls.includes(canonical)) urls.push(canonical);
+          for (const candidateUrl of urls) {
+            try {
+              const browserResponse = await requestBrowserSearchHtml(candidateUrl,feedAbort.signal);
+              if (generation !== feedGeneration) return false;
+              const browserParsed = parseSearchPage(browserResponse.html,browserResponse.url,state);
+              sawGuestPage ||= !!browserParsed.loginPage;
+              if (!browserParsed.loginPage) {
+                parsed=browserParsed;
+                break;
+              }
+            } catch (error) {
+              if (error?.name === 'AbortError' || error?.rateLimited) throw error;
+            }
+          }
+        }
+
+        const initialQuality=parsedSearchQuality(parsed);
+        const missingCards=!parsed.empty && (initialQuality.count===0
+          || initialQuality.meaningful < Math.max(1,Math.floor(initialQuality.count*0.45)));
+        if (missingCards) {
+          // Work-ID references in HTML/JSON are not enough to claim that
+          // details were obtained. Give the logged-in rendered UI a chance.
+          try {
+            await reserveNetworkSlot(feedAbort.signal);
+            const canonicalIframe = sawGuestPage && state.pagesFetched === 0
+              ? absolutePageUrl(searchHrefForWord(state.row?.word || '')) : '';
+            const rendered=await renderedSearchHtml(canonicalIframe || pageUrl,feedAbort.signal);
+            if (generation !== feedGeneration) return false;
+            const hydrated=parseSearchPage(rendered.html,rendered.url,state);
+            sawGuestPage ||= !!hydrated.loginPage;
+            const quality=parsedSearchQuality(hydrated);
+            // Never replace valid cards with an anonymous login page.
+            if (!hydrated.loginPage && (quality.count && (quality.meaningful>initialQuality.meaningful
+                || (quality.meaningful===initialQuality.meaningful
+                    && quality.count>=initialQuality.count)))) {
+              parsed=hydrated;
+            }
+          } catch(e) {
+            if(e?.name==='AbortError' || e?.rateLimited)throw e;
+            // Retain IDs if no work-specific metadata is rendered either.
+          }
+        }
+
+        if (!parsed.works.length && !parsed.empty) {
+          if (parsed.loginPage || sawGuestPage)
+            throw new Error('pictBLandのログイン案内が返されました。Safariでこの検索語を直接開き、ログイン状態を確認してから「更新」を押してください。');
+          const hint = [parsed.title,parsed.pageText.slice(0,100)].filter(Boolean).join(' ／ ');
+          const links = (parsed.hrefSamples||[]).slice(0,6).join(' , ');
+          throw new Error(
+            '検索ページは開けましたが作品カードを判定できません'
+            + (hint ? '：'+hint : '')
+            + (links ? ' ／ リンク候補：'+links : '')
+          );
+        }
+        cachePut(searchPageCache,pageUrl,copyCachedSearchPage(parsed,state),SEARCH_CACHE_MS);
+      }
+
+      const acceptedWorks=[];
+      const remaining=Math.max(0,PER_SEARCH_LIMIT-state.loadedIds.size);
+      for (const work of parsed.works) {
+        const id=work?.id ? String(work.id) : '';
+        if(!id || state.loadedIds.has(id))continue;
+        if(acceptedWorks.length>=remaining)break;
+        state.loadedIds.add(id);
+        acceptedWorks.push(work);
+      }
+      state.pagesFetched = Number(state.pagesFetched || 0) + 1;
+
+      const next = parsed.nextHref ? absolutePageUrl(parsed.nextHref) : '';
+      state.nextHref = next && !state.seenPages.has(next) ? next : '';
+      state.done = state.loadedIds.size >= PER_SEARCH_LIMIT || !state.nextHref;
+      if(state.done)state.nextHref='';
+      state.error = '';
+      mergeWorks(acceptedWorks);
+
+      // If a page yielded no new IDs, following pagination further is unsafe:
+      // it is usually a repeated/looping page rather than genuinely new data.
+      if (parsed.works.length && state.loadedIds.size === before) {
+        state.done = true;
+        state.nextHref = '';
+      }
+      return state.loadedIds.size > before;
+    } catch (e) {
+      if (e?.name === 'AbortError') return false;
+      state.error = String(e?.message || e);
+      return false;
+    }
+  }
+
+  function mergeWorks(works) {
+    for (const work of works || []) {
+      const old = feedWorks.get(work.id);
+      if (!old) {
+        feedWorks.set(work.id, work);
+        continue;
+      }
+      for (const name of work.matches) old.matches.add(name);
+      old.searchPriority = Math.min(
+        Number.isFinite(Number(old.searchPriority)) ? Number(old.searchPriority) : Number.MAX_SAFE_INTEGER,
+        Number.isFinite(Number(work.searchPriority)) ? Number(work.searchPriority) : Number.MAX_SAFE_INTEGER
+      );
+      if (!old.thumb && work.thumb) old.thumb = work.thumb;
+      if (!old.authorName && work.authorName) { old.authorName = work.authorName; old.authorHref = work.authorHref; }
+      if (!old.caption && work.caption) old.caption = work.caption;
+      if (!old.workType && work.workType) old.workType=work.workType;
+      if (old.characterCount==null && work.characterCount!=null) old.characterCount=work.characterCount;
+      if (old.imageCount==null && work.imageCount!=null) old.imageCount=work.imageCount;
+      if (!old.tags.length && work.tags.length) old.tags = work.tags;
+      if (work.detailTagsVerified || old.tags.length) old.detailTagsVerified = true;
+      old.accessBadges = [...new Set([...(old.accessBadges||[]),...(work.accessBadges||[])])];
+      if (!old.dateTime && work.dateTime) { old.dateTime = work.dateTime; old.dateText = work.dateText; }
+      if (old.sukiCount == null && work.sukiCount != null) old.sukiCount = work.sukiCount;
+      if (old.bookmarkCount == null && work.bookmarkCount != null) old.bookmarkCount = work.bookmarkCount;
+    }
+  }
+
+  // The same newest-first comparator governs both display and detail requests.
+  // Unknown dates fall back to work IDs, matching the existing feed ordering.
+  function compareNewestWorks(a,b) {
+    if ((b.dateTime||0) !== (a.dateTime||0)) return (b.dateTime||0) - (a.dateTime||0);
+    const bi = Number(b.id), ai = Number(a.id);
+    if (Number.isFinite(bi) && Number.isFinite(ai) && bi !== ai) return bi-ai;
+    return (a.searchOrder||0) - (b.searchOrder||0);
+  }
+
+  function allSortedWorks() {
+    return [...feedWorks.values()].sort(compareNewestWorks);
+  }
+
+  function compareSavedSearchPriority(a,b) {
+    const ap=Number.isFinite(Number(a?.searchPriority)) ? Number(a.searchPriority) : Number.MAX_SAFE_INTEGER;
+    const bp=Number.isFinite(Number(b?.searchPriority)) ? Number(b.searchPriority) : Number.MAX_SAFE_INTEGER;
+    if(ap!==bp)return ap-bp;
+    return compareNewestWorks(a,b);
+  }
+
+  // With blocked tags set, prevent even a momentary preview before detail checking.
+  function feedNeedsTagVerification() { return feedExcludeTags.length > 0; }
+  function feedTagsAreVerified(work) {
+    return !feedNeedsTagVerification() || !!work.detailTagsVerified;
+  }
+  function feedReviewCandidates() {
+    return allSortedWorks().filter(work =>
+      !excludedByTag(work) && !work.detailError &&
+      (!feedNeedsTagVerification() || !work.detailTagsVerified));
+  }
+  function sortedWorks() {
+    return allSortedWorks().filter(work =>
+      !excludedByTag(work) && feedTagsAreVerified(work));
+  }
+
+  async function mapLimit(items, limit, worker) {
+    let index = 0;
+    const runners = Array.from({length:Math.min(limit,items.length)}, async () => {
+      while (index < items.length) {
+        const item = items[index++];
+        await worker(item);
+      }
+    });
+    await Promise.allSettled(runners);
+  }
+
+  function stateCoverage(state) {
+    return Number(state?.loadedIds?.size || 0);
+  }
+
+  function coverageComplete() {
+    return feedStates.every(state =>
+      !!state.error || !!state.done || stateCoverage(state) >= PER_SEARCH_LIMIT
+    );
+  }
+
+  async function ensureCoverage(_target, generation) {
+    // This feed is intentionally shallow: take only the newest 15 works from
+    // each saved condition, then merge all conditions and process globally by date.
+    for (const state of feedStates) {
+      if (generation !== feedGeneration || feedAbort?.signal.aborted) break;
+      if (state.error || state.done || !state.nextHref || stateCoverage(state) >= PER_SEARCH_LIMIT) continue;
+      state.processing = true;
+      if (generation === feedGeneration) renderFeed();
+
+      let rounds = 0;
+      while (generation === feedGeneration && !feedAbort?.signal.aborted &&
+             !state.error && !state.done && state.nextHref && stateCoverage(state) < PER_SEARCH_LIMIT) {
+        const before = stateCoverage(state);
+        await fetchSearchState(state,state.nextHref,generation);
+        if (generation !== feedGeneration) break;
+        renderFeed();
+        const progressed = stateCoverage(state) > before || state.done || state.error;
+        if (!progressed || ++rounds >= 8) break;
+      }
+      state.processing = false;
+      if (generation === feedGeneration) renderFeed();
+    }
+  }
+
+  async function expandFeed() {
+    if (feedLoading || !feedOpen) return;
+    feedVisibleCount += FEED_STEP;
+    renderFeed();
+  }
+
+  // Prefer the browser's authenticated same-origin request. In some iOS
+  // userscript engines GM requests do not carry Safari's logged-in cookies.
+  async function requestAuthenticatedDetail(url,signal) {
+    await reserveNetworkSlot(signal);
+    let response;
+    try {
+      response=await fetch(url,{
+        credentials:'include',signal,
+        headers:{Accept:'text/html,application/xhtml+xml'}
+      });
+    } catch(error) {
+      if(signal?.aborted)throw abortError();
+      // Fall back to the userscript request when native fetch is unavailable.
+      return await requestHtml(url,signal);
+    }
+    if(response.status===429){
+      blockedUntil=Date.now()+RATE_LIMIT_COOLDOWN_MS;
+      throw rateLimitError();
+    }
+    if(!response.ok)throw new Error('詳細ページ HTTP '+response.status);
+    return {html:await response.text(),url:response.url||url};
+  }
+
+  function detailCaptionFromDoc(doc,work) {
+    // Work-specific nodes may live in a shadow root in responsive layouts.
+    for(const node of deepRoots(doc)) {
+      const value=captionFrom(node,work.title,work.authorName,work.tags,true);
+      if(value)return value;
+    }
+    return '';
+  }
+
+  // Render within the logged-in browser if the initial HTML is only the site
+  // shell. This obeys existing visibility restrictions and access cooldowns.
+  function renderedDetailHtml(url,work,signal) {
+    return new Promise((resolve,reject)=>{
+      const frame=document.createElement('iframe');
+      let finished=false,poll=null,timeout=null,loaded=0,latest=null;
+      frame.setAttribute('aria-hidden','true');frame.tabIndex=-1;
+      frame.style.cssText='position:fixed!important;inset:0!important;width:100vw!important;height:100dvh!important;opacity:.001!important;pointer-events:none!important;border:0!important;z-index:2147480000!important;';
+      const clean=()=>{clearTimeout(timeout);clearInterval(poll);signal?.removeEventListener('abort',onAbort);frame.remove();};
+      const finish=(ok,value)=>{if(finished)return;finished=true;clean();ok?resolve(value):reject(value);};
+      const onAbort=()=>finish(false,abortError());
+      if(signal?.aborted){onAbort();return;}
+      signal?.addEventListener('abort',onAbort,{once:true});
+      timeout=setTimeout(()=>finish(true,latest),6500);
+      frame.addEventListener('load',()=>{
+        loaded=Date.now();clearInterval(poll);
+        poll=setInterval(()=>{
+          if(Date.now()-loaded<1000)return;
+          try {
+            const doc=frame.contentDocument;
+            const pathname=String(frame.contentWindow?.location?.pathname||'');
+            if(!doc?.body || pathname!==new URL(url,location.origin).pathname)return;
+            const html=doc.documentElement?.outerHTML||'';
+            if(html.length<400)return;
+            // Preserve shadow content in the snapshot for detail parsing.
+            const extra=[];
+            for(const node of deepRoots(doc)) {
+              if(node===doc)continue;
+              extra.push('<div data-pbsw-detail-shadow="1">'+(node.innerHTML||'')+'</div>');
+            }
+            latest={html:html+extra.join(''),url:frame.contentWindow.location.href};
+            if(detailCaptionFromDoc(doc,work) || tagsFrom(doc).length){
+              finish(true,latest);
+              return;
+            }
+          }catch{}
+        },350);
+      });
+      try{(document.body||document.documentElement).append(frame);frame.src=url;}
+      catch(e){finish(false,e);}
+    });
+  }
+
+  async function fetchDetail(work,signal) {
+    const key=new URL(work.href,location.origin).href;
+    let response=cacheGet(detailHtmlCache,key);
+    if(!response){
+      response=await requestAuthenticatedDetail(key,signal);
+    }
+    let doc=new DOMParser().parseFromString(response.html,'text/html');
+    let caption=detailCaptionFromDoc(doc,work);
+    let tags=tagsFrom(doc);
+    // For exclusion filtering, tags from the authenticated work detail HTML
+    // are already enough. Avoid a second iframe/render wait just to obtain a caption.
+    if(!caption && !(feedNeedsTagVerification() && tags.length)){
+      try {
+        await reserveNetworkSlot(signal);
+        const rendered=await renderedDetailHtml(key,work,signal);
+        if(rendered?.html) {
+          const parsed=new DOMParser().parseFromString(rendered.html,'text/html');
+          const found=detailCaptionFromDoc(parsed,work);
+          const renderedTags=tagsFrom(parsed);
+          if(found || renderedTags.length){
+            doc=parsed;response=rendered;caption=found;tags=renderedTags;
+          }
+        }
+      } catch(error) {
+        if(error?.name==='AbortError'||error?.rateLimited)throw error;
+      }
+    }
+    // Cache only work-specific successful snapshots, not generic landing-page
+    // SEO HTML that could contaminate many unrelated result cards.
+    if(caption || tags.length)cachePut(detailHtmlCache,key,response,DETAIL_CACHE_MS);
+    const bodyText=compactText(doc.body?.textContent||'');
+    // A generic site shell is not proof that the work has no blocked tags.
+    work.detailTagsVerified=tags.length > 0;
+    if(tags.length)work.tags=tags;
+    if(feedNeedsTagVerification() && !work.detailTagsVerified)
+      throw new Error('作品固有のタグを確認できませんでした');
+    const detailedBadges=accessBadgesFromDetailDocument(doc);
+    if(detailedBadges.length)
+      work.accessBadges=[...new Set([...(work.accessBadges||[]),...detailedBadges])];
+    const author=authorFrom(doc);
+    if(author.name && !work.authorName){work.authorName=author.name;work.authorHref=author.href;}
+    const ogTitle=compactText(doc.querySelector('meta[property="og:title"]')?.getAttribute('content'));
+    const headingTitle=compactText(doc.querySelector('h1,h2,[class*="title"],[class*="subject"]')?.textContent);
+    const title=headingTitle || ogTitle;
+    // Never let an incomplete detail-page shell overwrite a correct result
+    // card title already visible to the user.
+    if((!work.title || work.title==='作品 '+work.id)
+      && title && !/pictBLand|一般会員|プレミアム会員/i.test(title))
+      work.title=title.replace(/\\s*[|｜-]\\s*pictBLand.*$/i,'').trim()||work.title;
+    const ogImage=doc.querySelector('meta[property="og:image"]')?.getAttribute('content')||'';
+    if(!work.thumb && ogImage && !isBoilerplateCaption(ogTitle)) {
+      try{work.thumb=new URL(ogImage,response.url).href;}catch{}
+    }
+    const date=dateFrom(doc);
+    if(date.time && !work.dateTime){work.dateTime=date.time;work.dateText=date.text;}
+    const original=doc.body?.textContent||'';
+    const cardType=workFormatFromCard({textContent:original.slice(0,300)});
+    if(!work.workType && cardType.workType)work.workType=cardType.workType;
+    if(work.characterCount==null && cardType.characterCount!=null)work.characterCount=cardType.characterCount;
+    if(work.imageCount==null && cardType.imageCount!=null)work.imageCount=cardType.imageCount;
+    // Never use <meta name=description>, <meta property=og:description> or
+    // search page promotional excerpts as authored work captions.
+    work.caption=caption || validCaption(work.caption,work.title,work.authorName,work.tags);
+    const suki=metricFromText(bodyText,['ステキ!?','ステキ','いいね']);
+    const bookmark=metricFromText(bodyText,['ブクマ','ブックマーク']);
+    if(suki!=null)work.sukiCount=suki;
+    if(bookmark!=null)work.bookmarkCount=bookmark;
+  }
+  function resetDetailQueue() {
+    detailQueue = [];
+    detailActive = 0;
+  }
+
+  function enqueueDetail(work, generation) {
+    if (!work || work.detailLoaded || work.detailLoading || work.detailQueued || work.detailError) return;
+    work.detailQueued = true;
+    detailQueue.push({work,generation});
+    pumpDetailQueue();
+  }
+
+  function enqueueDetailsForSearchPriority(priority,generation,limit=FEED_STEP) {
+    const target=Number(priority);
+    const works=[...feedWorks.values()]
+      .filter(work => Number(work.searchPriority)===target && !excludedByTag(work) &&
+        !work.detailTagsVerified && !work.detailLoading && !work.detailQueued && !work.detailError)
+      .sort(compareSavedSearchPriority)
+      .slice(0,Math.max(1,Number(limit)||FEED_STEP));
+    for(const work of works)enqueueDetail(work,generation);
+  }
+
+  function pumpDetailQueue() {
+    // After every saved condition contributes at most 15 works, exclusion
+    // checks follow the merged feed's global newest-first order.
+    detailQueue.sort((a,b) => compareNewestWorks(a.work,b.work));
+    while (detailActive < DETAIL_CONCURRENCY && detailQueue.length) {
+      const job = detailQueue.shift();
+      const work = job.work;
+      work.detailQueued = false;
+      if (job.generation !== feedGeneration || feedAbort?.signal.aborted || work.detailLoaded || work.detailLoading) continue;
+      work.detailLoading = true;
+      detailActive++;
+      fetchDetail(work,feedAbort.signal).then(() => {
+        if (job.generation !== feedGeneration) return;
+        work.detailLoaded = true;
+        work.detailError = '';
+        if (feedNeedsTagVerification() || excludedByTag(work)) renderFeed();
+        else updateFeedCard(work);
+      }).catch(e => {
+        if (job.generation !== feedGeneration || e?.name === 'AbortError') return;
+        work.detailError = e?.rateLimited
+          ? 'アクセス制限中（時間を置いて更新してください）'
+          : '詳細取得失敗：' + String(e?.message || e || '不明なエラー');
+        work.detailLoaded = false;
+        if (e?.rateLimited) {
+          for (const remaining of detailQueue) remaining.work.detailQueued = false;
+          detailQueue = [];
+        }
+        if (feedNeedsTagVerification()) renderFeed();
+        else updateFeedCard(work);
+      }).finally(() => {
+        work.detailLoading = false;
+        detailActive = Math.max(0,detailActive-1);
+        if (job.generation === feedGeneration) updateFeedCard(work);
+        const status = root?.querySelector('.pbsw-feed-status');
+        if (status) status.textContent = feedStatusText();
+        pumpDetailQueue();
+      });
+    }
+  }
+
+  function feedStatusText() {
+    const total=feedStates.length,ok=feedStates.filter(x=>!x.error).length,bad=feedStates.filter(x=>x.error).length;
+    const all=allSortedWorks(),ready=sortedWorks(),displayed=ready.slice(0,feedVisibleCount);
+    const excluded=all.filter(excludedByTag).length;
+    const pending=feedNeedsTagVerification()?all.filter(w=>!excludedByTag(w)&&!w.detailTagsVerified&&!w.detailError).length:0;
+    const unknown=feedNeedsTagVerification()?all.filter(w=>!excludedByTag(w)&&!!w.detailError).length:0;
+    const target=PER_SEARCH_LIMIT,covered=feedStates.filter(x=>x.error||x.done||stateCoverage(x)>=target).length;
+    const coverageText=total?' ／ 横断同期 '+covered+'/'+total+'条件（各最大'+PER_SEARCH_LIMIT+'件）':'';
+    const detailText=displayed.length
+      ? (feedNeedsTagVerification()
+          ? ' ／ 除外確認 '+displayed.filter(w=>w.detailTagsVerified).length+'/'+displayed.length
+          : ' ／ 新着順に詳細 '+displayed.filter(w=>w.detailLoaded).length+'/'+displayed.length)
+      : '';
+    const tagText=feedNeedsTagVerification()?' ／ タグ確認待ち '+pending+'件'+(unknown?' ／ タグ確認不可 '+unknown+'件（非表示）':''):'';
+    const active=feedStates.find(x=>x.processing);
+    const activeText=active?' ／ 処理中 '+(Number(active.priority)+1)+'/'+total+'：'+(active.row?.name||active.row?.word||'保存検索'):'';
+    return (feedLoading?'保存検索を上から順に処理中… 現在 ':'保存検索 '+ok+'/'+total+'件取得 ／ 表示 ')
+      +ready.length.toLocaleString('ja-JP')+'作品'+coverageText+detailText
+      +(excluded?' ／ 除外 '+excluded+'作品':'')+tagText+activeText+(bad?' ／ 失敗 '+bad+'件':'');
+  }
+
+  function renderCoverageBreakdown() {
+    const box = root?.querySelector('.pbsw-feed-coverage');
+    if (!box) return;
+    box.replaceChildren();
+    for (const state of feedStates) {
+      const chip = document.createElement('span');
+      const name = state.row?.name || state.row?.word || '保存検索';
+      const count = stateCoverage(state);
+      chip.textContent = name + ' ' + count + '件' + (state.error ? ' ⚠️' : state.processing ? ' ▶' : state.done ? ' ✓' : count >= PER_SEARCH_LIMIT ? ' ✓' : ' …');
+      if (state.error) chip.title = state.error;
+      box.append(chip);
+    }
+  }
+
+  function metricLabel(work) {
+    const bits = [];
+    if (work.sukiCount != null) bits.push('♥ ' + Number(work.sukiCount).toLocaleString('ja-JP'));
+    if (work.bookmarkCount != null) bits.push('🔖 ' + Number(work.bookmarkCount).toLocaleString('ja-JP'));
+    if (bits.length) return bits.join('  ');
+    if (work.detailError) return '⚠ 詳細取得不可';
+    if (work.detailLoaded) return '件数情報なし';
+    return work.detailLoading ? '詳細取得中…' : '詳細取得待ち…';
+  }
+
+  function createFeedCard(work) {
+    const card = document.createElement('article');
+    card.className = 'pbsw-feed-card';
+    card.dataset.workId = work.id;
+
+    const thumb = document.createElement('a');
+    thumb.className = 'pbsw-feed-thumb';
+    thumb.href = work.href;
+    const img = document.createElement('img');
+    img.loading = 'lazy';
+    img.alt = work.title;
+    if (work.thumb) img.src = work.thumb;
+    else img.classList.add('empty');
+    thumb.append(img);
+
+    const info = document.createElement('div');
+    info.className = 'pbsw-feed-info';
+    const kind = document.createElement('div');
+    kind.className='pbsw-feed-kind';
+    kind.textContent=formatWorkLabel(work);
+    kind.hidden=!kind.textContent;
+    const access = document.createElement('div');
+    access.className='pbsw-feed-access';
+    updateFeedAccessBadges(access,work);
+
+    const top = document.createElement('div');
+    top.className = 'pbsw-feed-top';
+    const title = document.createElement('a');
+    title.className = 'pbsw-feed-title';
+    title.href = work.href;
+    title.textContent = work.title;
+    const metric = document.createElement('span');
+    metric.className = 'pbsw-feed-metric';
+    metric.textContent = metricLabel(work);
+    if (work.detailError) metric.title = work.detailError;
+    top.append(title,metric);
+
+    const author = document.createElement(work.authorHref ? 'a' : 'span');
+    author.className = 'pbsw-feed-author';
+    if (work.authorHref) author.href = work.authorHref;
+    author.textContent = work.authorName || '作者取得中…';
+
+    const date = document.createElement('div');
+    date.className = 'pbsw-feed-date';
+    date.textContent = work.dateText || '';
+
+    const caption = document.createElement('p');
+    caption.className = 'pbsw-feed-caption';
+    caption.textContent = work.caption || (work.detailError ? 'キャプション取得不可'
+      : work.detailLoaded ? 'キャプションを取得できませんでした' : '作品情報を取得中…');
+
+    const tags = document.createElement('div');
+    tags.className = 'pbsw-feed-tags';
+    for (const tag of work.tags.slice(0,10)) {
+      const a = document.createElement('a');
+      a.href = searchHrefForWord(tag);
+      a.textContent = '#' + tag;
+      tags.append(a);
+    }
+
+    const matches = document.createElement('div');
+    matches.className = 'pbsw-feed-matches';
+    const names = [...work.matches];
+    for (const name of names.slice(0,4)) {
+      const chip = document.createElement('span');
+      chip.textContent = name;
+      matches.append(chip);
+    }
+    if (names.length > 4) {
+      const more = document.createElement('span');
+      more.textContent = '+' + (names.length-4);
+      matches.append(more);
+    }
+
+    info.append(kind,access,top,author,date,caption,tags,matches);
+    card.append(thumb,info);
+    return card;
+  }
+
+  function updateFeedCard(work) {
+    const card = root?.querySelector('.pbsw-feed-card[data-work-id="' + CSS.escape(work.id) + '"]');
+    if (!card) return;
+    const metric = card.querySelector('.pbsw-feed-metric');
+    if (metric) {
+      metric.textContent = metricLabel(work);
+      metric.title = work.detailError || (work.detailLoaded && work.sukiCount == null && work.bookmarkCount == null
+        ? '詳細ページにステキ数・ブックマーク数の情報がありませんでした' : '');
+    }
+    const title = card.querySelector('.pbsw-feed-title');
+    if (title) title.textContent = work.title;
+    const kind=card.querySelector('.pbsw-feed-kind');
+    if(kind){kind.textContent=formatWorkLabel(work);kind.hidden=!kind.textContent;}
+    updateFeedAccessBadges(card.querySelector('.pbsw-feed-access'),work);
+    const author = card.querySelector('.pbsw-feed-author');
+    if (author) author.textContent = work.authorName || '作者不明';
+    const date = card.querySelector('.pbsw-feed-date');
+    if (date) date.textContent = work.dateText || '';
+    const caption = card.querySelector('.pbsw-feed-caption');
+    if (caption) caption.textContent = work.caption || (work.detailError ? 'キャプション取得不可'
+      : work.detailLoaded ? 'キャプションを取得できませんでした' : '作品情報を取得中…');
+    const img = card.querySelector('.pbsw-feed-thumb img');
+    if (img && work.thumb && !img.getAttribute('src')) { img.src = work.thumb; img.classList.remove('empty'); }
+    const tags = card.querySelector('.pbsw-feed-tags');
+    if (tags) {
+      tags.replaceChildren();
+      for (const tag of work.tags.slice(0,10)) {
+        const a = document.createElement('a');
+        a.href = searchHrefForWord(tag);
+        a.textContent = '#' + tag;
+        tags.append(a);
+      }
+    }
+  }
+
+  function observeFeedCards(works,generation) {
+    // Fetch details for the displayed batch in newest-first order, including
+    // works below the fold. IntersectionObserver callbacks may arrive in a
+    // different order and must not cause older works to jump ahead.
+    feedObserver?.disconnect();
+    for (const work of works) enqueueDetail(work,generation);
+  }
+
+  function renderFeed() {
+    if (!root) return;
+    syncExcludeUi();
+    const status = root.querySelector('.pbsw-feed-status');
+    if (status) status.textContent = (Date.now() < blockedUntil ? '⚠ pictBLandのアクセス制限を検出：10分間は通信停止 ／ ' : '') + feedStatusText();
+
+    renderCoverageBreakdown();
+
+    const errors = root.querySelector('.pbsw-feed-errors');
+    if (errors) {
+      const failed = feedStates.filter(s => s.error);
+      errors.replaceChildren();
+      errors.hidden = !failed.length;
+      for (const state of failed) {
+        const row = document.createElement('div');
+        row.className = 'pbsw-feed-error-row';
+        const name = document.createElement('strong');
+        name.textContent = state.row?.name || state.row?.word || '保存検索';
+        const msg = document.createElement('span');
+        msg.textContent = state.error;
+        row.append(name,msg);
+        const target = searchHrefForWord(state.row?.word || '');
+        if (target) {
+          const link = document.createElement('a');
+          link.href = target;
+          link.target = '_blank';
+          link.rel = 'noopener noreferrer';
+          link.textContent = '↗ この検索を開く';
+          link.style.cssText = 'font-size:11px;color:#7356a8;text-decoration:underline;white-space:nowrap;';
+          row.append(link);
+        }
+        errors.append(row);
+      }
+    }
+
+    const works = sortedWorks();
+    const visible = works.slice(0,feedVisibleCount);
+    const grid = root.querySelector('.pbsw-feed-grid');
+    // Keep stable DOM/cards while verified results arrive one by one.
+    for(let i=0;i<visible.length;i++){
+      const work=visible[i],current=grid.children[i]||null;
+      if(current?.dataset?.workId===String(work.id))continue;
+      const existing=[...grid.querySelectorAll('.pbsw-feed-card')].find(
+        card=>card.dataset.workId===String(work.id));
+      grid.insertBefore(existing||createFeedCard(work),current);
+    }
+    while(grid.children.length>visible.length)grid.lastElementChild.remove();
+
+    if(!works.length&&!feedLoading){
+      const all=allSortedWorks();
+      const pending=feedNeedsTagVerification()&&all.some(w=>
+        !excludedByTag(w)&&!w.detailTagsVerified&&!w.detailError);
+      const failed=feedNeedsTagVerification()&&all.some(w=>
+        !excludedByTag(w)&&!!w.detailError);
+      const p=document.createElement('p');
+      p.className='pbsw-empty';
+      p.textContent=pending?'タグを確認中です。未確認の作品は表示しません。'
+        :failed?'タグを確認できなかった作品は非表示です。必要なら「更新」で再取得してください。'
+        :all.length&&feedNeedsTagVerification()?'取得した作品はすべて除外タグに一致しました。'
+        :'該当する新着作品がありません。';
+      grid.replaceChildren(p);
+    }
+
+    const showMore=root.querySelector('.pbsw-feed-show-more');
+    const older=root.querySelector('.pbsw-feed-load-older');
+    const refresh=root.querySelector('.pbsw-feed-refresh');
+    const hasHidden=works.length>feedVisibleCount;
+    const candidates=feedNeedsTagVerification()?feedReviewCandidates():visible;
+    const hasFurtherCandidates=feedNeedsTagVerification()&&candidates.length>feedVisibleCount;
+    showMore.hidden=!(hasHidden||hasFurtherCandidates);
+    older.hidden=true;
+    refresh.disabled=feedLoading;
+    showMore.disabled=feedLoading;
+    older.disabled=feedLoading;
+    // Hidden candidates still need work-specific detail requests; otherwise
+    // no card is visible and the old observer strategy would deadlock.
+    if(!feedLoading&&feedOpen)
+      observeFeedCards(feedNeedsTagVerification()?candidates.slice(0,feedVisibleCount):visible,feedGeneration);
+  }
+
+  async function refreshFeed(force = false) {
+    if (force) { searchPageCache.clear(); detailHtmlCache.clear(); captionDiagnostics.clear(); }
+    const rows = readSaved();
+    feedAbort?.abort();
+    feedAbort = new AbortController();
+    feedGeneration++;
+    const generation = feedGeneration;
+    feedLoading = true;
+    feedWorks = new Map();
+    feedVisibleCount = FEED_STEP;
+    feedStates = rows.map((row,priority) => ({
+      row,
+      priority,
+      processing:false,
+      nextHref:firstSearchHref(row),
+      done:!isPrivateSearchHref(row.href,row.word),
+      error:isPrivateSearchHref(row.href,row.word) ? '' : '旧形式の検索URLは使用できません。pictBLandの検索結果を開き「この検索結果を紐づけ」で新URLを登録してください。',
+      loadedIds:new Set(),
+      seenPages:new Set(),
+      pagesFetched:0
+    }));
+    feedObserver?.disconnect();
+    resetDetailQueue();
+    renderFeed();
+
+    // Fetch only the newest 15 from each saved condition. Once all conditions
+    // contribute, the merged set is ordered globally by work date.
+    await ensureCoverage(PER_SEARCH_LIMIT,generation);
+
+    if (generation !== feedGeneration) return;
+    feedLoading = false;
+    renderFeed();
+  }
+
+  async function loadOlderFeed() {
+    await expandFeed();
+  }
+
+  function showManagePage() {
+    if (!root) return;
+    const manage = root.querySelector('.pbsw-manage-page');
+    const feed = root.querySelector('.pbsw-feed-page');
+    if (feed) { feed.hidden = true; feed.style.setProperty('display','none','important'); }
+    if (manage) { manage.hidden = false; manage.style.setProperty('display','block','important'); }
+  }
+
+  function showFeedPage() {
+    if (!root) return;
+    const manage = root.querySelector('.pbsw-manage-page');
+    const feed = root.querySelector('.pbsw-feed-page');
+    if (manage) { manage.hidden = true; manage.style.setProperty('display','none','important'); }
+    if (feed) { feed.hidden = false; feed.style.setProperty('display','block','important'); }
+  }
+
+  function openFeed() {
+    build();
+    if (!root) return;
+    feedOpen = true;
+    root.classList.add('open');
+    showFeedPage();
+    root.scrollTop = 0;
+    void refreshFeed();
+  }
+
+  function closeFeed() {
+    feedAbort?.abort();
+    feedObserver?.disconnect();
+    clearTimeout(feedAutoExpandTimer);
+    resetDetailQueue();
+    feedOpen = false;
+    if (!root) return;
+    showManagePage();
+    root.scrollTop = 0;
+    render();
+  }
+
+  function render() {
+    if (!root || feedOpen) return;
+    const rows = readSaved();
+    const list = root.querySelector('.pbsw-list');
+    const current = currentSearch();
+    const saveCurrentBtn = root.querySelector('.pbsw-save-current');
+    const newestBtn = root.querySelector('.pbsw-newest-open');
+    root.querySelector('.pbsw-current').textContent = current
+      ? '現在の検索語：' + current.word
+      : '検索語を入力するか、保存済みの検索語をタップしてください。';
+    saveCurrentBtn.hidden = !current;
+    const bindBtn = root.querySelector('.pbsw-bind-current');
+    if (bindBtn) bindBtn.hidden = !isPrivateSearchHref(location.pathname + location.search);
+    newestBtn.disabled = !rows.length;
+    list.replaceChildren();
+
+    if (!rows.length) {
+      const p = document.createElement('p');
+      p.className = 'pbsw-empty';
+      p.textContent = '保存した検索語はまだありません。上の入力欄から検索・保存できます。';
+      list.append(p);
+      return;
+    }
+
+    rows.forEach((row,index) => {
+      const card = document.createElement('article');
+      card.className = 'pbsw-card';
+
+      const open = document.createElement('button');
+      open.type = 'button';
+      open.className = 'pbsw-open';
+      open.title = 'タップして検索';
+      open.addEventListener('click',()=>runSearch(row.word,row.href));
+      const name = document.createElement('strong');
+      name.textContent = row.name || row.word;
+      const word = document.createElement('span');
+      word.textContent = '🔎 ' + row.word +
+        (isPrivateSearchHref(row.href,row.word) ? '　✅ 新URL登録済み' : '　⚠️ URL再登録が必要');
+      open.append(name,word);
+
+      const actions = document.createElement('div');
+      actions.className = 'pbsw-actions';
+      const make=(label,fn,disabled=false)=>{
+        const b=document.createElement('button');
+        b.type='button';b.textContent=label;b.disabled=disabled;b.addEventListener('click',fn);return b;
+      };
+      actions.append(
+        make('🔎 検索する',()=>runSearch(row.word,row.href)),
+        make('🔗 URL再登録',()=>beginRebind(row.id)),
+        make('名前変更',()=>rename(row.id)),
+        make('↑',()=>move(row.id,-1),index===0),
+        make('↓',()=>move(row.id,1),index===rows.length-1),
+        make('削除',()=>remove(row.id))
+      );
+      card.append(open,actions);
+      list.append(card);
+    });
+  }
+
+  function build() {
+    if (!document.body || root) return;
+
+    const style = document.createElement('style');
+    style.textContent = `
+      #${BUTTON_ID}{position:fixed;right:14px;bottom:max(76px,env(safe-area-inset-bottom));z-index:2147483000;border:0;border-radius:999px;padding:11px 15px;background:#5b4a8d;color:#fff;font:700 14px/1.2 -apple-system,BlinkMacSystemFont,'Noto Sans JP',sans-serif;box-shadow:0 4px 16px #0003}
+      #${ROOT_ID}{display:none;position:fixed;inset:0;z-index:2147483646;background:#f4f6f8;color:#202124;overflow:auto;-webkit-overflow-scrolling:touch;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Noto Sans JP',sans-serif}
+      #${ROOT_ID}.open{display:block}
+      #${ROOT_ID} *{box-sizing:border-box}
+      #${ROOT_ID} a{color:inherit}
+      #${ROOT_ID} .pbsw-wrap{max-width:1080px;margin:auto;padding:18px 14px 80px}
+      #${ROOT_ID} .pbsw-head,#${ROOT_ID} .pbsw-feed-head{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;background:#fff;border:1px solid #ded9e8;border-radius:12px;padding:14px;margin-bottom:12px;position:sticky;top:0;z-index:2}
+      #${ROOT_ID} h2{font-size:18px;margin:0}
+      #${ROOT_ID} button,#${ROOT_ID} input{font:inherit;border:1px solid #cfc8dc;border-radius:8px;background:#fff;color:#2d2640;padding:9px 10px}
+      #${ROOT_ID} button:disabled{opacity:.45}
+      #${ROOT_ID} .pbsw-current{flex:1 1 100%;font-size:12px;color:#6b6478}
+      #${ROOT_ID} .pbsw-quick{display:flex;gap:7px;flex:1 1 100%;flex-wrap:wrap}
+      #${ROOT_ID} .pbsw-quick input{flex:1 1 260px;min-width:0}
+      #${ROOT_ID} .pbsw-search,#${ROOT_ID} .pbsw-save-current,#${ROOT_ID} .pbsw-newest-open,#${ROOT_ID} .pbsw-feed-refresh{background:#7356a8;color:#fff;border-color:#7356a8;font-weight:700}
+      #${ROOT_ID} .pbsw-card{background:#fff;border:1px solid #ded9e8;border-radius:12px;padding:10px;margin-bottom:10px}
+      #${ROOT_ID} .pbsw-open{display:flex;width:100%;text-align:left;flex-direction:column;gap:4px;border:0;background:transparent;padding:5px;cursor:pointer}
+      #${ROOT_ID} .pbsw-open strong{font-size:15px}
+      #${ROOT_ID} .pbsw-open span{font-size:12px;color:#716b7b;overflow-wrap:anywhere}
+      #${ROOT_ID} .pbsw-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+      #${ROOT_ID} .pbsw-actions button{font-size:12px;padding:7px 9px}
+      #${ROOT_ID} .pbsw-empty{background:#fff;border:1px solid #ded9e8;border-radius:12px;padding:18px;color:#716b7b}
+      #${ROOT_ID} .pbsw-feed-status{flex:1 1 100%;font-size:12px;color:#716b7b}
+      #${ROOT_ID} .pbsw-feed-coverage{flex:1 1 100%;display:flex;gap:5px;flex-wrap:wrap}
+      #${ROOT_ID} .pbsw-feed-coverage span{font-size:10px;color:#625a70;background:#f0edf4;border-radius:999px;padding:3px 7px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      #${ROOT_ID} .pbsw-feed-errors{flex:1 1 100%;background:#fff2f2;border:1px solid #efcaca;border-radius:9px;padding:8px 10px;color:#8a3b3b}
+      #${ROOT_ID} .pbsw-feed-errors[hidden]{display:none}
+      #${ROOT_ID} .pbsw-feed-error-row{display:flex;gap:8px;align-items:flex-start;font-size:11px;line-height:1.45}
+      #${ROOT_ID} .pbsw-feed-error-row+ .pbsw-feed-error-row{margin-top:5px}
+      #${ROOT_ID} .pbsw-feed-error-row strong{flex:0 0 auto;max-width:38%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      #${ROOT_ID} .pbsw-feed-error-row span{overflow-wrap:anywhere}
+      #${ROOT_ID} .pbsw-feed-filter{flex:1 1 100%;background:#faf9fc;border:1px solid #ded9e8;border-radius:9px;padding:8px 10px}
+      #${ROOT_ID} .pbsw-feed-filter summary{cursor:pointer;font-weight:700}
+      #${ROOT_ID} .pbsw-feed-filter-row{display:flex;gap:7px;margin-top:8px}
+      #${ROOT_ID} .pbsw-feed-exclude-input{flex:1;min-width:0}
+      #${ROOT_ID} .pbsw-feed-filter-note{margin:6px 0 0;color:#7b7388;font-size:11px}
+      #${ROOT_ID} .pbsw-feed-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
+      #${ROOT_ID} .pbsw-feed-card{display:grid;grid-template-columns:128px minmax(0,1fr);background:#fff;border:1px solid #ded9e8;border-radius:12px;overflow:hidden;min-width:0}
+      #${ROOT_ID} .pbsw-feed-thumb{display:block;background:#ece8f2;min-height:128px}
+      #${ROOT_ID} .pbsw-feed-thumb img{display:block;width:100%;height:100%;min-height:128px;object-fit:cover;background:#ece8f2}
+      #${ROOT_ID} .pbsw-feed-thumb img.empty{visibility:hidden}
+      #${ROOT_ID} .pbsw-feed-info{padding:10px;min-width:0}
+      #${ROOT_ID} .pbsw-feed-kind{font-size:11px;font-weight:800;color:#7356a8;margin-bottom:4px}
+      #${ROOT_ID} .pbsw-feed-access{display:flex;flex-wrap:wrap;gap:5px;margin:3px 0 7px}
+      #${ROOT_ID} .pbsw-feed-access[hidden]{display:none}
+      #${ROOT_ID} .pbsw-feed-access span{font-size:10px;font-weight:800;line-height:1.3;padding:3px 6px;border-radius:6px;background:#e8e9ed;color:#40444c}
+      #${ROOT_ID} .pbsw-feed-access span.age{background:#f9e8e8;color:#a44249}
+      #${ROOT_ID} .pbsw-feed-access span.locked{background:#2d2930;color:#fff}
+      #${ROOT_ID} .pbsw-feed-top{display:flex;gap:7px;align-items:flex-start}
+      #${ROOT_ID} .pbsw-feed-title{font-weight:800;text-decoration:none;line-height:1.35;overflow-wrap:anywhere;flex:1}
+      #${ROOT_ID} .pbsw-feed-metric{font-size:11px;color:#755096;white-space:nowrap;font-weight:700}
+      #${ROOT_ID} .pbsw-feed-author{display:block;margin-top:5px;color:#675f74;text-decoration:none;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      #${ROOT_ID} .pbsw-feed-date{font-size:11px;color:#8c8595;margin-top:2px}
+      #${ROOT_ID} .pbsw-feed-caption{font-size:12px;line-height:1.5;color:#494251;margin:7px 0;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+      #${ROOT_ID} .pbsw-feed-tags{display:flex;gap:5px;flex-wrap:wrap;max-height:44px;overflow:hidden}
+      #${ROOT_ID} .pbsw-feed-tags a{font-size:11px;color:#7356a8;text-decoration:none;overflow-wrap:anywhere}
+      #${ROOT_ID} .pbsw-feed-matches{display:flex;gap:4px;flex-wrap:wrap;margin-top:8px}
+      #${ROOT_ID} .pbsw-feed-matches span{font-size:10px;color:#645c70;background:#f0edf4;border-radius:999px;padding:3px 6px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      #${ROOT_ID} .pbsw-feed-more{display:flex;justify-content:center;gap:8px;flex-wrap:wrap;padding:18px 0}
+      #${ROOT_ID} .pbsw-feed-more button{font-weight:700}
+      @media(max-width:650px){
+        #${BUTTON_ID}{right:12px;padding:10px 13px}
+        #${ROOT_ID} .pbsw-wrap{padding:10px 8px 70px}
+        #${ROOT_ID} h2{font-size:16px}
+        #${ROOT_ID} .pbsw-feed-grid{grid-template-columns:1fr}
+        #${ROOT_ID} .pbsw-feed-card{grid-template-columns:112px minmax(0,1fr)}
+        #${ROOT_ID} .pbsw-feed-thumb,#${ROOT_ID} .pbsw-feed-thumb img{min-height:112px}
+      }
+    `;
+    document.head.append(style);
+
+    const button=document.createElement('button');
+    button.id=BUTTON_ID;
+    button.type='button';
+    button.textContent='🔖 検索';
+    button.addEventListener('click',openPanel);
+
+    root=document.createElement('section');
+    root.id=ROOT_ID;
+    root.innerHTML=`
+      <div class="pbsw-wrap pbsw-manage-page">
+        <div class="pbsw-head">
+          <h2>🔖 pictBLand 保存検索</h2>
+          <button type="button" class="pbsw-newest-open">🆕 保存検索の新着</button>
+          <button type="button" class="pbsw-save-current">現在の検索語を保存</button>
+          <button type="button" class="pbsw-bind-current" hidden>🔗 この検索結果を紐づけ</button>
+          <button type="button" class="pbsw-close">閉じる</button>
+          <div class="pbsw-current"></div>
+          <div class="pbsw-quick">
+            <input class="pbsw-input" type="search" placeholder="検索語を入力">
+            <button type="button" class="pbsw-search">🔎 検索</button>
+            <button type="button" class="pbsw-save-input">この語を保存</button>
+          </div>
+        </div>
+        <div class="pbsw-list"></div>
+      </div>
+      <div class="pbsw-wrap pbsw-feed-page" hidden>
+        <div class="pbsw-feed-head">
+          <button type="button" class="pbsw-feed-back">← 保存検索へ</button>
+          <h2>🆕 保存検索の新着</h2>
+          <button type="button" class="pbsw-feed-refresh">更新</button>
+          <button type="button" class="pbsw-feed-diagnose">🔎 取得診断をコピー</button>
+          <div class="pbsw-feed-status"></div>
+          <div class="pbsw-feed-coverage"></div>
+          <div class="pbsw-feed-errors" hidden></div>
+          <details class="pbsw-feed-filter">
+            <summary class="pbsw-feed-exclude-summary">🚫 除外タグなし</summary>
+            <div class="pbsw-feed-filter-row">
+              <input type="text" class="pbsw-feed-exclude-input" placeholder="例：女体化, パロディ, R-18">
+              <button type="button" class="pbsw-feed-exclude-apply">適用</button>
+            </div>
+            <p class="pbsw-feed-filter-note">カンマまたは改行区切り。作品タグと完全一致した場合に除外します。</p>
+          </details>
+        </div>
+        <div class="pbsw-feed-grid"></div>
+        <div class="pbsw-feed-more">
+          <button type="button" class="pbsw-feed-show-more" hidden>次の50件を表示</button>
+          <button type="button" class="pbsw-feed-load-older" hidden>さらに過去の新着を取得</button>
+        </div>
+      </div>
+    `;
+
+    quickInput=root.querySelector('.pbsw-input');
+    root.querySelector('.pbsw-save-current').addEventListener('click',saveCurrent);
+    root.querySelector('.pbsw-bind-current').addEventListener('click',bindCurrentSearch);
+    root.querySelector('.pbsw-search').addEventListener('click',runQuickSearch);
+    root.querySelector('.pbsw-save-input').addEventListener('click',saveQuickSearch);
+    root.querySelector('.pbsw-close').addEventListener('click',closePanel);
+    root.querySelector('.pbsw-newest-open').addEventListener('click',openFeed);
+    root.querySelector('.pbsw-feed-back').addEventListener('click',closeFeed);
+    root.querySelector('.pbsw-feed-refresh').addEventListener('click',()=>void refreshFeed(true));
+    root.querySelector('.pbsw-feed-diagnose').addEventListener('click',copyCaptionDiagnostics);
+    root.querySelector('.pbsw-feed-exclude-apply').addEventListener('click',applyExcludeInput);
+    root.querySelector('.pbsw-feed-exclude-input').addEventListener('keydown',e=>{
+      if(e.key==='Enter'){e.preventDefault();applyExcludeInput();}
+    });
+    root.querySelector('.pbsw-feed-show-more').addEventListener('click',()=>void expandFeed());
+    root.querySelector('.pbsw-feed-load-older').addEventListener('click',()=>void expandFeed());
+    quickInput.addEventListener('keydown',e=>{
+      if(e.key==='Enter'){e.preventDefault();runQuickSearch();}
+    });
+
+    root.addEventListener('scroll',()=>{
+      if(!feedOpen || feedLoading) return;
+      clearTimeout(feedAutoExpandTimer);
+      feedAutoExpandTimer=setTimeout(()=>{
+        if(!feedOpen || feedLoading) return;
+        const remaining=root.scrollHeight-root.scrollTop-root.clientHeight;
+        if(remaining<700) void expandFeed();
+      },120);
+    },{passive:true});
+
+    document.body.append(button,root);
+    syncExcludeUi();
+    render();
+  }
+
+  function openPanel() {
+    build();
+    if (!root) return;
+    feedAbort?.abort();
+    feedObserver?.disconnect();
+    clearTimeout(feedAutoExpandTimer);
+    resetDetailQueue();
+    feedOpen=false;
+    root.classList.add('open');
+    showManagePage();
+    root.scrollTop=0;
+    render();
+    setTimeout(()=>quickInput?.focus(),0);
+  }
+
+  function closePanel() {
+    feedAbort?.abort();
+    feedObserver?.disconnect();
+    resetDetailQueue();
+    feedOpen=false;
+    if(root){
+      showManagePage();
+      root.classList.remove('open');
+    }
+  }
+
+  function countSaved() {
+    return readSaved().length;
+  }
+
+  window.__pictblandSavedSearchUi={
+    open:openPanel,
+    close:closePanel,
+    render,
+    count:countSaved,
+    storageKey:STORAGE_KEY,
+    openNewest:openFeed
+  };
+
+  if(document.body)build();
+  else addEventListener('DOMContentLoaded',build,{once:true});
+})();
+
+
+
+// ---- pictBLand image saver (v0.3.8) ----
+(() => {
+  'use strict';
+  if (window.__pictblandImageSaverV038) return;
+  window.__pictblandImageSaverV038 = true;
+
+  const ROOT_ID = 'pbi-root';
+  const BUTTON_ID = 'pbi-button';
+  const STYLE_ID = 'pbi-style';
+
+  let root = null;
+  let statusNode = null;
+  let listNode = null;
+  let titleInput = null;
+  let found = [];
+
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  function isItemPage() {
+    return /^\/items\/detail\/\d+/.test(location.pathname);
+  }
+
+  function itemId() {
+    return location.pathname.match(/^\/items\/detail\/(\d+)/)?.[1] || '';
+  }
+
+  function expectedCount() {
+    const text = document.body?.innerText || '';
+    const m = text.match(/画像枚数\s*[：:]\s*(\d+)\s*枚/);
+    return m ? Number(m[1]) : 0;
+  }
+
+  function isImageWork() {
+    if (!isItemPage()) return false;
+    const text = document.body?.innerText || '';
+    return /画像枚数\s*[：:]\s*\d+\s*枚/.test(text) || /アルバムを表示/.test(text);
+  }
+
+  function safeBaseName(name) {
+    const cleaned = String(name || ('pictBLand_' + itemId()))
+      .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '＿')
+      .replace(/[. ]+$/g, '')
+      .trim();
+    return (cleaned || ('pictBLand_' + itemId())).slice(0, 120);
+  }
+
+  function extractTitle() {
+    const shared = window.__pictblandNovelExtractTitle;
+    if (typeof shared === 'function') {
+      try {
+        const title = shared();
+        if (title && title.trim()) return title.trim();
+      } catch {}
+    }
+
+    // 念のため共通関数がまだ準備できていない場合だけ最低限のフォールバック。
+    const docTitle = (document.title || '')
+      .replace(/\s*[|｜-]\s*pictBLand.*$/i, '')
+      .trim();
+    return docTitle || ('pictBLand_' + itemId());
+  }
+
+  function normalizeImageUrl(raw) {
+    if (!raw) return '';
+    let value = String(raw).trim().replace(/&amp;/g, '&');
+    if (!value || value.startsWith('data:') || value.startsWith('blob:')) return '';
+    if (value.startsWith('//')) value = location.protocol + value;
+
+    try {
+      const u = new URL(value, location.href);
+      if (!/^https?:$/.test(u.protocol)) return '';
+      if (!/^img\d*\.pictbland\.net$/i.test(u.hostname)) return '';
+      if (!/^\/items\//i.test(u.pathname)) return '';
+      return u.href;
+    } catch {
+      return '';
+    }
+  }
+
+  function addSrcset(value, add) {
+    String(value || '').split(',').forEach(part => {
+      const url = part.trim().split(/\s+/)[0];
+      if (url) add(url);
+    });
+  }
+
+  function collectLinkedImageUrls() {
+    const rows = [];
+    const seen = new Set();
+
+    const add = raw => {
+      const url = normalizeImageUrl(raw);
+      if (!url) return;
+      let key = url;
+      try {
+        const u = new URL(url);
+        key = u.origin + u.pathname;
+      } catch {}
+      if (seen.has(key)) return;
+      seen.add(key);
+      rows.push(url);
+    };
+
+    document.querySelectorAll('a[href]').forEach(a => add(a.href));
+
+    const id = itemId();
+    if (id) {
+      const strict = rows.filter(url => {
+        try {
+          const p = new URL(url).pathname;
+          return new RegExp('(?:/|_)' + id + '(?:[_.\\/-]|$)').test(p);
+        } catch {
+          return false;
+        }
+      });
+      if (strict.length) return strict;
+    }
+
+    return rows;
+  }
+
+  function collectImageUrls() {
+    const rows = [];
+    const seen = new Set();
+
+    const add = raw => {
+      const url = normalizeImageUrl(raw);
+      if (!url) return;
+      let key = url;
+      try {
+        const u = new URL(url);
+        key = u.origin + u.pathname;
+      } catch {}
+      if (seen.has(key)) return;
+      seen.add(key);
+      rows.push(url);
+    };
+
+    document.querySelectorAll('img').forEach(img => {
+      add(img.currentSrc);
+      add(img.src);
+      ['data-src','data-original','data-lazy-src','data-url','data-image'].forEach(attr => add(img.getAttribute(attr)));
+      addSrcset(img.getAttribute('srcset'), add);
+    });
+
+    document.querySelectorAll('source').forEach(source => {
+      addSrcset(source.getAttribute('srcset'), add);
+      add(source.getAttribute('src'));
+    });
+
+    document.querySelectorAll('a[href]').forEach(a => add(a.href));
+
+    document.querySelectorAll('[style*="background"]').forEach(el => {
+      const style = el.getAttribute('style') || '';
+      const re = /url\((['"]?)(.*?)\1\)/g;
+      let m;
+      while ((m = re.exec(style))) add(m[2]);
+    });
+
+    try {
+      performance.getEntriesByType('resource').forEach(entry => add(entry.name));
+    } catch {}
+
+    const html = document.documentElement?.innerHTML || '';
+    const re = /(?:https?:)?\/\/img\d*\.pictbland\.net\/items\/[^"'()<>\s\\]+/gi;
+    let m;
+    while ((m = re.exec(html))) add(m[0]);
+
+    const id = itemId();
+    if (id) {
+      const strict = rows.filter(url => {
+        try {
+          const p = new URL(url).pathname;
+          return new RegExp('(?:/|_)' + id + '(?:[_.\\/-]|$)').test(p);
+        } catch {
+          return false;
+        }
+      });
+      if (strict.length) return strict;
+    }
+
+    return rows;
+  }
+
+  function imageDimensions(url) {
+    return new Promise(resolve => {
+      const img = new Image();
+      let done = false;
+      const finish = value => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        img.onload = null;
+        img.onerror = null;
+        resolve(value);
+      };
+      const timer = setTimeout(() => finish({width:0,height:0,area:0}), 8000);
+      img.onload = () => {
+        const width = img.naturalWidth || 0;
+        const height = img.naturalHeight || 0;
+        finish({width,height,area:width * height});
+      };
+      img.onerror = () => finish({width:0,height:0,area:0});
+      img.referrerPolicy = 'strict-origin-when-cross-origin';
+      img.src = url;
+    });
+  }
+
+  async function preferOriginalSet(urls, expected) {
+    if (!expected || urls.length <= expected || urls.length % expected !== 0) {
+      return {urls, filtered:false, rawCount:urls.length};
+    }
+
+    const setCount = urls.length / expected;
+    if (setCount < 2 || setCount > 6) {
+      return {urls, filtered:false, rawCount:urls.length};
+    }
+
+    const sets = [];
+    for (let s = 0; s < setCount; s++) {
+      const part = urls.slice(s * expected, (s + 1) * expected);
+      const dims = await Promise.all(part.map(imageDimensions));
+      const usable = dims.filter(d => d.area > 0);
+      const areas = usable.map(d => d.area).sort((a,b) => a-b);
+      const medianArea = areas.length ? areas[Math.floor(areas.length / 2)] : 0;
+      const totalArea = usable.reduce((sum,d) => sum + d.area, 0);
+      const known = usable.length;
+      sets.push({part, medianArea, totalArea, known, index:s});
+    }
+
+    sets.sort((a,b) =>
+      b.medianArea - a.medianArea ||
+      b.totalArea - a.totalArea ||
+      b.known - a.known ||
+      b.index - a.index
+    );
+
+    const best = sets[0];
+    if (!best || best.known < Math.max(1, Math.ceil(expected * 0.5))) {
+      return {urls, filtered:false, rawCount:urls.length};
+    }
+
+    return {
+      urls: best.part,
+      filtered: true,
+      rawCount: urls.length,
+      chosenSet: best.index + 1,
+      setCount
+    };
+  }
+
+  async function revealAlbum() {
+    const nodes = [...document.querySelectorAll('button,a,input,[role="button"]')];
+    const target = nodes.find(el => {
+      const text = ((el.textContent || '') + ' ' + (el.getAttribute?.('value') || '') + ' ' + (el.getAttribute?.('aria-label') || '')).trim();
+      return /クリックしてアルバムを表示|アルバムを表示/.test(text);
+    });
+
+    if (target) {
+      try { target.click(); } catch {}
+      await sleep(700);
+    }
+
+    const oldY = window.scrollY;
+    const maxY = Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0);
+    if (maxY > innerHeight * 2) {
+      for (const ratio of [0.25, 0.5, 0.75, 1]) {
+        window.scrollTo(0, Math.floor(maxY * ratio));
+        await sleep(120);
+      }
+      window.scrollTo(0, oldY);
+      await sleep(120);
+    }
+  }
+
+  function extFromUrl(url) {
+    try {
+      const ext = new URL(url).pathname.match(/\.([a-z0-9]{2,5})$/i)?.[1]?.toLowerCase();
+      if (ext && ['jpg','jpeg','png','gif','webp','avif'].includes(ext)) return ext === 'jpeg' ? 'jpg' : ext;
+    } catch {}
+    return 'jpg';
+  }
+
+  function buildFileName(index, total) {
+    const base = safeBaseName(titleInput?.value || extractTitle());
+    const width = Math.max(2, String(total).length);
+    const no = String(index + 1).padStart(width, '0');
+    return base + '_' + no + '.png';
+  }
+
+  function buildZipName(label='') {
+    const base = safeBaseName(titleInput?.value || extractTitle());
+    return base + (label ? '_' + label : '') + '.zip';
+  }
+
+  // Use privileged userscript networking for image hosts: regular fetch is
+  // blocked by CORS on many pictBLand album images.
+  // Tampermonkey/Violentmonkey: GM.xmlHttpRequest and/or GM_xmlhttpRequest.
+  // Older Macaque builds may expose GM.xmlhttpRequest (lowercase r).
+  function gmXhrBlob(url) {
+    const gm = globalThis.GM;
+    const modern = typeof gm?.xmlHttpRequest === 'function'
+      ? gm.xmlHttpRequest.bind(gm)
+      : typeof gm?.xmlhttpRequest === 'function'
+        ? gm.xmlhttpRequest.bind(gm)
+        : null;
+    const legacy = typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : null;
+    const request = modern || legacy;
+    if (!request) return Promise.reject(new Error(
+      'ユーザースクリプトの画像取得権限が利用できません（GM.xmlHttpRequest / GM_xmlhttpRequest）'
+    ));
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const done = (ok, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (ok) resolve(value);
+        else reject(value instanceof Error ? value : new Error(String(value || '画像取得失敗')));
+      };
+      const timer = setTimeout(
+        () => done(false, new Error('画像取得が45秒でタイムアウトしました')), 45000
+      );
+      const acceptResponse = res => {
+        if (settled) return;
+        const status = Number(res?.status || 0);
+        if (status < 200 || status >= 300) {
+          done(false, new Error('画像サーバーの応答：HTTP ' + (status || '不明')));
+          return;
+        }
+        const data = res?.response;
+        const blob = data instanceof Blob ? data
+          : data instanceof ArrayBuffer ? new Blob([data])
+          : ArrayBuffer.isView(data) ? new Blob([data])
+          : null;
+        if (blob?.size) done(true, blob);
+        else done(false, new Error('通信は成功しましたが画像データが空でした'));
+      };
+      try {
+        const result = request({
+          method: 'GET',
+          url,
+          responseType: 'blob',
+          timeout: 45000,
+          anonymous: false,
+          // pictBLand sometimes checks the detail page as referer.
+          headers: {Referer: location.href},
+          onload: acceptResponse,
+          onerror: err => done(false, new Error(String(
+            err?.error || err?.message || '拡張機能から画像サーバーに接続できません'
+          ))),
+          ontimeout: () => done(false, new Error('画像サーバーの応答がタイムアウトしました'))
+        });
+        if (result && typeof result.then === 'function') {
+          result.then(acceptResponse).catch(err => done(false, err));
+        }
+      } catch (error) {
+        done(false, error);
+      }
+    });
+  }
+
+  async function getBlob(url) {
+    let gmError = null;
+    try {
+      return await gmXhrBlob(url);
+    } catch (error) {
+      gmError = error;
+    }
+
+    // Keep a same-origin/CORS fallback for managers that cannot expose GM APIs.
+    // Do not replace the real GM error with an unhelpful "Failed to fetch".
+    try {
+      const res = await fetch(url, {
+        credentials: 'include',
+        referrer: location.href,
+        cache: 'no-store'
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const blob = await res.blob();
+      if (!(blob instanceof Blob) || !blob.size)
+        throw new Error('画像データが空でした');
+      return blob;
+    } catch (fetchError) {
+      const gmReason = String(gmError?.message || gmError || '不明');
+      const nativeReason = String(fetchError?.message || fetchError || '不明');
+      let host = '画像サーバー';
+      try { host = new URL(url).hostname; } catch {}
+      throw new Error(host + '：拡張機能経由 ' + gmReason +
+        ' ／ 通常取得 ' + nativeReason);
+    }
+  }
+
+  async function blobToPng(blob) {
+    if (!(blob instanceof Blob) || !blob.size) {
+      throw new Error('画像データが空です');
+    }
+    if (blob.type === 'image/png') return blob;
+
+    const objectUrl = URL.createObjectURL(blob);
+    try {
+      const img = await new Promise((resolve, reject) => {
+        const node = new Image();
+        node.onload = () => resolve(node);
+        node.onerror = () => reject(new Error('画像のデコードに失敗しました'));
+        node.src = objectUrl;
+      });
+
+      const width = img.naturalWidth || img.width;
+      const height = img.naturalHeight || img.height;
+      if (!width || !height) throw new Error('画像サイズを取得できませんでした');
+
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+
+      const ctx = canvas.getContext('2d', {alpha:true});
+      if (!ctx) throw new Error('PNG変換用Canvasを作成できませんでした');
+
+      ctx.drawImage(img, 0, 0, width, height);
+
+      const png = await new Promise((resolve, reject) => {
+        canvas.toBlob(
+          result => result ? resolve(result) : reject(new Error('PNG変換に失敗しました')),
+          'image/png'
+        );
+      });
+
+      return png;
+    } finally {
+      URL.revokeObjectURL(objectUrl);
+    }
+  }
+
+  async function getPngBlob(url) {
+    const original = await getBlob(url);
+    return await blobToPng(original);
+  }
+
+  function saveBlob(blob, name) {
+    return new Promise((resolve, reject) => {
+      try {
+        const objectUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = objectUrl;
+        a.download = name;
+        a.rel = 'noopener';
+        a.style.display = 'none';
+        document.body.append(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 30000);
+        setTimeout(resolve, 120);
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  async function saveOne(row, index, total) {
+    const name = buildFileName(index, total);
+
+    try {
+      const png = await getPngBlob(row.url);
+      await saveBlob(png, name);
+      return {ok:true};
+    } catch (err) {
+      return {ok:false, error:err};
+    }
+  }
+
+
+  // ZIP STORE format: PNG bytes are already compressed, so no external
+  // library is required. Avoid synchronous zipSync and large regex recursion.
+  // UTF-8 file names are flagged explicitly (ZIP general purpose bit 11).
+  const zipCrcTable = (() => {
+    const table = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let j = 0; j < 8; j++) c = c & 1 ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      table[n] = c >>> 0;
+    }
+    return table;
+  })();
+
+  function zipCrc32(bytes) {
+    let crc = 0xffffffff;
+    for (let i = 0; i < bytes.length; i++) {
+      crc = zipCrcTable[(crc ^ bytes[i]) & 255] ^ (crc >>> 8);
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+
+  function makeStoreZipBlob(files) {
+    if (!files.length) throw new Error('ZIPに入れる画像がありません');
+    if (files.length > 65535) throw new Error('ZIPのファイル数上限を超えました');
+    const encoder = new TextEncoder();
+    const parts = [], central = [];
+    let offset = 0;
+    for (const {name, bytes} of files) {
+      const filename = encoder.encode(name);
+      const size = bytes.byteLength;
+      if (!filename.length || filename.length > 65535 || size > 0xffffffff ||
+          offset + 30 + filename.length + size > 0xffffffff) {
+        throw new Error('ZIPのサイズ上限（4GB）を超えました');
+      }
+      const crc = zipCrc32(bytes);
+      const local = new Uint8Array(30);
+      const lv = new DataView(local.buffer);
+      lv.setUint32(0, 0x04034b50, true); // local file header signature
+      lv.setUint16(4, 20, true);         // version to extract
+      lv.setUint16(6, 0x0800, true);     // UTF-8 file names
+      lv.setUint16(8, 0, true);          // STORED, no compression
+      lv.setUint32(14, crc, true);
+      lv.setUint32(18, size, true);
+      lv.setUint32(22, size, true);
+      lv.setUint16(26, filename.length, true);
+      parts.push(local, filename, bytes);
+
+      const directory = new Uint8Array(46);
+      const dv = new DataView(directory.buffer);
+      dv.setUint32(0, 0x02014b50, true); // central directory
+      dv.setUint16(4, 20, true);
+      dv.setUint16(6, 20, true);
+      dv.setUint16(8, 0x0800, true);
+      dv.setUint16(10, 0, true);
+      dv.setUint32(16, crc, true);
+      dv.setUint32(20, size, true);
+      dv.setUint32(24, size, true);
+      dv.setUint16(28, filename.length, true);
+      dv.setUint32(42, offset, true);
+      central.push(directory, filename);
+      offset += local.byteLength + filename.byteLength + size;
+    }
+    const directoryOffset = offset;
+    for (const chunk of central) {
+      offset += chunk.byteLength;
+      if (offset > 0xffffffff) throw new Error('ZIPのサイズ上限（4GB）を超えました');
+      parts.push(chunk);
+    }
+    const ending = new Uint8Array(22);
+    const v = new DataView(ending.buffer);
+    v.setUint32(0, 0x06054b50, true);  // end of central directory
+    v.setUint16(8, files.length, true);
+    v.setUint16(10, files.length, true);
+    v.setUint32(12, offset - directoryOffset, true);
+    v.setUint32(16, directoryOffset, true);
+    parts.push(ending);
+    return new Blob(parts, {type:'application/zip'});
+  }
+
+  let preparedZipUrl = '';
+  let zipBusy = false;
+  function clearPreparedZipLink() {
+    root?.querySelector('.pbi-zip-ready-link')?.remove();
+    if (preparedZipUrl) {
+      URL.revokeObjectURL(preparedZipUrl);
+      preparedZipUrl = '';
+    }
+  }
+
+  function offerZipDownload(blob, name) {
+    clearPreparedZipLink();
+    preparedZipUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.className = 'pbi-zip-ready-link';
+    link.href = preparedZipUrl;
+    link.download = name;
+    link.textContent = '⬇️ ZIPを保存（ダウンロードが始まらない場合はこちらをクリック）';
+    link.style.cssText = 'display:block;margin:8px auto 6px;max-width:980px;' +
+      'padding:10px 12px;background:#ebf7ee;border:1px solid #8ac89a;border-radius:9px;' +
+      'font-weight:700;color:#176e36;text-decoration:underline;cursor:pointer;';
+    statusNode.insertAdjacentElement('afterend', link);
+    // Browsers can reject programmatic downloads after asynchronous image
+    // conversion. Keep the real, user-clickable link until the next ZIP build.
+    try { link.click(); } catch (error) {
+      console.warn('[pictBLand][ZIP automatic download]', String(error));
+    }
+  }
+
+  async function saveRowsAsZip(entries, zipName) {
+    clearPreparedZipLink();
+    if (!entries.length) {
+      statusNode.textContent = 'ZIPに入れる画像がありません。選択や保存範囲を確認してください。';
+      return;
+    }
+
+    const files = [];
+    let failed = 0;
+    let firstError = '';
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      statusNode.textContent = 'ZIP準備中… ' + (i + 1) + ' / ' + entries.length + '（画像をPNG変換）';
+      try {
+        const png = await getPngBlob(entry.row.url);
+        const bytes = new Uint8Array(await png.arrayBuffer());
+        files.push({name:buildFileName(entry.index, found.length), bytes});
+      } catch (error) {
+        failed++;
+        if (!firstError) firstError = String(error?.message || error || '取得失敗');
+      }
+      await sleep(0);
+    }
+
+    if (!files.length) {
+      statusNode.textContent = 'ZIP作成失敗：画像を取得できませんでした。' +
+        (firstError ? ' 理由：' + firstError : '');
+      return;
+    }
+    statusNode.textContent = 'ZIP生成中… ' + files.length + '枚';
+    const zip = makeStoreZipBlob(files);
+    offerZipDownload(zip, zipName);
+    statusNode.textContent = 'ZIP準備完了：' + files.length + '枚（' +
+      (zip.size / 1024 / 1024).toFixed(1) + 'MB）' +
+      (failed ? '／取得失敗 ' + failed + '枚（' + firstError + '）' : '') +
+      '。ダウンロードが始まらない場合は下のリンクをクリックしてください。';
+  }
+
+  async function runZipSave(button, entries, name) {
+    if (zipBusy) {
+      statusNode.textContent = '別のZIPを作成中です。完了までお待ちください。';
+      return;
+    }
+    zipBusy = true;
+    const buttons = [...root.querySelectorAll('.pbi-zip-selected, .pbi-zip-range')];
+    const original = button?.textContent;
+    for (const el of buttons) el.disabled = true;
+    if (button) button.textContent = '📦 ZIP作成中…';
+    try {
+      await saveRowsAsZip(entries, name);
+    } catch (error) {
+      statusNode.textContent = 'ZIP作成エラー：' + String(error?.message || error || '不明なエラー');
+      console.error('[pictBLand][ZIP]', error);
+    } finally {
+      zipBusy = false;
+      for (const el of buttons) el.disabled = false;
+      if (button && original) button.textContent = original;
+    }
+  }
+
+  async function saveSelectedZip() {
+    const entries = selectedRows().map(x => ({row:x.row,index:x.index}));
+    const button = root?.querySelector('.pbi-zip-selected');
+    await runZipSave(button, entries, buildZipName('選択'));
+  }
+
+  async function saveRangeZip() {
+    if (!found.length) {
+      statusNode.textContent = '保存できる画像がありません。';
+      return;
+    }
+    const {start, end} = readRange();
+    const entries = found.slice(start - 1, end).map((row, offset) => ({
+      row, index: start - 1 + offset
+    }));
+    const button = root?.querySelector('.pbi-zip-range');
+    await runZipSave(button, entries, buildZipName(start + '-' + end));
+  }
+
+  function selectedRows() {
+    return [...listNode.querySelectorAll('.pbi-card')].map((card, index) => ({
+      index,
+      checked: !!card.querySelector('.pbi-check')?.checked,
+      row: found[index]
+    })).filter(x => x.checked && x.row);
+  }
+
+  function readRange() {
+    const startInput = root?.querySelector('.pbi-range-start');
+    const endInput = root?.querySelector('.pbi-range-end');
+    const total = found.length;
+
+    let start = Number(startInput?.value || 1);
+    let end = Number(endInput?.value || total || 1);
+
+    if (!Number.isFinite(start)) start = 1;
+    if (!Number.isFinite(end)) end = total || 1;
+
+    start = Math.max(1, Math.min(total || 1, Math.floor(start)));
+    end = Math.max(1, Math.min(total || 1, Math.floor(end)));
+
+    if (start > end) [start, end] = [end, start];
+
+    if (startInput) startInput.value = String(start);
+    if (endInput) endInput.value = String(end);
+
+    return {start, end};
+  }
+
+  async function saveRange() {
+    if (!found.length) {
+      statusNode.textContent = '保存できる画像がありません。';
+      return;
+    }
+
+    const {start, end} = readRange();
+    const rows = found.slice(start - 1, end).map((row, offset) => ({
+      row,
+      index: start - 1 + offset
+    }));
+
+    const btn = root.querySelector('.pbi-save-range');
+    if (btn) btn.disabled = true;
+
+    let ok = 0;
+    let failed = 0;
+
+    for (let i = 0; i < rows.length; i++) {
+      const entry = rows[i];
+      statusNode.textContent =
+        start + '〜' + end + '枚目を保存中… ' + (i + 1) + ' / ' + rows.length;
+      const result = await saveOne(entry.row, entry.index, found.length);
+      if (result.ok) ok++;
+      else failed++;
+      await sleep(180);
+    }
+
+    if (btn) btn.disabled = false;
+    statusNode.textContent = failed
+      ? start + '〜' + end + '枚目：' + ok + '枚保存／失敗 ' + failed + '枚'
+      : start + '〜' + end + '枚目を保存しました（' + ok + '枚）。';
+  }
+
+  async function saveSelected() {
+    const selected = selectedRows();
+    if (!selected.length) {
+      statusNode.textContent = '保存する画像を選択してください。';
+      return;
+    }
+
+    const saveBtn = root.querySelector('.pbi-save-selected');
+    if (saveBtn) saveBtn.disabled = true;
+
+    let ok = 0;
+    let failed = 0;
+
+    for (let i = 0; i < selected.length; i++) {
+      const entry = selected[i];
+      statusNode.textContent = '保存中… ' + (i + 1) + ' / ' + selected.length;
+      const result = await saveOne(entry.row, entry.index, found.length);
+      if (result.ok) ok++;
+      else failed++;
+      await sleep(180);
+    }
+
+    if (saveBtn) saveBtn.disabled = false;
+    statusNode.textContent = failed
+      ? '保存完了：' + ok + '枚／失敗 ' + failed + '枚。失敗した画像は各カードの「画像を開く」から確認できます。'
+      : '保存完了：' + ok + '枚';
+  }
+
+  function render() {
+    listNode.replaceChildren();
+
+    if (!found.length) {
+      const empty = document.createElement('div');
+      empty.className = 'pbi-empty';
+      empty.textContent = '作品画像をまだ検出できていません。';
+      listNode.append(empty);
+      return;
+    }
+
+    found.forEach((row, index) => {
+      const card = document.createElement('article');
+      card.className = 'pbi-card';
+
+      const preview = document.createElement('img');
+      preview.className = 'pbi-preview';
+      preview.src = row.url;
+      preview.alt = '画像 ' + (index + 1);
+      preview.loading = 'lazy';
+      preview.referrerPolicy = 'strict-origin-when-cross-origin';
+
+      const info = document.createElement('div');
+      info.className = 'pbi-info';
+
+      const label = document.createElement('label');
+      const check = document.createElement('input');
+      check.type = 'checkbox';
+      check.checked = true;
+      check.className = 'pbi-check';
+      const strong = document.createElement('strong');
+      strong.textContent = '画像 ' + (index + 1);
+      label.append(check, strong);
+
+      const file = document.createElement('div');
+      file.className = 'pbi-file';
+      file.textContent = buildFileName(index, found.length);
+
+      const actions = document.createElement('div');
+      actions.className = 'pbi-actions';
+
+      const save = document.createElement('button');
+      save.type = 'button';
+      save.textContent = '⬇️ この1枚を保存';
+      save.addEventListener('click', async () => {
+        save.disabled = true;
+        statusNode.textContent = '画像 ' + (index + 1) + ' を保存中…';
+        const result = await saveOne(row, index, found.length);
+        save.disabled = false;
+        statusNode.textContent = result.ok
+          ? '画像 ' + (index + 1) + ' を保存しました。'
+          : '保存失敗：' + (result.error?.message || result.error || '不明なエラー');
+      });
+
+      const open = document.createElement('a');
+      open.href = row.url;
+      open.target = '_blank';
+      open.rel = 'noopener noreferrer';
+      open.textContent = '画像を開く';
+
+      actions.append(save, open);
+      info.append(label, file, actions);
+      card.append(preview, info);
+      listNode.append(card);
+    });
+  }
+
+  async function detect() {
+    statusNode.textContent = 'アルバムを確認して画像を検出中…';
+    await revealAlbum();
+
+    const detectedTitle = extractTitle();
+    if (titleInput && detectedTitle) {
+      titleInput.value = detectedTitle;
+    }
+
+    const expected = expectedCount();
+    const linkedUrls = collectLinkedImageUrls();
+    const rawUrls = collectImageUrls();
+
+    let picked;
+    let sourceNote = '';
+
+    if (expected && rawUrls.length === expected * 2) {
+      // 実ページ上で「前半=表示用、後半=同内容の原寸側」と並ぶケース。
+      // 作品枚数のちょうど2倍なら後半だけを採用する。
+      picked = {
+        urls: rawUrls.slice(expected),
+        filtered: true,
+        rawCount: rawUrls.length,
+        forcedSecondHalf: true
+      };
+      sourceNote = '（後半の原寸候補を採用）';
+    } else if (expected && linkedUrls.length === expected) {
+      picked = {
+        urls: linkedUrls,
+        filtered: true,
+        rawCount: rawUrls.length,
+        originalLinks: true
+      };
+      sourceNote = '（原寸リンクを採用）';
+    } else {
+      if (expected && rawUrls.length > expected && rawUrls.length % expected === 0) {
+        statusNode.textContent = '表示用画像と原寸画像を判定中… ' + rawUrls.length + '件';
+      }
+      picked = await preferOriginalSet(rawUrls, expected);
+    }
+
+    found = picked.urls.map(url => ({url}));
+    render();
+
+    const rangeStart = root?.querySelector('.pbi-range-start');
+    const rangeEnd = root?.querySelector('.pbi-range-end');
+    if (rangeStart) {
+      rangeStart.max = String(Math.max(1, found.length));
+      if (!rangeStart.value || Number(rangeStart.value) > found.length) rangeStart.value = '1';
+    }
+    if (rangeEnd) {
+      rangeEnd.max = String(Math.max(1, found.length));
+      rangeEnd.value = String(Math.max(1, found.length));
+    }
+
+    if (!found.length) {
+      statusNode.textContent = '作品画像を検出できませんでした。作品ページを一度表示し直してから「再検出」を押してください。';
+    } else if (picked.forcedSecondHalf || picked.originalLinks) {
+      statusNode.textContent =
+        '検出：' + found.length + ' / ' + expected + '枚 ' + sourceNote;
+    } else if (picked.filtered) {
+      statusNode.textContent =
+        '検出：' + found.length + ' / ' + expected + '枚' +
+        '（候補 ' + picked.rawCount + '件から高解像度側を採用）';
+    } else if (expected && found.length < expected) {
+      statusNode.textContent = '検出：' + found.length + ' / ' + expected + '枚。まだ読み込まれていない画像がある可能性があります。';
+    } else {
+      statusNode.textContent = '検出：' + found.length + (expected ? ' / ' + expected : '') + '枚';
+    }
+  }
+
+  function injectCss() {
+    if (document.getElementById(STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = STYLE_ID;
+    style.textContent = [
+      '#' + BUTTON_ID + '{position:fixed;right:14px;bottom:max(76px,env(safe-area-inset-bottom));z-index:2147483000;border:0;border-radius:999px;padding:11px 15px;background:#7356a8;color:#fff;font:700 14px/1.2 -apple-system,BlinkMacSystemFont,"Noto Sans JP",sans-serif;box-shadow:0 4px 16px #0003}',
+      '#' + ROOT_ID + '{display:none;position:fixed;inset:0;z-index:2147483646;background:#f4f6f8;color:#202124;overflow:auto;-webkit-overflow-scrolling:touch;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Noto Sans JP",sans-serif}',
+      '#' + ROOT_ID + '.open{display:block}',
+      '#' + ROOT_ID + ' *{box-sizing:border-box}',
+      '#' + ROOT_ID + ' .pbi-head{position:sticky;top:0;z-index:3;background:#fff;border-bottom:1px solid #dfe3e8;padding:10px 12px;box-shadow:0 2px 8px #0000000d}',
+      '#' + ROOT_ID + ' .pbi-bar{max-width:980px;margin:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}',
+      '#' + ROOT_ID + ' .pbi-bar strong{font-size:16px;margin-right:auto}',
+      '#' + ROOT_ID + ' button,#' + ROOT_ID + ' input{font:inherit}',
+      '#' + ROOT_ID + ' button{border:1px solid #ccd2d9;background:#fff;color:#202124;border-radius:8px;padding:8px 10px;font-weight:600}',
+      '#' + ROOT_ID + ' .pbi-primary{background:#7356a8;color:#fff;border-color:#7356a8}',
+      '#' + ROOT_ID + ' .pbi-meta{max-width:980px;margin:8px auto 0;display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:12px;color:#59636e}',
+      '#' + ROOT_ID + ' .pbi-meta input[type=text]{min-width:220px;max-width:100%;border:1px solid #ccd2d9;border-radius:7px;padding:6px}',
+      '#' + ROOT_ID + ' .pbi-range{max-width:980px;margin:8px auto 0;display:flex;gap:7px;align-items:center;flex-wrap:wrap;font-size:12px;color:#59636e}',
+      '#' + ROOT_ID + ' .pbi-range input[type=number]{width:72px;border:1px solid #ccd2d9;border-radius:7px;padding:6px;background:#fff;color:#202124}',
+      '#' + ROOT_ID + ' .pbi-status{max-width:980px;margin:7px auto 0;font-size:12px;color:#59636e;overflow-wrap:anywhere}',
+      '#' + ROOT_ID + ' .pbi-list{max-width:980px;margin:0 auto;padding:12px 10px 80px;display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px}',
+      '#' + ROOT_ID + ' .pbi-card{background:#fff;border:1px solid #dfe3e8;border-radius:10px;padding:9px;min-width:0}',
+      '#' + ROOT_ID + ' .pbi-preview{display:block;width:100%;height:260px;object-fit:contain;background:#eef0f3;border-radius:7px}',
+      '#' + ROOT_ID + ' .pbi-info{padding-top:8px}',
+      '#' + ROOT_ID + ' .pbi-info label{display:flex;gap:7px;align-items:center}',
+      '#' + ROOT_ID + ' .pbi-file{font-size:11px;color:#747d87;overflow-wrap:anywhere;margin:5px 0 7px}',
+      '#' + ROOT_ID + ' .pbi-actions{display:flex;gap:7px;align-items:center;flex-wrap:wrap}',
+      '#' + ROOT_ID + ' .pbi-actions a{font-size:12px;color:#5b4690;text-decoration:underline}',
+      '#' + ROOT_ID + ' .pbi-empty{grid-column:1/-1;background:#fff;border:1px solid #dfe3e8;border-radius:10px;padding:18px;color:#6a727b}',
+      '@media(max-width:600px){#' + ROOT_ID + ' .pbi-head{padding:8px}#' + ROOT_ID + ' .pbi-bar strong{width:100%;font-size:15px}#' + ROOT_ID + ' .pbi-bar button{font-size:12px;padding:7px 8px}#' + ROOT_ID + ' .pbi-list{grid-template-columns:1fr;padding:10px 7px 70px}#' + ROOT_ID + ' .pbi-preview{height:auto;max-height:70vh}}'
+    ].join('');
+    document.head.append(style);
+  }
+
+  function build() {
+    if (!document.body || root) return;
+    injectCss();
+
+    const button = document.createElement('button');
+    button.id = BUTTON_ID;
+    button.type = 'button';
+    button.textContent = '🖼️ 画像保存';
+    button.addEventListener('click', openPanel);
+
+    root = document.createElement('section');
+    root.id = ROOT_ID;
+    root.innerHTML =
+      '<div class="pbi-head">' +
+        '<div class="pbi-bar">' +
+          '<strong>🖼️ pictBLand 画像保存</strong>' +
+          '<button type="button" class="pbi-detect">🔄 再検出</button>' +
+          '<button type="button" class="pbi-select-all">全部選択</button>' +
+          '<button type="button" class="pbi-clear-all">全部解除</button>' +
+          '<button type="button" class="pbi-save-selected">⬇️ 選択をPNG保存</button>' +
+          '<button type="button" class="pbi-zip-selected pbi-primary">📦 選択をZIP</button>' +
+          '<button type="button" class="pbi-close">閉じる</button>' +
+        '</div>' +
+        '<div class="pbi-meta"><label>ファイル名：<input type="text" class="pbi-title" placeholder="作品タイトル"></label><span>保存形式はPNG。01・02…の連番で保存します。</span></div>' +
+        '<div class="pbi-range"><strong>保存範囲：</strong><input type="number" class="pbi-range-start" min="1" value="1"><span>〜</span><input type="number" class="pbi-range-end" min="1" value="1"><span>枚目</span><button type="button" class="pbi-save-range">⬇️ PNG保存</button><button type="button" class="pbi-zip-range pbi-primary">📦 この範囲をZIP</button></div>' +
+        '<div class="pbi-status">まだ検出していません。</div>' +
+      '</div>' +
+      '<main class="pbi-list"></main>';
+
+    statusNode = root.querySelector('.pbi-status');
+    listNode = root.querySelector('.pbi-list');
+    titleInput = root.querySelector('.pbi-title');
+
+    root.querySelector('.pbi-detect').addEventListener('click', detect);
+    root.querySelector('.pbi-save-selected').addEventListener('click', saveSelected);
+    root.querySelector('.pbi-zip-selected').addEventListener('click', saveSelectedZip);
+    root.querySelector('.pbi-save-range').addEventListener('click', saveRange);
+    root.querySelector('.pbi-zip-range').addEventListener('click', saveRangeZip);
+    root.querySelector('.pbi-select-all').addEventListener('click', () => {
+      listNode.querySelectorAll('.pbi-check').forEach(x => x.checked = true);
+    });
+    root.querySelector('.pbi-clear-all').addEventListener('click', () => {
+      listNode.querySelectorAll('.pbi-check').forEach(x => x.checked = false);
+    });
+    root.querySelector('.pbi-close').addEventListener('click', closePanel);
+
+    document.body.append(button, root);
+  }
+
+  async function openPanel() {
+    build();
+    if (!root) return;
+    root.classList.add('open');
+    if (titleInput) titleInput.value = extractTitle();
+    if (!found.length) await detect();
+  }
+
+  function closePanel() {
+    root?.classList.remove('open');
+  }
+
+  window.__pictblandImageSaveUi = {
+    open: openPanel,
+    close: closePanel,
+    detect,
+    isImageWork,
+    count: () => found.length
+  };
+
+  if (isItemPage()) {
+    if (document.body) build();
+    else addEventListener('DOMContentLoaded', build, {once:true});
+  }
+})();
+
+
+// ---- Unified pictBLand tools shell (v0.3.0) ----
+(() => {
+  'use strict';
+  if (window.__pictblandUnifiedToolsV030) return;
+  window.__pictblandUnifiedToolsV030 = true;
+
+  const BAR_ID='pictbland-tools-unified-bar';
+  const LAUNCH_ID='pictbland-tools-unified-launch';
+  const PLACEHOLDER_ID='pictbland-tools-unified-placeholder';
+  const OFFSET=76;
+  let active='';
+
+  function isNovelPage() {
+    return /^\/items\/detail\//.test(location.pathname);
+  }
+
+  function novelUi() {
+    return {
+      button:document.getElementById('pbnt-button'),
+      overlay:document.getElementById('pbnt-root')
+    };
+  }
+
+  function searchUi() {
+    return window.__pictblandSavedSearchUi || null;
+  }
+
+  function imageUi() {
+    return window.__pictblandImageSaveUi || null;
+  }
+
+  function hideNovel() {
+    novelUi().overlay?.classList.remove('pbnt-open');
+  }
+
+  function hideSearch() {
+    searchUi()?.close?.();
+  }
+
+  function hideImage() {
+    imageUi()?.close?.();
+  }
+
+  function hidePlaceholder() {
+    document.getElementById(PLACEHOLDER_ID)?.classList.remove('open');
+  }
+
+  function showPlaceholder(message) {
+    const p=document.getElementById(PLACEHOLDER_ID);
+    if(!p)return;
+    p.textContent=message;
+    p.classList.add('open');
+  }
+
+  function paintTabs() {
+    const bar=document.getElementById(BAR_ID);
+    if(!bar)return;
+    for(const b of bar.querySelectorAll('[data-tool-tab]')) b.classList.toggle('active',b.dataset.toolTab===active);
+  }
+
+  function openNovel() {
+    active='novel';
+    paintTabs();
+    hidePlaceholder();
+    hideSearch();
+    hideImage();
+    if(!isNovelPage()){
+      hideNovel();
+      showPlaceholder('📖 小説TXTはpictBLandの小説作品ページで利用できます。');
+      return;
+    }
+    const n=novelUi();
+    if(!n.button||!n.overlay){
+      showPlaceholder('小説TXT機能を準備中です。少し待ってからもう一度お試しください。');
+      return;
+    }
+    if(n.overlay.querySelector('.pbnt-page')) n.overlay.classList.add('pbnt-open');
+    else n.button.click();
+  }
+
+  function openSearch() {
+    active='search';
+    paintTabs();
+    hidePlaceholder();
+    hideNovel();
+    hideImage();
+    const s=searchUi();
+    if(!s?.open){
+      showPlaceholder('保存検索機能を準備中です。少し待ってからもう一度お試しください。');
+      return;
+    }
+    s.open();
+  }
+
+  function openImage() {
+    active='image';
+    paintTabs();
+    hidePlaceholder();
+    hideNovel();
+    hideSearch();
+    if(!isNovelPage()){
+      hideImage();
+      showPlaceholder('🖼️ 画像保存はpictBLandの作品詳細ページで利用できます。');
+      return;
+    }
+    const i=imageUi();
+    if(!i?.open){
+      showPlaceholder('画像保存機能を準備中です。少し待ってからもう一度お試しください。');
+      return;
+    }
+    i.open();
+  }
+
+  function switchTo(tab) {
+    if(tab==='novel')openNovel();
+    else if(tab==='image')openImage();
+    else openSearch();
+  }
+
+  function closeAll() {
+    hidePlaceholder();
+    hideNovel();
+    hideSearch();
+    hideImage();
+    document.getElementById(BAR_ID)?.classList.remove('open');
+  }
+
+  function openShell() {
+    document.getElementById(BAR_ID)?.classList.add('open');
+    switchTo(isNovelPage()?(imageUi()?.isImageWork?.()?'image':'novel'):'search');
+  }
+
+  function build() {
+    if(!document.body||document.getElementById(BAR_ID))return;
+
+    const style=document.createElement('style');
+    style.textContent=`
+      #pbnt-button,#pbsw-button,#pbi-button{display:none!important}
+      #pbnt-root,#pbsw-root,#pbi-root{top:${OFFSET}px!important;right:0!important;bottom:0!important;left:0!important;height:auto!important}
+      #${LAUNCH_ID}{position:fixed;right:14px;bottom:max(76px,env(safe-area-inset-bottom));z-index:2147483001;border:0;border-radius:999px;padding:12px 16px;background:#7356a8;color:#fff;font:700 14px/1.2 -apple-system,BlinkMacSystemFont,'Noto Sans JP',sans-serif;box-shadow:0 4px 18px #0004}
+      #${BAR_ID}{display:none;position:fixed;top:0;left:0;right:0;height:${OFFSET}px;z-index:2147483647;background:#fff;color:#202124;border-bottom:1px solid #dfe3e8;box-shadow:0 2px 9px #0002;padding:max(7px,env(safe-area-inset-top)) 8px 7px;font-family:-apple-system,BlinkMacSystemFont,'Noto Sans JP',sans-serif}
+      #${BAR_ID}.open{display:flex;align-items:flex-end;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+      #${BAR_ID} .pt-title{font-weight:800;font-size:14px;white-space:nowrap;margin:0 3px 5px 2px}
+      #${BAR_ID} [data-tool-tab],#${BAR_ID} .pt-close,#${BAR_ID} [data-ncb-slot] button{flex:0 0 auto;border:1px solid #cec7dc;background:#fff;color:#33294a;border-radius:9px;padding:9px 10px;font:700 12px/1 -apple-system,BlinkMacSystemFont,'Noto Sans JP',sans-serif}
+      #${BAR_ID} [data-tool-tab].active{background:#7356a8;color:#fff;border-color:#7356a8}
+      #${BAR_ID} [data-ncb-slot]{display:flex;flex:0 0 auto}
+      #${BAR_ID} .pt-close{margin-left:auto}
+      #${PLACEHOLDER_ID}{display:none;position:fixed;top:${OFFSET}px;right:0;bottom:0;left:0;z-index:2147483645;background:#f4f6f8;color:#5f586a;padding:36px 20px;text-align:center;font:14px/1.8 -apple-system,BlinkMacSystemFont,'Noto Sans JP',sans-serif}
+      #${PLACEHOLDER_ID}.open{display:block}
+      @media(max-width:600px){
+        #${BAR_ID}{gap:5px;padding-left:6px;padding-right:6px}
+        #${BAR_ID} .pt-title{display:none}
+        #${BAR_ID} [data-tool-tab],#${BAR_ID} .pt-close,#${BAR_ID} [data-ncb-slot] button{font-size:11px;padding:8px 7px}
+        #${LAUNCH_ID}{right:12px;padding:11px 14px}
+      }
+    `;
+    document.head.append(style);
+
+    const launch=document.createElement('button');
+    launch.id=LAUNCH_ID;
+    launch.type='button';
+    launch.textContent='🧰 pictBLandツール';
+    launch.addEventListener('click',openShell);
+
+    const bar=document.createElement('div');
+    bar.id=BAR_ID;
+
+    const title=document.createElement('div');
+    title.className='pt-title';
+    title.textContent='pictBLandツール';
+
+    const novel=document.createElement('button');
+    novel.type='button';
+    novel.dataset.toolTab='novel';
+    novel.textContent='📖 小説TXT';
+    novel.addEventListener('click',()=>switchTo('novel'));
+
+    const image=document.createElement('button');
+    image.type='button';
+    image.dataset.toolTab='image';
+    image.textContent='🖼️ 画像保存';
+    image.addEventListener('click',()=>switchTo('image'));
+
+    const search=document.createElement('button');
+    search.type='button';
+    search.dataset.toolTab='search';
+    search.textContent='🔖 保存検索';
+    search.addEventListener('click',()=>switchTo('search'));
+
+    const cloudSlot=document.createElement('span');
+    cloudSlot.dataset.ncbSlot='pictbland';
+
+    const close=document.createElement('button');
+    close.type='button';
+    close.className='pt-close';
+    close.textContent='閉じる';
+    close.addEventListener('click',closeAll);
+
+    bar.append(title,novel,image,search,cloudSlot,close);
+
+    const placeholder=document.createElement('div');
+    placeholder.id=PLACEHOLDER_ID;
+
+    document.body.append(launch,bar,placeholder);
+  }
+
+  if(document.body)build();
+  else addEventListener('DOMContentLoaded',build,{once:true});
+})();
