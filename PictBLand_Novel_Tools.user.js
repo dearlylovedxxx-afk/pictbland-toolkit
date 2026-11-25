@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.55
+// @version      0.3.56
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -915,7 +915,7 @@
     bar.className = 'pbnt-bar';
 
     const title = document.createElement('strong');
-    title.textContent = '📖 pictBLand 小説TXT v0.3.55';
+    title.textContent = '📖 pictBLand 小説TXT v0.3.56';
 
     const restore = document.createElement('button');
     restore.type = 'button';
@@ -1875,8 +1875,11 @@
       ['R18G',/R[-‐‑－]?18G/ig],
       ['R18',/R[-‐‑－]?18/ig],
       ['鍵付',/(?:鍵付|鍵付き|パスワード限定)/g],
-      ['フォロ限',/(?:フォロ限|フォロワー限定公開作品|フォロワー限定|フォロー限定)/g],
-      ['相互のみ',/(?:相互のみ|相互限|相互フォロー限定|相互フォロワー限定)/g],
+      // Current pictBLand search cards use "フォロワーのみ公開" /
+      // "相互フォローのみ公開". Match the mutual label first so the
+      // follower substring cannot consume it.
+      ['相互のみ',/(?:相互のみ|相互限|相互フォローのみ公開|相互フォロワーのみ公開|相互フォロー限定|相互フォロワー限定)/g],
+      ['フォロ限',/(?:フォロ限|フォロワーのみ公開|フォローのみ公開|フォロワー限定公開作品|フォロワー限定|フォロー限定)/g],
       ['リスト限',/(?:リスト限|リスト限定)/g],
       ['マイ限',/(?:マイピク限定|マイ限)/g],
       ['期間限定',/(?:期間限定公開|期間限定)/g],

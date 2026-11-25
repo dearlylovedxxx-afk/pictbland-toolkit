@@ -26,8 +26,8 @@ function setup(tags,works){
 
 test('syntax/version',()=>{
   assert.doesNotThrow(()=>new Function(s));
-  assert.match(s,/@version\s+0\.3\.55/);
-  assert.match(meta,/@version\s+0\.3\.55/);
+  assert.match(s,/@version\s+0\.3\.56/);
+  assert.match(meta,/@version\s+0\.3\.56/);
 });
 
 test('no exclusion means results can appear immediately',()=>{
@@ -95,4 +95,18 @@ test('generic access badges are accepted only when not hidden/inactive',()=>{
  assert.match(s,/getClientRects\(\)\.length===0/);
  assert.match(s,/\[class\*="badge" i\]/);
  assert.match(s,/node\.closest\?\.\('a\[href\*="\/tags\/index\/"\]'\)/);
+});
+
+
+test('current pictBLand follower-only labels are recognized',()=>{
+ const begin=s.indexOf('  function accessBadgeLabelsFromText(value) {');
+ const end=s.indexOf('  function accessBadgeNodeInactive(',begin);
+ const src=s.slice(begin,end);
+ const compactText=value=>String(value||'').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim();
+ const parse=new Function('compactText',src+'return accessBadgeLabelsFromText;')(compactText);
+ assert.deepEqual(parse('フォロワーのみ公開'),['フォロ限']);
+ assert.deepEqual(parse('相互フォローのみ公開'),['相互のみ']);
+ assert.deepEqual(parse('相互フォロワーのみ公開'),['相互のみ']);
+ assert.deepEqual(parse('フォロ限'),['フォロ限']);
+ assert.deepEqual(parse('この作品はフォロワーのみ公開です'),[]);
 });
