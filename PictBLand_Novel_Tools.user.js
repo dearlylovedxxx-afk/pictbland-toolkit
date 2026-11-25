@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.56
+// @version      0.3.57
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -915,7 +915,7 @@
     bar.className = 'pbnt-bar';
 
     const title = document.createElement('strong');
-    title.textContent = '📖 pictBLand 小説TXT v0.3.56';
+    title.textContent = '📖 pictBLand 小説TXT v0.3.57';
 
     const restore = document.createElement('button');
     restore.type = 'button';
@@ -1917,8 +1917,12 @@
       if(cur===card)break;
       cur=cur.parentElement;
     }
-    // On the live page, use actual rendered visibility when available.
-    if(node.isConnected && typeof getComputedStyle==='function'){
+    // Only use layout visibility for nodes that belong to the CURRENT page.
+    // Search-result HTML is often parsed in a detached DOMParser document:
+    // getClientRects() is empty there even for real visible badges, which used
+    // to erase both follower-only and R18 labels.
+    const onCurrentPage=node.ownerDocument===document && document.documentElement?.contains(node);
+    if(onCurrentPage && typeof getComputedStyle==='function'){
       try{
         const cs=getComputedStyle(node);
         if(cs.display==='none'||cs.visibility==='hidden'||Number(cs.opacity)===0)return true;
