@@ -26,8 +26,8 @@ function setup(tags,works){
 
 test('syntax/version',()=>{
   assert.doesNotThrow(()=>new Function(s));
-  assert.match(s,/@version\s+0\.3\.51/);
-  assert.match(meta,/@version\s+0\.3\.51/);
+  assert.match(s,/@version\s+0\.3\.53/);
+  assert.match(meta,/@version\s+0\.3\.53/);
 });
 
 test('no exclusion means results can appear immediately',()=>{
@@ -67,4 +67,13 @@ test('detail checks use merged global newest-first order',()=>{
   const ensure=s.slice(s.indexOf('  async function ensureCoverage('),s.indexOf('  async function expandFeed()',s.indexOf('  async function ensureCoverage(')));
   assert.doesNotMatch(ensure,/enqueueDetailsForSearchPriority/);
   assert.match(s,/if\(!feedLoading&&feedOpen\)\s*observeFeedCards/);
+});
+
+
+test('access badges come only from explicit short badge text',()=>{
+ assert.match(s,/function accessBadgeLabelsFromText\(value\)/);
+ assert.match(s,/function accessBadgesFromDetailDocument\(doc\)/);
+ assert.doesNotMatch(s,/const header = titleAt/);
+ assert.doesNotMatch(s,/accessBadgesFromCard\(doc\.body/);
+ assert.match(s,/Any prose left over means this was not a badge/);
 });

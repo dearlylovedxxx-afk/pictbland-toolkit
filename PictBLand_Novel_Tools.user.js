@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.52
+// @version      0.3.53
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -915,7 +915,7 @@
     bar.className = 'pbnt-bar';
 
     const title = document.createElement('strong');
-    title.textContent = '📖 pictBLand 小説TXT v0.3.52';
+    title.textContent = '📖 pictBLand 小説TXT v0.3.53';
 
     const restore = document.createElement('button');
     restore.type = 'button';
@@ -1863,37 +1863,79 @@
   }
 
 
-  // Visibility/rating badges are distinct from user-defined tags.
-  // Only read the card header or explicit badge-like nodes; never infer
-  // these from an unrelated caption mentioning "R18"/"鍵付".
-  function accessBadgesFromCard(card, title = '') {
-    if (!card) return [];
-    const whole = compactText(card.textContent || '');
-    const cleanTitle = compactText(title);
-    const titleAt = cleanTitle ? whole.indexOf(cleanTitle) : -1;
-    const header = titleAt >= 0 && titleAt <= 300
-      ? whole.slice(0, titleAt) : whole.slice(0, 95);
-    const samples = [header];
-    for (const node of card.querySelectorAll?.('[class*="badge" i],[class*="chip" i],[class*="rating" i],[class*="visibility" i],[class*="access" i],[class*="restrict" i],[class*="status" i],[class*="locked" i]') || []) {
-      const raw = compactText(node.textContent || '');
-      if (raw && raw.length <= 35 && !node.querySelector('a[href*="/tags/index/"]'))
-        samples.push(raw);
-    }
-    const content = samples.join(' ');
-    const names = [];
-    if (/(?:^|[^\w])R[-‐‑－]?18G(?=$|[^\w])/i.test(content)) names.push('R18G');
-    else if (/(?:^|[^\w])R[-‐‑－]?18(?=$|[^\w])/i.test(content)) names.push('R18');
-    if (/鍵付|鍵付き|パスワード限定/.test(content)) names.push('鍵付');
-    if (/フォロ限|フォロワー限定|フォロー限定/.test(content)) names.push('フォロ限');
-    const other = [
-      ['相互のみ',/相互のみ|相互限|相互フォロー限定|相互フォロワー限定/],
-      ['リスト限',/リスト限|リスト限定/],
-      ['マイ限',/マイピク限定|マイ限/],
-      ['期間限定',/期間限定公開|期間限定/],
-      ['全体公開',/全体公開/],
+  // Visibility/rating labels must come from an actual short badge element.
+  // Never infer them from the card prefix, body text, captions, neighbouring cards
+  // or generic site copy: those can contain words such as "フォロワー限定".
+  function accessBadgeLabelsFromText(value) {
+    const text=compactText(value).normalize('NFKC');
+    if(!text || text.length>70)return [];
+    let rest=text;
+    const names=[];
+    const rules=[
+      ['R18G',/R[-‐‑－]?18G/ig],
+      ['R18',/R[-‐‑－]?18/ig],
+      ['鍵付',/(?:鍵付|鍵付き|パスワード限定)/g],
+      ['フォロ限',/(?:フォロ限|フォロワー限定公開作品|フォロワー限定|フォロー限定)/g],
+      ['相互のみ',/(?:相互のみ|相互限|相互フォロー限定|相互フォロワー限定)/g],
+      ['リスト限',/(?:リスト限|リスト限定)/g],
+      ['マイ限',/(?:マイピク限定|マイ限)/g],
+      ['期間限定',/(?:期間限定公開|期間限定)/g],
+      ['全体公開',/全体公開/g],
     ];
-    for (const [label, re] of other) if (re.test(content)) names.push(label);
+    for(const [label,re] of rules){
+      re.lastIndex=0;
+      if(!re.test(rest))continue;
+      names.push(label);
+      re.lastIndex=0;
+      rest=rest.replace(re,' ');
+    }
+    // Accept combinations made only from known badge labels and separators.
+    // Any prose left over means this was not a badge.
+    rest=rest.replace(/[\s・･|｜/／,，:：;；()[\]{}【】「」『』<>＜＞]+/g,'');
+    if(rest)return [];
+    // R18G already contains R18 semantically; never show both.
+    return [...new Set(names.filter(label=>label!=='R18'||!names.includes('R18G')))];
+  }
+
+  function accessBadgesFromCard(card) {
+    if (!card) return [];
+    const names=[];
+    const seen=new Set();
+    const add=value=>{
+      for(const label of accessBadgeLabelsFromText(value)){
+        if(!seen.has(label)){seen.add(label);names.push(label);}
+      }
+    };
+    const selector=[
+      '[class*="badge" i]','[class*="chip" i]','[class*="rating" i]',
+      '[class*="visibility" i]','[class*="access" i]','[class*="restrict" i]',
+      '[class*="status" i]','[class*="locked" i]','[class*="limited" i]',
+      '[class*="permission" i]','[class*="publish" i]','[class*="scope" i]',
+      '[data-visibility]','[data-access]','[data-restriction]','[data-rating]'
+    ].join(',');
+    for(const node of card.querySelectorAll?.(selector)||[]){
+      if(node.querySelector?.('a[href*="/tags/index/"]'))continue;
+      add(node.textContent||'');
+      add(node.getAttribute?.('aria-label')||'');
+      add(node.getAttribute?.('title')||'');
+    }
+    // Some pictBLand badge builds use an unclassified leaf span. Accept it only
+    // when its entire short text is made of known labels.
+    for(const node of card.querySelectorAll?.('span,small,strong,em')||[]){
+      if(node.children?.length || node.closest?.('a[href*="/tags/index/"]'))continue;
+      const raw=compactText(node.textContent||'');
+      if(raw.length<=70)add(raw);
+    }
     return names;
+  }
+
+  function accessBadgesFromDetailDocument(doc) {
+    if(!doc)return [];
+    const scope=doc.querySelector?.(
+      'main article,main [class*="item-detail" i],main [class*="work-detail" i],'+
+      'article[class*="item" i],main'
+    );
+    return scope ? accessBadgesFromCard(scope) : [];
   }
 
   function updateFeedAccessBadges(holder, work) {
@@ -1959,7 +2001,7 @@
       caption:captionFromSearchCard(card,title,author.name,tags) || captionFrom(card,title,author.name,tags),
       ...format,
       tags,
-      accessBadges:accessBadgesFromCard(card,title),
+      accessBadges:accessBadgesFromCard(card),
       sukiCount:metricFromText(text,['ステキ!?','ステキ','いいね']),
       bookmarkCount:metricFromText(text,['ブクマ','ブックマーク']),
       matches:new Set([state.row.name || state.row.word]),
@@ -2642,7 +2684,7 @@
     if(tags.length)work.tags=tags;
     if(feedNeedsTagVerification() && !work.detailTagsVerified)
       throw new Error('作品固有のタグを確認できませんでした');
-    const detailedBadges=accessBadgesFromCard(doc.body,work.title);
+    const detailedBadges=accessBadgesFromDetailDocument(doc);
     if(detailedBadges.length)
       work.accessBadges=[...new Set([...(work.accessBadges||[]),...detailedBadges])];
     const author=authorFrom(doc);
