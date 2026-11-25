@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.59
+// @version      0.3.60
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -915,7 +915,7 @@
     bar.className = 'pbnt-bar';
 
     const title = document.createElement('strong');
-    title.textContent = '📖 pictBLand 小説TXT v0.3.59';
+    title.textContent = '📖 pictBLand 小説TXT v0.3.60';
 
     const restore = document.createElement('button');
     restore.type = 'button';
@@ -2195,7 +2195,7 @@
       badgeNodes:badgeDiagnosticNodes(card),
       imageNodes:imageDiagnosticNodes(card),
       textNodes:nodes.map(n=>({t:n.text.slice(0,130),role:n.role,tag:n.tag,cls:n.className})),
-      diagnosticVersion:'0.3.59-session-card'
+      diagnosticVersion:'0.3.60-session-card'
     });
   }
 
@@ -2205,7 +2205,7 @@
       alert('診断データがありません。「更新」を押して作品を再取得してから試してください。');
       return;
     }
-    const text=JSON.stringify({version:'0.3.59',cards:records},null,2);
+    const text=JSON.stringify({version:'0.3.60',cards:records},null,2);
     const fallback=()=>{
       const box=document.createElement('textarea');
       box.value=text;
@@ -3052,7 +3052,12 @@
         ? '詳細ページにステキ数・ブックマーク数の情報がありませんでした' : '');
     }
     const title = card.querySelector('.pbsw-feed-title');
-    if (title) title.textContent = work.title;
+    if (title) {
+      title.textContent = work.title;
+      title.href = work.href;
+    }
+    const thumbLink=card.querySelector('.pbsw-feed-thumb');
+    if(thumbLink)thumbLink.href=work.href;
     const kind=card.querySelector('.pbsw-feed-kind');
     if(kind){kind.textContent=formatWorkLabel(work);kind.hidden=!kind.textContent;}
     updateFeedAccessBadges(card.querySelector('.pbsw-feed-access'),work);
@@ -3064,7 +3069,17 @@
     if (caption) caption.textContent = work.caption || (work.detailError ? 'キャプション取得不可'
       : work.detailLoaded ? 'キャプションを取得できませんでした' : '作品情報を取得中…');
     const img = card.querySelector('.pbsw-feed-thumb img');
-    if (img && work.thumb && !img.getAttribute('src')) { img.src = work.thumb; img.classList.remove('empty'); }
+    if (img) {
+      img.alt=work.title||'';
+      const current=img.getAttribute('src')||'';
+      if(work.thumb){
+        if(current!==work.thumb)img.src=work.thumb;
+        img.classList.remove('empty');
+      }else{
+        img.removeAttribute('src');
+        img.classList.add('empty');
+      }
+    }
     const tags = card.querySelector('.pbsw-feed-tags');
     if (tags) {
       tags.replaceChildren();
@@ -3126,10 +3141,15 @@
     // Keep stable DOM/cards while verified results arrive one by one.
     for(let i=0;i<visible.length;i++){
       const work=visible[i],current=grid.children[i]||null;
-      if(current?.dataset?.workId===String(work.id))continue;
+      if(current?.dataset?.workId===String(work.id)){
+        updateFeedCard(work);
+        continue;
+      }
       const existing=[...grid.querySelectorAll('.pbsw-feed-card')].find(
         card=>card.dataset.workId===String(work.id));
-      grid.insertBefore(existing||createFeedCard(work),current);
+      const card=existing||createFeedCard(work);
+      grid.insertBefore(card,current);
+      updateFeedCard(work);
     }
     while(grid.children.length>visible.length)grid.lastElementChild.remove();
 
