@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.53
+// @version      0.3.54
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -915,7 +915,7 @@
     bar.className = 'pbnt-bar';
 
     const title = document.createElement('strong');
-    title.textContent = '📖 pictBLand 小説TXT v0.3.53';
+    title.textContent = '📖 pictBLand 小説TXT v0.3.54';
 
     const restore = document.createElement('button');
     restore.type = 'button';
@@ -1901,30 +1901,42 @@
     if (!card) return [];
     const names=[];
     const seen=new Set();
-    const add=value=>{
+    const add=(value,allowVisibility)=>{
       for(const label of accessBadgeLabelsFromText(value)){
+        // Generic badge/chip/status nodes are common in pictBLand and can
+        // contain hidden access-control templates. They are trustworthy for
+        // age-rating labels only. Visibility labels require a dedicated
+        // access/visibility/restriction-like element.
+        if(!allowVisibility && !/^R18/.test(label))continue;
         if(!seen.has(label)){seen.add(label);names.push(label);}
       }
     };
-    const selector=[
-      '[class*="badge" i]','[class*="chip" i]','[class*="rating" i]',
-      '[class*="visibility" i]','[class*="access" i]','[class*="restrict" i]',
-      '[class*="status" i]','[class*="locked" i]','[class*="limited" i]',
-      '[class*="permission" i]','[class*="publish" i]','[class*="scope" i]',
-      '[data-visibility]','[data-access]','[data-restriction]','[data-rating]'
+    const ratingSelector=[
+      '[class*="rating" i]','[data-rating]',
+      '[class*="badge" i]','[class*="chip" i]','[class*="status" i]'
     ].join(',');
-    for(const node of card.querySelectorAll?.(selector)||[]){
+    for(const node of card.querySelectorAll?.(ratingSelector)||[]){
       if(node.querySelector?.('a[href*="/tags/index/"]'))continue;
-      add(node.textContent||'');
-      add(node.getAttribute?.('aria-label')||'');
-      add(node.getAttribute?.('title')||'');
+      add(node.textContent||'',false);
+      add(node.getAttribute?.('aria-label')||'',false);
+      add(node.getAttribute?.('title')||'',false);
     }
-    // Some pictBLand badge builds use an unclassified leaf span. Accept it only
-    // when its entire short text is made of known labels.
-    for(const node of card.querySelectorAll?.('span,small,strong,em')||[]){
-      if(node.children?.length || node.closest?.('a[href*="/tags/index/"]'))continue;
-      const raw=compactText(node.textContent||'');
-      if(raw.length<=70)add(raw);
+
+    const visibilitySelector=[
+      '[class*="visibility" i]','[class*="access" i]','[class*="restrict" i]',
+      '[class*="locked" i]','[class*="limited" i]','[class*="permission" i]',
+      '[class*="publish-scope" i]','[class*="publish_scope" i]',
+      '[class*="view-scope" i]','[class*="view_scope" i]',
+      '[data-visibility]','[data-access]','[data-restriction]'
+    ].join(',');
+    for(const node of card.querySelectorAll?.(visibilitySelector)||[]){
+      if(node.querySelector?.('a[href*="/tags/index/"]'))continue;
+      add(node.textContent||'',true);
+      add(node.getAttribute?.('aria-label')||'',true);
+      add(node.getAttribute?.('title')||'',true);
+      add(node.getAttribute?.('data-visibility')||'',true);
+      add(node.getAttribute?.('data-access')||'',true);
+      add(node.getAttribute?.('data-restriction')||'',true);
     }
     return names;
   }
@@ -2685,8 +2697,10 @@
     if(feedNeedsTagVerification() && !work.detailTagsVerified)
       throw new Error('作品固有のタグを確認できませんでした');
     const detailedBadges=accessBadgesFromDetailDocument(doc);
-    if(detailedBadges.length)
-      work.accessBadges=[...new Set([...(work.accessBadges||[]),...detailedBadges])];
+    const ratingBadges=(work.accessBadges||[]).filter(label=>/^R18/.test(label));
+    const detailVisibility=detailedBadges.filter(label=>!/^R18/.test(label));
+    const detailRatings=detailedBadges.filter(label=>/^R18/.test(label));
+    work.accessBadges=[...new Set([...ratingBadges,...detailRatings,...detailVisibility])];
     const author=authorFrom(doc);
     if(author.name && !work.authorName){work.authorName=author.name;work.authorHref=author.href;}
     const ogTitle=compactText(doc.querySelector('meta[property="og:title"]')?.getAttribute('content'));

@@ -26,8 +26,8 @@ function setup(tags,works){
 
 test('syntax/version',()=>{
   assert.doesNotThrow(()=>new Function(s));
-  assert.match(s,/@version\s+0\.3\.53/);
-  assert.match(meta,/@version\s+0\.3\.53/);
+  assert.match(s,/@version\s+0\.3\.54/);
+  assert.match(meta,/@version\s+0\.3\.54/);
 });
 
 test('no exclusion means results can appear immediately',()=>{
@@ -76,4 +76,13 @@ test('access badges come only from explicit short badge text',()=>{
  assert.doesNotMatch(s,/const header = titleAt/);
  assert.doesNotMatch(s,/accessBadgesFromCard\(doc\.body/);
  assert.match(s,/Any prose left over means this was not a badge/);
+});
+
+
+test('visibility labels require dedicated visibility/access elements',()=>{
+ assert.doesNotMatch(s,/querySelectorAll\?\.\('span,small,strong,em'\)/);
+ assert.match(s,/if\(!allowVisibility && !\/\^R18\/\.test\(label\)\)continue/);
+ assert.match(s,/\[class\*="visibility" i\]/);
+ assert.match(s,/\[class\*="access" i\]/);
+ assert.match(s,/work\.accessBadges=\[\.\.\.new Set\(\[\.\.\.ratingBadges,\.\.\.detailRatings,\.\.\.detailVisibility\]\)\]/);
 });
