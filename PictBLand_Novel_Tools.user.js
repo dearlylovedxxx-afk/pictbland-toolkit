@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.57
+// @version      0.3.58
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -915,7 +915,7 @@
     bar.className = 'pbnt-bar';
 
     const title = document.createElement('strong');
-    title.textContent = '📖 pictBLand 小説TXT v0.3.57';
+    title.textContent = '📖 pictBLand 小説TXT v0.3.58';
 
     const restore = document.createElement('button');
     restore.type = 'button';
@@ -2123,23 +2123,76 @@
   }
 
 
-  // Optional on-demand diagnostic, no cookies, account tokens, entire HTML,
-  // request headers or cross-origin URLs are collected or transmitted.
+  // Optional on-demand diagnostic. Never include cookies, auth tokens,
+  // request headers or full page HTML. We keep only short DOM metadata around
+  // the first few search-result cards so false access badges can be identified.
   const captionDiagnostics = new Map();
+
+  function diagnosticAttrs(node){
+    if(!node?.getAttribute)return {};
+    const names=['class','role','aria-label','aria-hidden','title','style','hidden',
+      'data-visibility','data-access','data-restriction','data-rating','src','alt'];
+    const out={};
+    for(const name of names){
+      const value=node.getAttribute(name);
+      if(value!==null && value!=='')out[name]=String(value).slice(0,260);
+    }
+    return out;
+  }
+
+  function badgeDiagnosticNodes(card){
+    const selector=[
+      '[class*="badge" i]','[class*="chip" i]','[class*="status" i]',
+      '[class*="rating" i]','[class*="visibility" i]','[class*="access" i]',
+      '[class*="restrict" i]','[class*="locked" i]','[class*="limited" i]',
+      '[class*="permission" i]','[data-visibility]','[data-access]',
+      '[data-restriction]','[data-rating]'
+    ].join(',');
+    const rows=[];
+    for(const node of card?.querySelectorAll?.(selector)||[]){
+      const text=compactText(node.textContent||'');
+      if(!text && !node.getAttribute?.('aria-label') && !node.getAttribute?.('title'))continue;
+      rows.push({
+        tag:node.tagName,
+        text:text.slice(0,180),
+        attrs:diagnosticAttrs(node),
+        parent:{tag:node.parentElement?.tagName||'',attrs:diagnosticAttrs(node.parentElement)},
+        inactive:accessBadgeNodeInactive(node,card)
+      });
+      if(rows.length>=35)break;
+    }
+    return rows;
+  }
+
+  function imageDiagnosticNodes(card){
+    const rows=[];
+    for(const node of card?.querySelectorAll?.('img')||[]){
+      rows.push({
+        attrs:diagnosticAttrs(node),
+        parent:{tag:node.parentElement?.tagName||'',attrs:diagnosticAttrs(node.parentElement)},
+        grandparent:{tag:node.parentElement?.parentElement?.tagName||'',attrs:diagnosticAttrs(node.parentElement?.parentElement)}
+      });
+      if(rows.length>=12)break;
+    }
+    return rows;
+  }
+
   function rememberCaptionDiagnostic(card,work){
-    if(!card||!work||captionDiagnostics.size>=4||work.caption)return;
-    const nodes=captionTextNodes(card).slice(0,65);
-    // Skip empty anonymous divs when a real article card is available.
-    if(!nodes.length || (!card.matches?.('article.item-card,article.history-work-card.item-card')
-      && nodes.length<3))return;
+    if(!card||!work||captionDiagnostics.size>=8)return;
+    const nodes=captionTextNodes(card).slice(0,45);
     captionDiagnostics.set(String(work.id),{
       id:String(work.id),
       title:String(work.title||''),
+      author:String(work.authorName||''),
       kind:formatWorkLabel(work),
+      detectedAccessBadges:[...(work.accessBadges||[])],
+      thumb:String(work.thumb||'').slice(0,300),
       cardTag:card.tagName,
-      cardClass:String(card.className||'').slice(0,120),
+      cardAttrs:diagnosticAttrs(card),
+      badgeNodes:badgeDiagnosticNodes(card),
+      imageNodes:imageDiagnosticNodes(card),
       textNodes:nodes.map(n=>({t:n.text.slice(0,130),role:n.role,tag:n.tag,cls:n.className})),
-      captionAlgorithm:'v0.3.28-title-to-tag'
+      diagnosticVersion:'0.3.58-access-card'
     });
   }
 
@@ -2149,7 +2202,7 @@
       alert('診断データがありません。「更新」を押して作品を再取得してから試してください。');
       return;
     }
-    const text=JSON.stringify({version:'0.3.28',captions:records},null,2);
+    const text=JSON.stringify({version:'0.3.58',cards:records},null,2);
     const fallback=()=>{
       const box=document.createElement('textarea');
       box.value=text;

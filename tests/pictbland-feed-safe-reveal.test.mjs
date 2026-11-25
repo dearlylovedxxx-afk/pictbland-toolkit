@@ -26,8 +26,8 @@ function setup(tags,works){
 
 test('syntax/version',()=>{
   assert.doesNotThrow(()=>new Function(s));
-  assert.match(s,/@version\s+0\.3\.57/);
-  assert.match(meta,/@version\s+0\.3\.57/);
+  assert.match(s,/@version\s+0\.3\.58/);
+  assert.match(meta,/@version\s+0\.3\.58/);
 });
 
 test('no exclusion means results can appear immediately',()=>{
@@ -115,4 +115,13 @@ test('current pictBLand follower-only labels are recognized',()=>{
 test('detached parsed search HTML is not rejected by layout visibility checks',()=>{
  assert.match(s,/const onCurrentPage=node\.ownerDocument===document && document\.documentElement\?\.contains\(node\)/);
  assert.match(s,/if\(onCurrentPage && typeof getComputedStyle==='function'\)/);
+});
+
+
+test('access-card diagnostics include badge and image DOM metadata',()=>{
+ assert.match(s,/function badgeDiagnosticNodes\(card\)/);
+ assert.match(s,/function imageDiagnosticNodes\(card\)/);
+ assert.match(s,/detectedAccessBadges:\[\.\.\.\(work\.accessBadges\|\|\[\]\)\]/);
+ assert.match(s,/diagnosticVersion:'0\.3\.58-access-card'/);
+ assert.match(s,/JSON\.stringify\(\{version:'0\.3\.58',cards:records\}/);
 });
