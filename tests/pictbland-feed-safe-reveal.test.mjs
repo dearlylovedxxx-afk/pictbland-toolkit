@@ -26,8 +26,8 @@ function setup(tags,works){
 
 test('syntax/version',()=>{
   assert.doesNotThrow(()=>new Function(s));
-  assert.match(s,/@version\s+0\.3\.54/);
-  assert.match(meta,/@version\s+0\.3\.54/);
+  assert.match(s,/@version\s+0\.3\.55/);
+  assert.match(meta,/@version\s+0\.3\.55/);
 });
 
 test('no exclusion means results can appear immediately',()=>{
@@ -85,4 +85,14 @@ test('visibility labels require dedicated visibility/access elements',()=>{
  assert.match(s,/\[class\*="visibility" i\]/);
  assert.match(s,/\[class\*="access" i\]/);
  assert.match(s,/work\.accessBadges=\[\.\.\.new Set\(\[\.\.\.ratingBadges,\.\.\.detailRatings,\.\.\.detailVisibility\]\)\]/);
+});
+
+
+test('generic access badges are accepted only when not hidden/inactive',()=>{
+ assert.match(s,/function accessBadgeNodeInactive\(node,card\)/);
+ assert.match(s,/aria-hidden/);
+ assert.match(s,/display:none\|visibility:hidden/);
+ assert.match(s,/getClientRects\(\)\.length===0/);
+ assert.match(s,/\[class\*="badge" i\]/);
+ assert.match(s,/node\.closest\?\.\('a\[href\*="\/tags\/index\/"\]'\)/);
 });

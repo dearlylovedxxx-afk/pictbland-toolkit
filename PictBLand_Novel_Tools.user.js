@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.54
+// @version      0.3.55
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -915,7 +915,7 @@
     bar.className = 'pbnt-bar';
 
     const title = document.createElement('strong');
-    title.textContent = '📖 pictBLand 小説TXT v0.3.54';
+    title.textContent = '📖 pictBLand 小説TXT v0.3.55';
 
     const restore = document.createElement('button');
     restore.type = 'button';
@@ -1897,46 +1897,63 @@
     return [...new Set(names.filter(label=>label!=='R18'||!names.includes('R18G')))];
   }
 
+  function accessBadgeNodeInactive(node,card) {
+    if(!node)return true;
+    let cur=node;
+    while(cur && cur!==card?.parentElement){
+      if(cur.nodeType===1){
+        if(cur.hidden || cur.hasAttribute?.('inert') ||
+           cur.getAttribute?.('aria-hidden')==='true')return true;
+        const style=String(cur.getAttribute?.('style')||'').replace(/\s+/g,'').toLowerCase();
+        if(/display:none|visibility:hidden|opacity:0(?:[;}]|$)/.test(style))return true;
+        const cls=String(cur.className||'');
+        if(/(?:^|[\s_-])(?:hidden|is-hidden|d-none|u-hidden|visually-hidden|template|prototype)(?:$|[\s_-])/i.test(cls))
+          return true;
+        if(cur.tagName==='TEMPLATE')return true;
+      }
+      if(cur===card)break;
+      cur=cur.parentElement;
+    }
+    // On the live page, use actual rendered visibility when available.
+    if(node.isConnected && typeof getComputedStyle==='function'){
+      try{
+        const cs=getComputedStyle(node);
+        if(cs.display==='none'||cs.visibility==='hidden'||Number(cs.opacity)===0)return true;
+        if(typeof node.getClientRects==='function' && node.getClientRects().length===0)return true;
+      }catch{}
+    }
+    return false;
+  }
+
   function accessBadgesFromCard(card) {
     if (!card) return [];
     const names=[];
     const seen=new Set();
-    const add=(value,allowVisibility)=>{
+    const add=(node,value)=>{
+      if(accessBadgeNodeInactive(node,card))return;
       for(const label of accessBadgeLabelsFromText(value)){
-        // Generic badge/chip/status nodes are common in pictBLand and can
-        // contain hidden access-control templates. They are trustworthy for
-        // age-rating labels only. Visibility labels require a dedicated
-        // access/visibility/restriction-like element.
-        if(!allowVisibility && !/^R18/.test(label))continue;
         if(!seen.has(label)){seen.add(label);names.push(label);}
       }
     };
-    const ratingSelector=[
+    const selector=[
       '[class*="rating" i]','[data-rating]',
-      '[class*="badge" i]','[class*="chip" i]','[class*="status" i]'
-    ].join(',');
-    for(const node of card.querySelectorAll?.(ratingSelector)||[]){
-      if(node.querySelector?.('a[href*="/tags/index/"]'))continue;
-      add(node.textContent||'',false);
-      add(node.getAttribute?.('aria-label')||'',false);
-      add(node.getAttribute?.('title')||'',false);
-    }
-
-    const visibilitySelector=[
+      '[class*="badge" i]','[class*="chip" i]','[class*="status" i]',
       '[class*="visibility" i]','[class*="access" i]','[class*="restrict" i]',
       '[class*="locked" i]','[class*="limited" i]','[class*="permission" i]',
       '[class*="publish-scope" i]','[class*="publish_scope" i]',
       '[class*="view-scope" i]','[class*="view_scope" i]',
       '[data-visibility]','[data-access]','[data-restriction]'
     ].join(',');
-    for(const node of card.querySelectorAll?.(visibilitySelector)||[]){
-      if(node.querySelector?.('a[href*="/tags/index/"]'))continue;
-      add(node.textContent||'',true);
-      add(node.getAttribute?.('aria-label')||'',true);
-      add(node.getAttribute?.('title')||'',true);
-      add(node.getAttribute?.('data-visibility')||'',true);
-      add(node.getAttribute?.('data-access')||'',true);
-      add(node.getAttribute?.('data-restriction')||'',true);
+    for(const node of card.querySelectorAll?.(selector)||[]){
+      if(node.closest?.('a[href*="/tags/index/"]') ||
+         node.querySelector?.('a[href*="/tags/index/"]'))continue;
+      add(node,node.textContent||'');
+      add(node,node.getAttribute?.('aria-label')||'');
+      add(node,node.getAttribute?.('title')||'');
+      add(node,node.getAttribute?.('data-visibility')||'');
+      add(node,node.getAttribute?.('data-access')||'');
+      add(node,node.getAttribute?.('data-restriction')||'');
+      add(node,node.getAttribute?.('data-rating')||'');
     }
     return names;
   }
@@ -2697,10 +2714,8 @@
     if(feedNeedsTagVerification() && !work.detailTagsVerified)
       throw new Error('作品固有のタグを確認できませんでした');
     const detailedBadges=accessBadgesFromDetailDocument(doc);
-    const ratingBadges=(work.accessBadges||[]).filter(label=>/^R18/.test(label));
-    const detailVisibility=detailedBadges.filter(label=>!/^R18/.test(label));
-    const detailRatings=detailedBadges.filter(label=>/^R18/.test(label));
-    work.accessBadges=[...new Set([...ratingBadges,...detailRatings,...detailVisibility])];
+    if(detailedBadges.length)
+      work.accessBadges=[...new Set([...(work.accessBadges||[]),...detailedBadges])];
     const author=authorFrom(doc);
     if(author.name && !work.authorName){work.authorName=author.name;work.authorHref=author.href;}
     const ogTitle=compactText(doc.querySelector('meta[property="og:title"]')?.getAttribute('content'));
