@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pictBLand 小説TXTツール
 // @namespace    local.pictbland.novel-text-tools
-// @version      0.3.60
+// @version      0.3.61
 // @description  pictBLandツールを1つのボタンに統合。小説TXT化・画像一括保存・保存検索に対応します。
 // @match        https://pictbland.net/*
 // @run-at       document-idle
@@ -915,7 +915,7 @@
     bar.className = 'pbnt-bar';
 
     const title = document.createElement('strong');
-    title.textContent = '📖 pictBLand 小説TXT v0.3.60';
+    title.textContent = '📖 pictBLand 小説TXT v0.3.61';
 
     const restore = document.createElement('button');
     restore.type = 'button';
@@ -1939,31 +1939,30 @@
     if (!card) return [];
     const names=[];
     const seen=new Set();
-    const add=(node,value)=>{
-      if(accessBadgeNodeInactive(node,card))return;
-      for(const label of accessBadgeLabelsFromText(value)){
-        if(!seen.has(label)){seen.add(label);names.push(label);}
+    const add=label=>{if(label&&!seen.has(label)){seen.add(label);names.push(label);}};
+    const leaves=[...card.querySelectorAll?.(
+      '.history-work-card__badges .is-r18,'+
+      '.history-work-card__badges .is-lock,'+
+      '.history-work-card__badges .is-scope,'+
+      '.item-card__badges .is-r18,'+
+      '.item-card__badges .is-lock,'+
+      '.item-card__badges .is-scope'
+    )||[]];
+    for(const node of leaves){
+      // Rendered search snapshots explicitly annotate whether each leaf badge
+      // was actually visible. Detached detail/static HTML is not authoritative.
+      if(node.getAttribute('data-pbsw-render-visible')!=='1')continue;
+      if(node.classList.contains('is-r18')){
+        const raw=compactText(node.textContent||'');
+        add(/R[-‐‑－]?18G/i.test(raw)?'R18G':'R18');
+        continue;
       }
-    };
-    const selector=[
-      '[class*="rating" i]','[data-rating]',
-      '[class*="badge" i]','[class*="chip" i]','[class*="status" i]',
-      '[class*="visibility" i]','[class*="access" i]','[class*="restrict" i]',
-      '[class*="locked" i]','[class*="limited" i]','[class*="permission" i]',
-      '[class*="publish-scope" i]','[class*="publish_scope" i]',
-      '[class*="view-scope" i]','[class*="view_scope" i]',
-      '[data-visibility]','[data-access]','[data-restriction]'
-    ].join(',');
-    for(const node of card.querySelectorAll?.(selector)||[]){
-      if(node.closest?.('a[href*="/tags/index/"]') ||
-         node.querySelector?.('a[href*="/tags/index/"]'))continue;
-      add(node,node.textContent||'');
-      add(node,node.getAttribute?.('aria-label')||'');
-      add(node,node.getAttribute?.('title')||'');
-      add(node,node.getAttribute?.('data-visibility')||'');
-      add(node,node.getAttribute?.('data-access')||'');
-      add(node,node.getAttribute?.('data-restriction')||'');
-      add(node,node.getAttribute?.('data-rating')||'');
+      if(node.classList.contains('is-lock')){add('鍵付');continue;}
+      if(node.classList.contains('is-scope')){
+        for(const label of accessBadgeLabelsFromText(node.textContent||'')){
+          if(label!=='R18'&&label!=='R18G'&&label!=='鍵付')add(label);
+        }
+      }
     }
     return names;
   }
@@ -2145,11 +2144,14 @@
 
   function badgeDiagnosticNodes(card){
     const selector=[
-      '[class*="badge" i]','[class*="chip" i]','[class*="status" i]',
-      '[class*="rating" i]','[class*="visibility" i]','[class*="access" i]',
-      '[class*="restrict" i]','[class*="locked" i]','[class*="limited" i]',
-      '[class*="permission" i]','[data-visibility]','[data-access]',
-      '[data-restriction]','[data-rating]'
+      '.history-work-card__badges',
+      '.history-work-card__badges .is-r18',
+      '.history-work-card__badges .is-lock',
+      '.history-work-card__badges .is-scope',
+      '.item-card__badges',
+      '.item-card__badges .is-r18',
+      '.item-card__badges .is-lock',
+      '.item-card__badges .is-scope'
     ].join(',');
     const rows=[];
     for(const node of card?.querySelectorAll?.(selector)||[]){
@@ -2195,7 +2197,7 @@
       badgeNodes:badgeDiagnosticNodes(card),
       imageNodes:imageDiagnosticNodes(card),
       textNodes:nodes.map(n=>({t:n.text.slice(0,130),role:n.role,tag:n.tag,cls:n.className})),
-      diagnosticVersion:'0.3.60-session-card'
+      diagnosticVersion:'0.3.61-access-leaf'
     });
   }
 
@@ -2205,7 +2207,7 @@
       alert('診断データがありません。「更新」を押して作品を再取得してから試してください。');
       return;
     }
-    const text=JSON.stringify({version:'0.3.60',cards:records},null,2);
+    const text=JSON.stringify({version:'0.3.61',cards:records},null,2);
     const fallback=()=>{
       const box=document.createElement('textarea');
       box.value=text;
@@ -2295,6 +2297,38 @@
     };
   }
 
+  function markRenderedSearchAccessState(doc,win){
+    if(!doc)return;
+    const badgeSelector=[
+      '.history-work-card__badges .is-r18',
+      '.history-work-card__badges .is-lock',
+      '.history-work-card__badges .is-scope',
+      '.item-card__badges .is-r18',
+      '.item-card__badges .is-lock',
+      '.item-card__badges .is-scope'
+    ].join(',');
+    for(const node of doc.querySelectorAll(badgeSelector)){
+      try{
+        const cs=win?.getComputedStyle?.(node);
+        const hidden=node.hidden || node.getAttribute('aria-hidden')==='true' ||
+          cs?.display==='none' || cs?.visibility==='hidden' || Number(cs?.opacity)===0 ||
+          (typeof node.getClientRects==='function' && node.getClientRects().length===0);
+        node.setAttribute(hidden?'data-pbsw-render-hidden':'data-pbsw-render-visible','1');
+      }catch{}
+    }
+    // Images are independent of access-badge visibility; mark only images that
+    // are actually hidden in the rendered search page.
+    for(const node of doc.querySelectorAll('article.item-card img,article.history-work-card img')){
+      try{
+        const cs=win?.getComputedStyle?.(node);
+        const hidden=node.hidden || node.getAttribute('aria-hidden')==='true' ||
+          cs?.display==='none' || cs?.visibility==='hidden' || Number(cs?.opacity)===0 ||
+          (typeof node.getClientRects==='function' && node.getClientRects().length===0);
+        if(hidden)node.setAttribute('data-pbsw-render-hidden','1');
+      }catch{}
+    }
+  }
+
   function renderedSearchHtml(url, signal) {
     const abs = new URL(url, location.origin).href;
     return new Promise((resolve,reject) => {
@@ -2334,24 +2368,7 @@
       timer=setTimeout(()=>{
         try{
           const doc=iframe.contentDocument;
-          try{
-            for(const node of doc?.querySelectorAll?.(
-              '[class*="badge" i],[class*="chip" i],[class*="status" i],'+
-              '[class*="rating" i],[class*="visibility" i],[class*="access" i],'+
-              '[class*="restrict" i],[class*="locked" i],[class*="limited" i],'+
-              '[class*="permission" i],[data-visibility],[data-access],'+
-              '[data-restriction],[data-rating],img'
-            )||[]){
-              try{
-                const cs=iframe.contentWindow?.getComputedStyle?.(node);
-                if(node.hidden || node.getAttribute('aria-hidden')==='true' ||
-                   cs?.display==='none' || cs?.visibility==='hidden' ||
-                   Number(cs?.opacity)===0 ||
-                   (typeof node.getClientRects==='function' && node.getClientRects().length===0))
-                  node.setAttribute('data-pbsw-render-hidden','1');
-              }catch{}
-            }
-          }catch{}
+          markRenderedSearchAccessState(doc,iframe.contentWindow);
           let html=doc?.documentElement?.outerHTML||'';
           try{
             const shadowParts=[];
@@ -2407,26 +2424,8 @@
                   && (named>0||waited>=6500))
                ||(isEmpty&&stableTicks>=2)){
               try{iframe.contentWindow?.scrollTo?.(0,0);}catch{}
-              // Preserve actual rendered visibility before serializing. A
-              // detached DOMParser cannot reproduce stylesheet/layout state.
-              try{
-                for(const node of doc.querySelectorAll(
-                  '[class*="badge" i],[class*="chip" i],[class*="status" i],'+
-                  '[class*="rating" i],[class*="visibility" i],[class*="access" i],'+
-                  '[class*="restrict" i],[class*="locked" i],[class*="limited" i],'+
-                  '[class*="permission" i],[data-visibility],[data-access],'+
-                  '[data-restriction],[data-rating],img'
-                )){
-                  try{
-                    const cs=iframe.contentWindow?.getComputedStyle?.(node);
-                    if(node.hidden || node.getAttribute('aria-hidden')==='true' ||
-                       cs?.display==='none' || cs?.visibility==='hidden' ||
-                       Number(cs?.opacity)===0 ||
-                       (typeof node.getClientRects==='function' && node.getClientRects().length===0))
-                      node.setAttribute('data-pbsw-render-hidden','1');
-                  }catch{}
-                }
-              }catch{}
+              // Preserve the real visibility of authoritative leaf badges.
+              markRenderedSearchAccessState(doc,iframe.contentWindow);
               let html=doc.documentElement.outerHTML;
               try {
                 const shadowParts=[];
@@ -2824,9 +2823,8 @@
     if(tags.length)work.tags=tags;
     if(feedNeedsTagVerification() && !work.detailTagsVerified)
       throw new Error('作品固有のタグを確認できませんでした');
-    const detailedBadges=accessBadgesFromDetailDocument(doc);
-    if(detailedBadges.length)
-      work.accessBadges=[...new Set([...(work.accessBadges||[]),...detailedBadges])];
+    // Access/rating badges come only from the actually rendered saved-search
+    // card. Detail HTML can contain inactive templates and must not alter them.
     const author=authorFrom(doc);
     if(author.name && !work.authorName){work.authorName=author.name;work.authorHref=author.href;}
     const ogTitle=compactText(doc.querySelector('meta[property="og:title"]')?.getAttribute('content'));

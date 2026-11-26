@@ -26,8 +26,8 @@ function setup(tags,works){
 
 test('syntax/version',()=>{
   assert.doesNotThrow(()=>new Function(s));
-  assert.match(s,/@version\s+0\.3\.60/);
-  assert.match(meta,/@version\s+0\.3\.60/);
+  assert.match(s,/@version\s+0\.3\.61/);
+  assert.match(meta,/@version\s+0\.3\.61/);
 });
 
 test('no exclusion means results can appear immediately',()=>{
@@ -122,8 +122,8 @@ test('access-card diagnostics include badge and image DOM metadata',()=>{
  assert.match(s,/function badgeDiagnosticNodes\(card\)/);
  assert.match(s,/function imageDiagnosticNodes\(card\)/);
  assert.match(s,/detectedAccessBadges:\[\.\.\.\(work\.accessBadges\|\|\[\]\)\]/);
- assert.match(s,/diagnosticVersion:'0\.3\.60-access-card'/);
- assert.match(s,/JSON\.stringify\(\{version:'0\.3\.60',cards:records\}/);
+ assert.match(s,/diagnosticVersion:'0\.3\.61-access-card'/);
+ assert.match(s,/JSON\.stringify\(\{version:'0\.3\.61',cards:records\}/);
 });
 
 
@@ -140,4 +140,15 @@ test('reused feed cards refresh badges and thumbnails instead of keeping stale D
  assert.match(s,/if\(current!==work\.thumb\)img\.src=work\.thumb/);
  assert.match(s,/img\.removeAttribute\('src'\)/);
  assert.match(s,/updateFeedAccessBadges\(card\.querySelector\('\.pbsw-feed-access'\),work\)/);
+});
+
+
+test('access badges use only rendered authoritative leaf nodes',()=>{
+ assert.match(s,/function markRenderedSearchAccessState\(doc,win\)/);
+ assert.match(s,/data-pbsw-render-visible/);
+ assert.match(s,/\.history-work-card__badges \.is-r18/);
+ assert.match(s,/\.history-work-card__badges \.is-lock/);
+ assert.match(s,/\.history-work-card__badges \.is-scope/);
+ assert.match(s,/if\(node\.getAttribute\('data-pbsw-render-visible'\)!=='1'\)continue/);
+ assert.doesNotMatch(s,/const detailedBadges=accessBadgesFromDetailDocument\(doc\)/);
 });
